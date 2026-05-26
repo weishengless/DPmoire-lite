@@ -111,6 +111,9 @@ class Dataset:
             self.n_configs += 1
 
     def load_outcar(self, path: Path, freq: int) -> None:
+        if freq <= 0:
+            raise ValueError("freq must be a positive integer")
+
         for index, structure in enumerate(read_outcar_frames(Path(path))):
             if index % freq == 0:
                 self.add_atoms(structure)
