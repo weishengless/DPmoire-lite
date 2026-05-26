@@ -1,10 +1,14 @@
+import math
+
+from ase import Atoms
 import yaml
 
-from dpmoire_lite.build import run_build
+from dpmoire_lite.build import _ordered_elements, run_build
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
 
 
-def write_minimal_inputs(root):
+def write_minimal_inputs(root, *, top_a=4.0, bot_a=4.0):
+    root.mkdir(parents=True, exist_ok=True)
     input_dir = root / "input"
     scripts = root / "scripts"
     potcars = root / "potcars"
@@ -13,18 +17,28 @@ def write_minimal_inputs(root):
     for element in ["H"]:
         (potcars / element).mkdir(parents=True, exist_ok=True)
         (potcars / element / "POTCAR").write_text(" ENMAX = 100; \n", encoding="utf-8")
-    poscar = """H
+    top_poscar = f"""H
 1.0
-  4.0 0.0 0.0
-  0.0 4.0 0.0
+  {top_a} 0.0 0.0
+  0.0 {top_a} 0.0
   0.0 0.0 12.0
 H
 1
 Direct
   0.0 0.0 0.25
 """
-    (input_dir / "top_layer.poscar").write_text(poscar, encoding="utf-8")
-    (input_dir / "bot_layer.poscar").write_text(poscar, encoding="utf-8")
+    bot_poscar = f"""H
+1.0
+  {bot_a} 0.0 0.0
+  0.0 {bot_a} 0.0
+  0.0 0.0 12.0
+H
+1
+Direct
+  0.0 0.0 0.25
+"""
+    (input_dir / "top_layer.poscar").write_text(top_poscar, encoding="utf-8")
+    (input_dir / "bot_layer.poscar").write_text(bot_poscar, encoding="utf-8")
     for name in ["init_INCAR", "rlx_INCAR", "MD_INCAR", "MD_monolayer_INCAR", "val_INCAR"]:
         (input_dir / name).write_text("ENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\nLANGEVIN_GAMMA = 1\n", encoding="utf-8")
     (scripts / "DFT_script.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -32,7 +46,8 @@ Direct
 
 
 def write_build_config(root, **overrides):
-    input_dir, scripts, potcars = write_minimal_inputs(root)
+    input_kwargs = overrides.pop("input_kwargs", {})
+    input_dir, scripts, potcars = write_minimal_inputs(root, **input_kwargs)
     data = {
         "dft_script": "DFT_script.sh",
         "potcar_dir": str(potcars),
@@ -74,6 +89,33 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "0_0" / "INCAR").exists()
     assert (work / "rlx" / "1_0" / "KPOINTS").exists()
     assert (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_default_rcut_uses_input_layer_cells_and_ignores_supercell_scaling(tmp_path):
+    expected = math.sqrt(5.0**2 + 1.0**2) * 1.1
+    rendered_rcuts = []
+
+    for sc in ([1, 1], [3, 2]):
+        root = tmp_path / f"sc-{sc[0]}-{sc[1]}"
+        config = write_build_config(
+            root,
+            input_kwargs={"top_a": 4.0, "bot_a": 5.0},
+            do_relaxation=False,
+            d=1.0,
+            sc=sc,
+        )
+        run_build(config, wait=False)
+        incar = (root / "work" / "init_mlff" / "INCAR").read_text(encoding="utf-8")
+        rcut_line = next(line for line in incar.splitlines() if line.startswith("ML_RCUT1"))
+        rendered_rcuts.append(float(rcut_line.split("=", 1)[1].strip()))
+
+    assert rendered_rcuts == [expected, expected]
+
+
+def test_ordered_elements_preserves_consecutive_symbol_groups():
+    atoms = Atoms("MoSMo", positions=[[0, 0, 0], [0, 0, 1], [0, 0, 2]], cell=[4, 4, 12], pbc=True)
+
+    assert _ordered_elements(atoms) == ["Mo", "S", "Mo"]
 
 
 def test_parse_sbatch_output_extracts_job_id():

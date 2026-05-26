@@ -9,7 +9,15 @@ from ase import Atoms
 from ase.io.vasp import write_vasp
 
 from .config import DPmoireLiteConfig, load_config
-from .inputs import copy_submit_script, copy_vdw_if_needed, render_incar, write_kpoints, write_potcar, write_supercell_poscar
+from .inputs import (
+    copy_submit_script,
+    copy_vdw_if_needed,
+    get_ordered_elements,
+    render_incar,
+    write_kpoints,
+    write_potcar,
+    write_supercell_poscar,
+)
 from .manifest import Manifest, write_manifest
 from .paths import backup_existing_directory, relative_to_workdir, stage_dir
 from .slurm import SlurmJob, SlurmRunner
@@ -32,6 +40,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
     structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
+    rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
     stackings = (
         structures.find_sym_reduced_stackings()
         if config.symm_reduce
@@ -40,11 +49,11 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
 
     if config.init_mlff:
-        _build_init_mlff(config, structures, generated_at, timestamp, runner, wait)
+        _build_init_mlff(config, structures, rcut, generated_at, timestamp, runner, wait)
     if config.do_relaxation:
-        _build_relaxations(config, structures, stackings, generated_at, timestamp, runner, wait)
+        _build_relaxations(config, structures, stackings, rcut, generated_at, timestamp, runner, wait)
     if config.twist_val:
-        _build_validation(config, structures, generated_at, timestamp, runner, wait)
+        _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait)
 
 
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
@@ -60,6 +69,7 @@ def build_stage_all(config: DPmoireLiteConfig, wait: bool = False) -> None:
 def _build_init_mlff(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
+    rcut: float,
     generated_at: str,
     timestamp: str,
     runner: SlurmRunner | None,
@@ -70,7 +80,7 @@ def _build_init_mlff(
     init_dir.mkdir(parents=True, exist_ok=True)
     write_supercell_poscar(config.input_dir / "bot_layer.poscar", init_dir / "POSCAR", config.sc)
     atoms = structures.read_atoms(init_dir / "POSCAR")
-    _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", config.sc)
+    _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", config.sc, rcut)
     jobs = _submit_dirs(config, runner, [init_dir], wait)
     write_manifest(
         config.work_dir,
@@ -89,6 +99,7 @@ def _build_relaxations(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
     stackings: list[tuple[int, int]],
+    rcut: float,
     generated_at: str,
     timestamp: str,
     runner: SlurmRunner | None,
@@ -103,7 +114,7 @@ def _build_relaxations(
         target.mkdir(parents=True, exist_ok=True)
         atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
         write_vasp(target / "POSCAR", atoms=atoms)
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", config.sc if config.sc_rlx else (1, 1))
+        _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", config.sc if config.sc_rlx else (1, 1), rcut)
         directories.append(target)
     jobs = _submit_dirs(config, runner, directories, wait)
     write_manifest(
@@ -123,6 +134,7 @@ def _build_relaxations(
 def _build_validation(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
+    rcut: float,
     generated_at: str,
     timestamp: str,
     runner: SlurmRunner | None,
@@ -137,7 +149,7 @@ def _build_validation(
         target = validation_dir / angle
         target.mkdir(parents=True, exist_ok=True)
         write_vasp(target / "POSCAR", atoms=atoms)
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "val_INCAR", (1, 1))
+        _write_vasp_inputs(config, target, atoms, config.input_dir / "val_INCAR", (1, 1), rcut)
     jobs = _submit_dirs(config, runner, directories, wait)
     write_manifest(
         config.work_dir,
@@ -159,10 +171,10 @@ def _write_vasp_inputs(
     atoms: Atoms,
     incar_template: Path,
     k_scale: tuple[int, int],
+    rcut: float,
 ) -> None:
     elements = _ordered_elements(atoms)
     max_enmax = write_potcar(elements, config.potcar_dir, output_dir / "POTCAR")
-    rcut = _resolve_rcut(config, atoms)
     render_incar(
         incar_template,
         output_dir / "INCAR",
@@ -177,18 +189,20 @@ def _write_vasp_inputs(
 
 
 def _ordered_elements(atoms: Atoms) -> list[str]:
-    elements = []
-    for symbol in atoms.get_chemical_symbols():
-        if symbol not in elements:
-            elements.append(symbol)
-    return elements
+    return get_ordered_elements(atoms)
 
 
-def _resolve_rcut(config: DPmoireLiteConfig, atoms: Atoms) -> float:
+def _resolve_rcut(config: DPmoireLiteConfig, top_atoms: Atoms | None, bot_atoms: Atoms | None) -> float:
     if config.r_cut >= 0:
         return config.r_cut
-    in_plane = np.linalg.norm(atoms.cell.array[:2], axis=1)
-    return float(max(config.d, min(in_plane) / 2))
+    if top_atoms is None or bot_atoms is None:
+        raise ValueError("Input layer cells are required to resolve default r_cut")
+    max_layer_a = max(
+        float(np.linalg.norm(atoms.cell.array[index]))
+        for atoms in (top_atoms, bot_atoms)
+        for index in (0, 1)
+    )
+    return float(np.sqrt(max_layer_a**2 + config.d**2) * 1.1)
 
 
 def _backup_targets(work_dir: Path, stage: str, targets: list[Path], timestamp: str) -> list[str]:
