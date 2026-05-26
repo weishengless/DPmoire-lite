@@ -1,0 +1,25 @@
+dft_script: DFT_script.sh
+potcar_dir: ./potcars
+script_dir: ./scripts
+input_dir: ./input
+work_dir: ./work
+n_nodes: 1
+stage: 0
+submit: false
+auto_resub: false
+vasp_ml: true
+outcar_collect_freq: 8
+do_relaxation: true
+init_mlff: true
+sc_rlx: true
+n_sectors: [3, 2]
+sc: [2, 2]
+d: 6.3
+k_mesh: 40
+encut_factor: 1.6
+r_cut: -1
+symm_reduce: false
+twist_val: false
+min_val_n: 4
+max_val_n: 5
+include_monolayer_md: true
