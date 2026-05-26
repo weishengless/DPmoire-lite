@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import re
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -63,8 +64,16 @@ class StructureHandler:
             if normalized == labels:
                 raise
             lines[symbol_line_idx] = "  " + "  ".join(normalized) + "\n"
-            tmp_file = path.with_name(f"{path.name}.normalized")
-            tmp_file.write_text("".join(lines), encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".normalized",
+                delete=False,
+            ) as handle:
+                handle.write("".join(lines))
+                tmp_file = Path(handle.name)
             try:
                 return read_vasp(tmp_file)
             finally:
