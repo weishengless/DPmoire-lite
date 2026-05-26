@@ -1,6 +1,8 @@
 import math
 
 from ase import Atoms
+from ase.io.vasp import read_vasp, write_vasp
+import pytest
 import yaml
 
 from dpmoire_lite.build import _ordered_elements, run_build
@@ -81,6 +83,22 @@ def write_build_config(root, **overrides):
     return path
 
 
+def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_block=False):
+    target = work / "rlx" / name
+    target.mkdir(parents=True, exist_ok=True)
+    atoms = atoms or Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True)
+    write_vasp(target / "CONTCAR", atoms=atoms, direct=True)
+    if with_velocity_block:
+        with (target / "CONTCAR").open("a", encoding="utf-8") as handle:
+            handle.write("Cartesian\n")
+            handle.write("  9.0 9.0 9.0\n")
+    (target / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    return target
+
+
 def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     config = write_build_config(tmp_path)
     run_build(config, wait=False)
@@ -89,6 +107,69 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "0_0" / "INCAR").exists()
     assert (work / "rlx" / "1_0" / "KPOINTS").exists()
     assert (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work, with_velocity_block=True)
+    init_mlff = work / "init_mlff"
+    init_mlff.mkdir(parents=True)
+    (init_mlff / "ML_ABN").write_text("abn", encoding="utf-8")
+    (init_mlff / "ML_FFN").write_text("ffn", encoding="utf-8")
+
+    run_build(config, wait=False)
+
+    md_dir = work / "md" / "0_0"
+    assert (md_dir / "INCAR").read_text(encoding="utf-8").startswith("ENCUT")
+    assert (md_dir / "KPOINTS").exists()
+    assert (md_dir / "POTCAR").exists()
+    assert (md_dir / "DFT_script.sh").exists()
+    assert (md_dir / "ML_AB").read_text(encoding="utf-8") == "abn"
+    assert (md_dir / "ML_FF").read_text(encoding="utf-8") == "ffn"
+    poscar_text = (md_dir / "POSCAR").read_text(encoding="utf-8")
+    assert "9.0 9.0 9.0" not in poscar_text
+    manifest = yaml.safe_load((work / "md" / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["stage"] == "md"
+    assert manifest["directories"] == ["md/0_0"]
+    assert manifest["stackings"] == [[0, 0]]
+
+
+def test_stage1_fails_for_unconverged_relaxation(tmp_path):
+    config = write_build_config(tmp_path, stage=1, n_sectors=[1, 1], vasp_ml=False)
+    target = tmp_path / "work" / "rlx" / "0_0"
+    target.mkdir(parents=True, exist_ok=True)
+    write_vasp(target / "CONTCAR", atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
+    (target / "OUTCAR").write_text("not there yet\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Relaxation did not converge"):
+        run_build(config, wait=False)
+
+
+def test_stage1_expands_primitive_relaxation_when_sc_rlx_is_false(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        sc=[2, 3],
+        sc_rlx=False,
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work, atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(work / "md" / "0_0" / "POSCAR")
+    assert len(atoms) == 6
+    assert atoms.cell.lengths()[0] == pytest.approx(8.0)
+    assert atoms.cell.lengths()[1] == pytest.approx(15.0)
 
 
 def test_default_rcut_uses_input_layer_cells_and_ignores_supercell_scaling(tmp_path):

@@ -5,8 +5,10 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import yaml
+from ase.build import make_supercell, sort
 from ase import Atoms
-from ase.io.vasp import write_vasp
+from ase.io.vasp import read_vasp, write_vasp
 
 from .config import DPmoireLiteConfig, load_config
 from .inputs import (
@@ -14,6 +16,7 @@ from .inputs import (
     copy_vdw_if_needed,
     get_ordered_elements,
     render_incar,
+    stage_mlff_files,
     write_kpoints,
     write_potcar,
     write_supercell_poscar,
@@ -21,7 +24,10 @@ from .inputs import (
 from .manifest import Manifest, write_manifest
 from .paths import backup_existing_directory, relative_to_workdir, stage_dir
 from .slurm import SlurmJob, SlurmRunner
-from .structures import StructureHandler, generate_stackings
+from .structures import StructureHandler, generate_stackings, rewrite_contcar_as_poscar, supercell_matrix
+
+
+VASP_RELAXATION_CONVERGED_PHRASE = "reached required accuracy - stopping structural energy minimisation"
 
 
 def run_build(config_path: Path, wait: bool = False) -> None:
@@ -57,13 +63,83 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
 
 
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
-    _ = (config, wait)
-    raise NotImplementedError("stage 1 build is added in a later task")
+    generated_at = datetime.now().isoformat(timespec="seconds")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    config.work_dir.mkdir(parents=True, exist_ok=True)
+    structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
+    rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
+    stackings = _stage1_stackings(config)
+    init_mlff_dir = config.work_dir / "init_mlff"
+    if config.vasp_ml:
+        _check_mlff_files(init_mlff_dir)
+
+    md_dir = stage_dir(config.work_dir, "md")
+    targets = [md_dir / f"{i}_{j}" for i, j in stackings]
+    if config.include_monolayer_md:
+        targets.extend([md_dir / "top_layer", md_dir / "bot_layer"])
+    backups = _backup_targets(config.work_dir, "md", targets, timestamp)
+
+    directories = []
+    for i, j in stackings:
+        source_dir = config.work_dir / "rlx" / f"{i}_{j}"
+        check_relaxation_converged(source_dir)
+        target = md_dir / f"{i}_{j}"
+        target.mkdir(parents=True, exist_ok=True)
+        _write_md_poscar(source_dir / "CONTCAR", target / "POSCAR", config.sc if not config.sc_rlx else None)
+        atoms = structures.read_atoms(target / "POSCAR")
+        _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", config.sc, rcut)
+        if config.vasp_ml:
+            stage_mlff_files(init_mlff_dir, target)
+        directories.append(target)
+
+    if config.include_monolayer_md:
+        for layer_name in ("top_layer", "bot_layer"):
+            target = md_dir / layer_name
+            target.mkdir(parents=True, exist_ok=True)
+            write_supercell_poscar(config.input_dir / f"{layer_name}.poscar", target / "POSCAR", config.sc)
+            atoms = structures.read_atoms(target / "POSCAR")
+            _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_monolayer_INCAR", config.sc, rcut)
+            if config.vasp_ml:
+                stage_mlff_files(init_mlff_dir, target)
+            directories.append(target)
+
+    runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
+    jobs = _submit_dirs(config, runner, directories, wait)
+    write_manifest(
+        config.work_dir,
+        Manifest(
+            stage="md",
+            generated_at=generated_at,
+            config_summary=_config_summary(config),
+            directories=[relative_to_workdir(config.work_dir, path) for path in directories],
+            backups=backups,
+            jobs=[job.as_dict() for job in jobs],
+            stackings=[[i, j] for i, j in stackings],
+        ),
+    )
 
 
 def build_stage_all(config: DPmoireLiteConfig, wait: bool = False) -> None:
     _ = (config, wait)
     raise NotImplementedError("stage all build is added in a later task")
+
+
+def check_relaxation_converged(directory: Path) -> None:
+    directory = Path(directory)
+    outcar = directory / "OUTCAR"
+    if not outcar.exists():
+        raise FileNotFoundError(f"Missing OUTCAR in {directory}")
+    text = outcar.read_text(encoding="utf-8", errors="ignore")
+    if VASP_RELAXATION_CONVERGED_PHRASE not in text:
+        raise ValueError(f"Relaxation did not converge in {directory}")
+
+    contcar = directory / "CONTCAR"
+    if not contcar.exists():
+        raise FileNotFoundError(f"Missing CONTCAR in {directory}")
+    try:
+        read_vasp(contcar)
+    except Exception as exc:
+        raise ValueError(f"CONTCAR is not readable by ASE in {directory}") from exc
 
 
 def _build_init_mlff(
@@ -163,6 +239,42 @@ def _build_validation(
             angles=list(angles),
         ),
     )
+
+
+def _stage1_stackings(config: DPmoireLiteConfig) -> list[tuple[int, int]]:
+    rlx_manifest = config.work_dir / "rlx" / "manifest.yaml"
+    if rlx_manifest.exists():
+        data = yaml.safe_load(rlx_manifest.read_text(encoding="utf-8")) or {}
+        stackings = data.get("stackings") or []
+        if stackings:
+            return [(int(i), int(j)) for i, j in stackings]
+
+    symm_file = config.work_dir / "sym_reduced_stackings.txt"
+    if config.symm_reduce and symm_file.exists():
+        data = np.loadtxt(symm_file, dtype=int)
+        if data.ndim == 1:
+            data = data.reshape(1, 2)
+        return [(int(i), int(j)) for i, j in data.tolist()]
+
+    return generate_stackings(config.n_sectors)
+
+
+def _check_mlff_files(init_mlff_dir: Path) -> None:
+    for name in ("ML_ABN", "ML_FFN"):
+        path = Path(init_mlff_dir) / name
+        if not path.exists():
+            raise FileNotFoundError(f"vasp_ml requires {path}")
+
+
+def _write_md_poscar(contcar: Path, poscar: Path, sc: tuple[int, int] | None) -> None:
+    if sc is None:
+        rewrite_contcar_as_poscar(contcar, poscar)
+        return
+
+    atoms = read_vasp(contcar)
+    atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(sc)))
+    poscar.parent.mkdir(parents=True, exist_ok=True)
+    write_vasp(poscar, atoms=atoms_sc, direct=True, sort=False)
 
 
 def _write_vasp_inputs(
