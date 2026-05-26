@@ -139,13 +139,49 @@ def _resolve_path(base: Path, value: Any) -> Path:
     return path.resolve()
 
 
-def _positive_int(value: Any, field_name: str) -> int:
+def _bool(value: Any, field_name: str) -> bool:
     if isinstance(value, bool):
-        raise ConfigError(f"{field_name} must be positive")
-    result = int(value)
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+    raise ConfigError(f"{field_name} must be a boolean")
+
+
+def _int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError as exc:
+            raise ConfigError(f"{field_name} must be an integer") from exc
+    raise ConfigError(f"{field_name} must be an integer")
+
+
+def _positive_int(value: Any, field_name: str) -> int:
+    result = _int(value, field_name)
     if result <= 0:
         raise ConfigError(f"{field_name} must be positive")
     return result
+
+
+def _float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{field_name} must be a number")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError as exc:
+            raise ConfigError(f"{field_name} must be a number") from exc
+    raise ConfigError(f"{field_name} must be a number")
 
 
 def _normalize_stage(value: Any) -> int | str:
@@ -185,23 +221,23 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         work_dir=_resolve_path(base, _require(raw, "work_dir")),
         n_nodes=_positive_int(_require(raw, "n_nodes"), "n_nodes"),
         stage=_normalize_stage(_require(raw, "stage")),
-        submit=bool(_require(raw, "submit")),
-        auto_resub=bool(_require(raw, "auto_resub")),
-        vasp_ml=bool(_require(raw, "vasp_ml")),
+        submit=_bool(_require(raw, "submit"), "submit"),
+        auto_resub=_bool(_require(raw, "auto_resub"), "auto_resub"),
+        vasp_ml=_bool(_require(raw, "vasp_ml"), "vasp_ml"),
         outcar_collect_freq=_positive_int(_require(raw, "outcar_collect_freq"), "outcar_collect_freq"),
-        do_relaxation=bool(_require(raw, "do_relaxation")),
-        init_mlff=bool(_require(raw, "init_mlff")),
-        sc_rlx=bool(_require(raw, "sc_rlx")),
+        do_relaxation=_bool(_require(raw, "do_relaxation"), "do_relaxation"),
+        init_mlff=_bool(_require(raw, "init_mlff"), "init_mlff"),
+        sc_rlx=_bool(_require(raw, "sc_rlx"), "sc_rlx"),
         n_sectors=normalize_pair(_require(raw, "n_sectors"), field="n_sectors"),
         sc=normalize_pair(_require(raw, "sc"), field="sc"),
-        d=float(_require(raw, "d")),
-        k_mesh=int(_require(raw, "k_mesh")),
-        encut_factor=float(_require(raw, "encut_factor")),
-        r_cut=float(_require(raw, "r_cut")),
-        symm_reduce=bool(_require(raw, "symm_reduce")),
-        twist_val=bool(_require(raw, "twist_val")),
-        min_val_n=int(_require(raw, "min_val_n")),
-        max_val_n=int(_require(raw, "max_val_n")),
-        include_monolayer_md=bool(_require(raw, "include_monolayer_md")),
+        d=_float(_require(raw, "d"), "d"),
+        k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
+        encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),
+        r_cut=_float(_require(raw, "r_cut"), "r_cut"),
+        symm_reduce=_bool(_require(raw, "symm_reduce"), "symm_reduce"),
+        twist_val=_bool(_require(raw, "twist_val"), "twist_val"),
+        min_val_n=_int(_require(raw, "min_val_n"), "min_val_n"),
+        max_val_n=_int(_require(raw, "max_val_n"), "max_val_n"),
+        include_monolayer_md=_bool(_require(raw, "include_monolayer_md"), "include_monolayer_md"),
         outcar_patterns=tuple(outcar_patterns),
     )

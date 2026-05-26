@@ -79,3 +79,47 @@ def test_old_field_names_are_rejected(tmp_path):
     config_file.write_text("VASP_ML: true\n", encoding="utf-8")
     with pytest.raises(ConfigError, match="snake_case"):
         load_config(config_file)
+
+
+def test_quoted_false_boolean_values_parse_to_false(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        submit="false",
+        auto_resub="NO",
+        vasp_ml="0",
+        do_relaxation="False",
+        init_mlff="no",
+        sc_rlx="false",
+        symm_reduce="0",
+        twist_val="NO",
+        include_monolayer_md="False",
+    )
+    config = load_config(config_file)
+    assert config.submit is False
+    assert config.auto_resub is False
+    assert config.vasp_ml is False
+    assert config.do_relaxation is False
+    assert config.init_mlff is False
+    assert config.sc_rlx is False
+    assert config.symm_reduce is False
+    assert config.twist_val is False
+    assert config.include_monolayer_md is False
+
+
+def test_invalid_boolean_string_raises_field_context(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, submit="sometimes")
+    with pytest.raises(ConfigError, match="submit"):
+        load_config(config_file)
+
+
+def test_invalid_numeric_values_raise_field_context(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, k_mesh=True)
+    with pytest.raises(ConfigError, match="k_mesh"):
+        load_config(config_file)
+
+    write_config(config_file, d="not-a-number")
+    with pytest.raises(ConfigError, match="d"):
+        load_config(config_file)
