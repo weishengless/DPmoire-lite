@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib import resources
 import re
 import shutil
 from pathlib import Path
@@ -196,5 +197,21 @@ def copy_example(target_dir: Path) -> None:
     target_dir = Path(target_dir)
     if target_dir.exists():
         raise FileExistsError(f"Target example directory already exists: {target_dir}")
-    source = Path(__file__).resolve().parents[2] / "example"
-    shutil.copytree(source, target_dir)
+    source = resources.files("dpmoire_lite") / "example"
+    if not source.is_dir():
+        raise FileNotFoundError("Bundled example template not found in dpmoire_lite package data")
+
+    target_dir.mkdir(parents=True)
+    for item in source.iterdir():
+        if item.name == "__init__.py":
+            continue
+        _copy_traversable(item, target_dir / item.name)
+
+
+def _copy_traversable(source, target: Path) -> None:
+    if source.is_dir():
+        target.mkdir()
+        for item in source.iterdir():
+            _copy_traversable(item, target / item.name)
+        return
+    target.write_bytes(source.read_bytes())

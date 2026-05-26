@@ -25,6 +25,9 @@ DPmoireLite = "dpmoire_lite.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+dpmoire_lite = ["example/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

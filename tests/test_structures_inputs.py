@@ -1,6 +1,7 @@
 from ase import Atoms
 from ase.io.vasp import read_vasp
 
+from dpmoire_lite import inputs
 from dpmoire_lite.inputs import needs_vdw_kernel, replace_incar_values, resolve_potcar_dir, write_kpoints
 from dpmoire_lite.structures import StructureHandler, generate_stackings, rewrite_contcar_as_poscar
 
@@ -88,3 +89,19 @@ def test_write_kpoints_uses_rectangular_scale_as_supercell_length(tmp_path):
 
     lines = (tmp_path / "KPOINTS").read_text(encoding="utf-8").splitlines()
     assert lines[3] == "4 2 1"
+
+
+def test_copy_example_uses_bundled_template_independent_of_source_checkout(tmp_path, monkeypatch):
+    installed_module = tmp_path / "site-packages" / "dpmoire_lite" / "inputs.py"
+    installed_module.parent.mkdir(parents=True)
+    installed_module.write_text("# installed module placeholder\n", encoding="utf-8")
+    monkeypatch.setattr(inputs, "__file__", str(installed_module))
+    monkeypatch.chdir(tmp_path)
+
+    target_dir = tmp_path / "copied-example"
+    inputs.copy_example(target_dir)
+
+    assert (target_dir / "config.yaml").is_file()
+    assert (target_dir / "input" / "top_layer.poscar").is_file()
+    assert (target_dir / "input" / "bot_layer.poscar").is_file()
+    assert (target_dir / "scripts" / "DFT_script.sh").is_file()
