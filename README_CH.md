@@ -50,6 +50,8 @@ python -m pip install .
 - `MD_monolayer_INCAR`：可选单层 MD 计算使用的 INCAR 模板。
 - `val_INCAR`：可选 twist validation 计算使用的 INCAR 模板。
 
+层结构 POSCAR 必须使用 slab cell：面内晶格矢量位于 Cartesian xy 平面，c 矢量沿 Cartesian z 方向。由于层间距模式沿 z 方向工作，DPmoire-lite 会拒绝倾斜的 slab cell。
+
 如果某个 INCAR 模板中包含 `LUSE_VDW = T`，则 `input_dir` 中还必须有 `vdw_kernel.bindat`，它会被复制到生成出的计算目录中。
 
 `script_dir` 中必须包含 `dft_script` 指定的 Slurm 提交脚本。
@@ -128,7 +130,9 @@ DPmoireLite collect config.yaml --stage validation
 | `sc_rlx` | 布尔值 | `true` 表示弛豫超胞堆垛结构；`false` 表示只弛豫 primitive glide structure，并在 stage1 根据 CONTCAR 扩胞。 |
 | `n_sectors` | 整数或 `[nx, ny]` | 堆垛平移采样网格。`9` 等价于 `[9, 9]`，`[9, 8]` 表示矩形网格。 |
 | `sc` | 整数或 `[sx, sy]` | MD 使用的超胞扩展；当 `sc_rlx: true` 时也用于弛豫。`2` 等价于 `[2, 2]`。 |
-| `d` | 数值 | 构造双层和 validation 结构时使用的层间距。 |
+| `d` | 数值 | 距离数值，具体物理含义由 `d_mode` 决定。 |
+| `d_mode` | `surface_gap` 或 `reference_plane_gap` | `surface_gap` 表示 `min_z(top) - max_z(bot) = d`；`reference_plane_gap` 表示所选参考原子的平均 z 坐标差为 `d`。默认值为 `surface_gap`。 |
+| `d_reference` | 映射，可选 | `reference_plane_gap` 使用的参考原子选择器，例如内置 MoTe2 示例可用 `{top: [Mo], bot: [Mo]}`。省略或使用 `all` 表示该层所有原子。 |
 | `k_mesh` | 整数 | KPOINTS 目标值。程序会根据面内晶格长度和当前超胞尺度写 Gamma-centered mesh。 |
 | `encut_factor` | 数值 | INCAR 中的 `ENCUT` 会写成 `encut_factor * max(POTCAR ENMAX)`。 |
 | `r_cut` | 数值 | 写入 `ML_RCUT1` 和 `ML_RCUT2` 的值。若为负数，则根据最大输入单层面内晶格长度和 `d` 自动估算。 |

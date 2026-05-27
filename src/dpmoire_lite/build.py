@@ -46,7 +46,14 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
+    structures = StructureHandler(
+        config.input_dir,
+        config.work_dir,
+        config.n_sectors,
+        config.d,
+        config.d_mode,
+        config.d_reference,
+    )
     rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
     stackings = (
         structures.find_sym_reduced_stackings()
@@ -67,7 +74,14 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
+    structures = StructureHandler(
+        config.input_dir,
+        config.work_dir,
+        config.n_sectors,
+        config.d,
+        config.d_mode,
+        config.d_reference,
+    )
     rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
     stackings = _stage1_stackings(config)
     check_stage1_inputs(config, stackings)
@@ -133,7 +147,14 @@ def build_stage_all(
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
+    structures = StructureHandler(
+        config.input_dir,
+        config.work_dir,
+        config.n_sectors,
+        config.d,
+        config.d_mode,
+        config.d_reference,
+    )
     rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
     stackings = (
         structures.find_sym_reduced_stackings()
@@ -426,11 +447,19 @@ def _submit_dirs(config: DPmoireLiteConfig, runner: SlurmRunner | None, director
 
 
 def _config_summary(config: DPmoireLiteConfig) -> dict[str, object]:
+    d_reference = None
+    if config.d_reference is not None:
+        d_reference = {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in config.d_reference.items()
+        }
     return {
         "stage": config.stage,
         "n_sectors": list(config.n_sectors),
         "sc": list(config.sc),
         "d": config.d,
+        "d_mode": config.d_mode,
+        "d_reference": d_reference,
         "k_mesh": config.k_mesh,
         "encut_factor": config.encut_factor,
         "r_cut": config.r_cut,

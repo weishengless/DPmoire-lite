@@ -123,3 +123,82 @@ def test_invalid_numeric_values_raise_field_context(tmp_path):
     write_config(config_file, d="not-a-number")
     with pytest.raises(ConfigError, match="d"):
         load_config(config_file)
+
+
+def test_d_mode_defaults_to_surface_gap(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.d_mode == "surface_gap"
+    assert config.d_reference is None
+
+
+@pytest.mark.parametrize("mode", ["surface_gap", "reference_plane_gap"])
+def test_load_config_accepts_valid_d_modes(tmp_path, mode):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, d_mode=mode)
+
+    config = load_config(config_file)
+
+    assert config.d_mode == mode
+
+
+def test_load_config_accepts_reference_elements(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        d_mode="reference_plane_gap",
+        d_reference={"top": ["Pt"], "bot": ["Pt", "Mo"]},
+    )
+
+    config = load_config(config_file)
+
+    assert config.d_reference == {"top": ("Pt",), "bot": ("Pt", "Mo")}
+
+
+def test_load_config_accepts_all_reference_keyword(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        d_mode="reference_plane_gap",
+        d_reference={"top": "all", "bot": "all"},
+    )
+
+    config = load_config(config_file)
+
+    assert config.d_reference == {"top": "all", "bot": "all"}
+
+
+def test_load_config_ignores_reference_when_surface_gap(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        d_mode="surface_gap",
+        d_reference={"top": ["Xx"], "bot": ["Pt"]},
+    )
+
+    config = load_config(config_file)
+
+    assert config.d_reference is None
+
+
+def test_load_config_rejects_invalid_reference_element(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        d_mode="reference_plane_gap",
+        d_reference={"top": ["Xx"], "bot": ["Mo"]},
+    )
+
+    with pytest.raises(ConfigError, match="d_reference.top"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_invalid_d_mode(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, d_mode="center_distance")
+
+    with pytest.raises(ConfigError, match="d_mode"):
+        load_config(config_file)

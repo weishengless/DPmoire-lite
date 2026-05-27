@@ -56,6 +56,10 @@ copy rather than an editable development install.
 - `MD_monolayer_INCAR`: INCAR template for optional monolayer MD calculations.
 - `val_INCAR`: INCAR template for optional twist validation calculations.
 
+Layer POSCAR files must use slab cells whose in-plane vectors lie in the
+Cartesian xy plane and whose c vector is aligned with Cartesian z. DPmoire-lite
+rejects tilted slab cells because the spacing modes operate along z.
+
 If an INCAR template contains `LUSE_VDW = T`, `input_dir` must also contain
 `vdw_kernel.bindat`; it will be copied into generated calculation folders.
 
@@ -163,7 +167,9 @@ rejected.
 | `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |
 | `n_sectors` | int or `[nx, ny]` | Stacking-shift grid. `9` means `[9, 9]`; `[9, 8]` creates a rectangular grid. |
 | `sc` | int or `[sx, sy]` | Supercell expansion used for MD and, when `sc_rlx: true`, relaxation. `2` means `[2, 2]`. |
-| `d` | number | Interlayer distance used when constructing bilayer and validation structures. |
+| `d` | number | Distance value interpreted according to `d_mode`. |
+| `d_mode` | `surface_gap` or `reference_plane_gap` | `surface_gap` sets `min_z(top) - max_z(bot) = d`; `reference_plane_gap` sets the selected reference-plane mean-z distance to `d`. Defaults to `surface_gap`. |
+| `d_reference` | mapping, optional | Reference atom selectors for `reference_plane_gap`, for example `{top: [Mo], bot: [Mo]}` for the bundled MoTe2 example. Omit or use `all` to average all atoms in that layer. |
 | `k_mesh` | int | KPOINTS target. DPmoire-lite writes a Gamma mesh from the in-plane cell lengths and the active supercell scale. |
 | `encut_factor` | number | INCAR `ENCUT` is rendered as `encut_factor * max(POTCAR ENMAX)` for the selected elements. |
 | `r_cut` | number | Value written to `ML_RCUT1` and `ML_RCUT2`. If negative, DPmoire-lite uses an automatic value based on the largest input-layer in-plane lattice length and `d`. |
