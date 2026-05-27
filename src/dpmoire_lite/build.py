@@ -418,6 +418,9 @@ def _backup_targets(work_dir: Path, stage: str, targets: list[Path], timestamp: 
 def _submit_dirs(config: DPmoireLiteConfig, runner: SlurmRunner | None, directories: list[Path], wait: bool) -> list[SlurmJob]:
     if runner is None:
         return []
+    items = [(path, relative_to_workdir(config.work_dir, path)) for path in directories]
+    if hasattr(runner, "submit_many"):
+        return runner.submit_many(items, wait=wait)
     jobs = [runner.submit(path, relative_to_workdir(config.work_dir, path)) for path in directories]
     return runner.wait(jobs) if wait else jobs
 
