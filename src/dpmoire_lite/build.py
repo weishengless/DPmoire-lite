@@ -69,9 +69,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
     structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
     rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
     stackings = _stage1_stackings(config)
-    init_mlff_dir = config.work_dir / "init_mlff"
-    if config.vasp_ml:
-        _check_mlff_files(init_mlff_dir)
+    check_stage1_inputs(config, stackings)
 
     md_dir = stage_dir(config.work_dir, "md")
     targets = [md_dir / f"{i}_{j}" for i, j in stackings]
@@ -80,9 +78,9 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
     backups = _backup_targets(config.work_dir, "md", targets, timestamp)
 
     directories = []
+    init_mlff_dir = config.work_dir / "init_mlff"
     for i, j in stackings:
         source_dir = config.work_dir / "rlx" / f"{i}_{j}"
-        check_relaxation_converged(source_dir)
         target = md_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
         _write_md_poscar(source_dir / "CONTCAR", target / "POSCAR", config.sc if not config.sc_rlx else None)
@@ -140,6 +138,30 @@ def check_relaxation_converged(directory: Path) -> None:
         read_vasp(contcar)
     except Exception as exc:
         raise ValueError(f"CONTCAR is not readable by ASE in {directory}") from exc
+
+
+def check_stage1_inputs(config: DPmoireLiteConfig, stackings: list[tuple[int, int]]) -> None:
+    failures: list[tuple[Path, str]] = []
+    init_mlff_dir = config.work_dir / "init_mlff"
+    if config.vasp_ml:
+        for name in ("ML_ABN", "ML_FFN"):
+            path = init_mlff_dir / name
+            if not path.exists():
+                failures.append((path, "missing required MLFF file"))
+
+    for i, j in stackings:
+        source_dir = config.work_dir / "rlx" / f"{i}_{j}"
+        try:
+            check_relaxation_converged(source_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            failures.append((source_dir, _stage1_failure_reason(exc, source_dir)))
+
+    if failures:
+        details = "\n".join(
+            f"- {relative_to_workdir(config.work_dir, path)}: {reason}"
+            for path, reason in failures
+        )
+        raise RuntimeError(f"Stage 1 input preflight failed:\n{details}")
 
 
 def _build_init_mlff(
@@ -264,6 +286,14 @@ def _check_mlff_files(init_mlff_dir: Path) -> None:
         path = Path(init_mlff_dir) / name
         if not path.exists():
             raise FileNotFoundError(f"vasp_ml requires {path}")
+
+
+def _stage1_failure_reason(exc: Exception, source_dir: Path) -> str:
+    text = str(exc)
+    suffix = f" in {source_dir}"
+    if text.endswith(suffix):
+        return text[: -len(suffix)]
+    return text
 
 
 def _write_md_poscar(contcar: Path, poscar: Path, sc: tuple[int, int] | None) -> None:
