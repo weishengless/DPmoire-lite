@@ -102,6 +102,28 @@ def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_bl
     return target
 
 
+def read_selective_dynamics_flags(poscar):
+    lines = poscar.read_text(encoding="utf-8").splitlines()
+    selective_idx = next(i for i, line in enumerate(lines) if line.strip().lower().startswith("selective"))
+    counts = [int(value) for value in lines[6].split()]
+    atom_count = sum(counts)
+    first_atom_line = selective_idx + 2
+    return [tuple(line.split()[-3:]) for line in lines[first_atom_line : first_atom_line + atom_count]]
+
+
+def assert_one_atom_per_layer_keeps_only_c_motion(poscar, expected_atom_count):
+    flags = read_selective_dynamics_flags(poscar)
+    atoms = read_vasp(poscar)
+    scaled_z = atoms.get_scaled_positions()[:, 2]
+    constrained_layers = [z > 0.5 for flag, z in zip(flags, scaled_z) if flag == ("F", "F", "T")]
+
+    assert len(flags) == expected_atom_count
+    assert set(flags) <= {("F", "F", "T"), ("T", "T", "T")}
+    assert len(constrained_layers) == 2
+    assert constrained_layers.count(True) == 1
+    assert constrained_layers.count(False) == 1
+
+
 class FakeRunner:
     def __init__(self):
         self.events = []
@@ -145,6 +167,21 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "0_0" / "INCAR").exists()
     assert (work / "rlx" / "1_0" / "KPOINTS").exists()
     assert (work / "rlx" / "manifest.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("sc_rlx", "sc", "expected_atom_count"),
+    [
+        (True, [2, 1], 4),
+        (False, [2, 1], 2),
+    ],
+)
+def test_stage0_rlx_poscars_keep_in_plane_sliding_constraints(tmp_path, sc_rlx, sc, expected_atom_count):
+    config = write_build_config(tmp_path, n_sectors=[1, 1], sc_rlx=sc_rlx, sc=sc)
+
+    run_build(config, wait=False)
+
+    assert_one_atom_per_layer_keeps_only_c_motion(tmp_path / "work" / "rlx" / "0_0" / "POSCAR", expected_atom_count)
 
 
 def test_prepare_init_mlff_step2_renames_ml_files_and_replaces_poscar(tmp_path):
