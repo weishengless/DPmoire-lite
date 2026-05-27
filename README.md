@@ -1,5 +1,7 @@
 # DPmoire-lite
 
+Chinese documentation is available in [README_CH.md](README_CH.md).
+
 DPmoire-lite is a clean VASP dataset-generation framework extracted from the
 original DPmoire workflow. It generates calculation folders for bilayer or moire
 force-field dataset construction, submits optional Slurm jobs, and collects
@@ -23,6 +25,22 @@ DPmoireLite collect config.yaml --stage validation
 `init-example` copies a self-contained template with `config.yaml`, `input/`,
 and `scripts/`. The generated `config.yaml` contains inline comments for every
 supported tag.
+
+## Installation In A Conda Environment
+
+Clone the private repository, activate your own conda environment, and install
+the package from the repository root:
+
+```bash
+git clone https://github.com/weishengless/DPmoire-lite.git
+cd DPmoire-lite
+conda activate your_env_name
+python -m pip install -e .
+DPmoireLite --help
+```
+
+Use `python -m pip install .` instead of `-e .` if you want a normal installed
+copy rather than an editable development install.
 
 ## Required Input Files
 
