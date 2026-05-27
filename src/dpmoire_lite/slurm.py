@@ -88,9 +88,9 @@ class SlurmRunner:
     ) -> list[SlurmJob]:
         limit = max(1, int(self.n_nodes))
         if not wait:
-            # Without a wait loop there is no safe point to submit the rest while
-            # preserving the configured active-job cap.
-            return [self.submit(work_dir, rel_path) for work_dir, rel_path in items[:limit]]
+            # Non-wait mode submits the requested stage and exits; n_nodes
+            # throttling needs a polling loop and is enforced when wait=True.
+            return [self.submit(work_dir, rel_path) for work_dir, rel_path in items]
 
         pending = list(enumerate(items))
         active: dict[str, tuple[SlurmJob, int]] = {}

@@ -1,5 +1,7 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+from dpmoire_lite.build import _submit_dirs
 from dpmoire_lite.slurm import SlurmJob, SlurmRunner
 
 
@@ -44,6 +46,22 @@ def test_submit_many_wait_throttles_to_one_active_job():
     assert [(job.path, job.status) for job in jobs] == [
         ("rlx/0_0", "COMPLETED"),
         ("rlx/1_0", "COMPLETED"),
+    ]
+
+
+def test_submit_dirs_without_wait_submits_all_jobs_even_when_n_nodes_is_one(tmp_path):
+    runner = QueueRunner(n_nodes=1)
+    directories = [tmp_path / "first", tmp_path / "second"]
+    for directory in directories:
+        directory.mkdir()
+
+    jobs = _submit_dirs(SimpleNamespace(work_dir=tmp_path), runner, directories, wait=False)
+
+    assert runner.submitted == [("first", "1"), ("second", "2")]
+    assert runner.query_log == []
+    assert [(job.path, job.status) for job in jobs] == [
+        ("first", "SUBMITTED"),
+        ("second", "SUBMITTED"),
     ]
 
 
