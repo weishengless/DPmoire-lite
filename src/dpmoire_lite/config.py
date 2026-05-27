@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ase.data import atomic_numbers
 import yaml
 
 
@@ -85,6 +86,17 @@ def normalize_d_mode(value: Any) -> str:
     return mode
 
 
+def _normalize_element_symbol(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{field} must contain element symbols")
+    text = value.strip()
+    if not text:
+        raise ConfigError(f"{field} must contain at least one non-empty element symbol")
+    if text not in atomic_numbers or atomic_numbers[text] == 0:
+        raise ConfigError(f"{field} contains invalid element symbol: {text}")
+    return text
+
+
 def normalize_reference_selector(value: Any, field: str) -> str | tuple[str, ...]:
     if value is None:
         return "all"
@@ -92,13 +104,11 @@ def normalize_reference_selector(value: Any, field: str) -> str | tuple[str, ...
         text = value.strip()
         if text == "all":
             return "all"
-        if not text:
-            raise ConfigError(f"{field} cannot be empty")
-        return (text,)
+        return (_normalize_element_symbol(text, field),)
     if isinstance(value, (list, tuple)):
-        items = tuple(str(item).strip() for item in value)
-        if not items or any(not item for item in items):
+        if not value:
             raise ConfigError(f"{field} must contain at least one non-empty element symbol")
+        items = tuple(_normalize_element_symbol(item, field) for item in value)
         return items
     raise ConfigError(f"{field} must be 'all', an element symbol, or a list of element symbols")
 
@@ -256,6 +266,8 @@ def load_config(path: Path) -> DPmoireLiteConfig:
 
     base = config_path.parent
     outcar_patterns = raw.get("outcar_patterns", DEFAULT_OUTCAR_PATTERNS)
+    d_mode = normalize_d_mode(raw.get("d_mode", "surface_gap"))
+    d_reference = normalize_d_reference(raw.get("d_reference")) if d_mode == "reference_plane_gap" else None
 
     return DPmoireLiteConfig(
         config_path=config_path,
@@ -276,8 +288,8 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         n_sectors=normalize_pair(_require(raw, "n_sectors"), field="n_sectors"),
         sc=normalize_pair(_require(raw, "sc"), field="sc"),
         d=_float(_require(raw, "d"), "d"),
-        d_mode=normalize_d_mode(raw.get("d_mode", "surface_gap")),
-        d_reference=normalize_d_reference(raw.get("d_reference")),
+        d_mode=d_mode,
+        d_reference=d_reference,
         k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
         encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),
         r_cut=_float(_require(raw, "r_cut"), "r_cut"),

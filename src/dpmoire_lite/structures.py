@@ -26,6 +26,17 @@ TOP_LAYER_TAG = 1
 BOT_LAYER_TAG = 2
 
 
+def validate_cartesian_z_slab_cell(atoms: Atoms, label: str) -> None:
+    cell = atoms.cell.array
+    tilted_in_plane = not np.allclose(cell[:2, 2], 0.0, atol=1e-8)
+    tilted_c = not np.allclose(cell[2, :2], 0.0, atol=1e-8)
+    invalid_c = float(cell[2, 2]) <= 1e-8
+    if tilted_in_plane or tilted_c or invalid_c:
+        raise ValueError(
+            f"{label} must use a slab cell with in-plane vectors in xy and c aligned to Cartesian z"
+        )
+
+
 def layer_indices_from_tags(atoms: Atoms) -> tuple[list[int], list[int]] | None:
     tags = atoms.get_tags()
     top_idx = [idx for idx, tag in enumerate(tags) if tag == TOP_LAYER_TAG]
@@ -33,6 +44,36 @@ def layer_indices_from_tags(atoms: Atoms) -> tuple[list[int], list[int]] | None:
     if top_idx and bot_idx and len(top_idx) + len(bot_idx) == len(atoms):
         return top_idx, bot_idx
     return None
+
+
+def layer_indices_from_z_gap(atoms: Atoms) -> tuple[list[int], list[int]]:
+    if len(atoms) < 2:
+        return list(range(len(atoms))), []
+    order = np.argsort(atoms.positions[:, 2])
+    sorted_z = atoms.positions[order, 2]
+    gaps = np.diff(sorted_z)
+    if len(gaps) == 0 or np.allclose(gaps, 0.0, atol=1e-8):
+        return layer_indices_from_fractional_midplane(atoms)
+    split = int(np.argmax(gaps)) + 1
+    bot_idx = sorted(int(idx) for idx in order[:split])
+    top_idx = sorted(int(idx) for idx in order[split:])
+    if not top_idx or not bot_idx:
+        return layer_indices_from_fractional_midplane(atoms)
+    return top_idx, bot_idx
+
+
+def layer_indices_from_fractional_midplane(atoms: Atoms) -> tuple[list[int], list[int]]:
+    cell_mat = atoms.get_cell().array
+    frac_mat = np.linalg.inv(cell_mat)
+    frac_pos = np.dot(atoms.get_positions(), frac_mat)
+    top_idx = []
+    bot_idx = []
+    for idx, pos in enumerate(frac_pos):
+        if pos[2] > 0.5:
+            top_idx.append(idx)
+        else:
+            bot_idx.append(idx)
+    return top_idx, bot_idx
 
 
 def z_bounds(atoms: Atoms, indexes: list[int]) -> tuple[float, float]:
@@ -45,14 +86,23 @@ def z_thickness(atoms: Atoms, indexes: list[int]) -> float:
     return z_max - z_min
 
 
-def reference_indexes(atoms: Atoms, indexes: list[int], selector: str | tuple[str, ...]) -> list[int]:
+def reference_indexes(
+    atoms: Atoms,
+    indexes: list[int],
+    selector: str | tuple[str, ...],
+    layer_name: str,
+) -> list[int]:
     if selector == "all":
         return list(indexes)
     allowed = {selector} if isinstance(selector, str) else set(selector)
     symbols = atoms.get_chemical_symbols()
     selected = [idx for idx in indexes if symbols[idx] in allowed]
     if not selected:
-        raise ValueError(f"No atoms matched d_reference selector: {sorted(allowed)}")
+        available = sorted({symbols[idx] for idx in indexes})
+        raise ValueError(
+            f"No atoms in {layer_name} matched d_reference selector {sorted(allowed)}; "
+            f"available symbols: {available}"
+        )
     return selected
 
 
@@ -96,21 +146,21 @@ def apply_interlayer_spacing(
     d_mode: str,
     d_reference: dict[str, str | tuple[str, ...]] | None,
 ) -> None:
+    validate_cartesian_z_slab_cell(atoms, "stacked structure")
     top_height = z_thickness(atoms, top_idx)
     bot_height = z_thickness(atoms, bot_idx)
     current_c = _cell_z_length(atoms)
     vacuum_budget = max(current_c - top_height - bot_height, 0.0)
-
-    top_selector = (d_reference or {}).get("top", "all")
-    bot_selector = (d_reference or {}).get("bot", "all")
-    top_ref = reference_indexes(atoms, top_idx, top_selector)
-    bot_ref = reference_indexes(atoms, bot_idx, bot_selector)
 
     center_z = current_c / 2
     if d_mode == "surface_gap":
         top_anchor, _ = z_bounds(atoms, top_idx)
         _, bot_anchor = z_bounds(atoms, bot_idx)
     elif d_mode == "reference_plane_gap":
+        top_selector = (d_reference or {}).get("top", "all")
+        bot_selector = (d_reference or {}).get("bot", "all")
+        top_ref = reference_indexes(atoms, top_idx, top_selector, "top layer")
+        bot_ref = reference_indexes(atoms, bot_idx, bot_selector, "bot layer")
         top_anchor = mean_z(atoms, top_ref)
         bot_anchor = mean_z(atoms, bot_ref)
     else:
@@ -191,23 +241,15 @@ class StructureHandler:
     def read_all_layers(self) -> None:
         self.top_atoms = self.read_atoms(self.input_dir / "top_layer.poscar")
         self.bot_atoms = self.read_atoms(self.input_dir / "bot_layer.poscar")
+        validate_cartesian_z_slab_cell(self.top_atoms, "top_layer.poscar")
+        validate_cartesian_z_slab_cell(self.bot_atoms, "bot_layer.poscar")
 
     def find_layer_idx(self, atoms: Atoms) -> tuple[list[int], list[int]]:
         tagged = layer_indices_from_tags(atoms)
         if tagged is not None:
             return tagged
 
-        cell_mat = atoms.get_cell().array
-        frac_mat = np.linalg.inv(cell_mat)
-        frac_pos = np.dot(atoms.get_positions(), frac_mat)
-        top_idx = []
-        bot_idx = []
-        for idx, pos in enumerate(frac_pos):
-            if pos[2] > 0.5:
-                top_idx.append(idx)
-            else:
-                bot_idx.append(idx)
-        return top_idx, bot_idx
+        return layer_indices_from_z_gap(atoms)
 
     def _generate_all_stackings(self):
         yield from generate_stackings(self.n_sectors)

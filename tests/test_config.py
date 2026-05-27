@@ -171,6 +171,31 @@ def test_load_config_accepts_all_reference_keyword(tmp_path):
     assert config.d_reference == {"top": "all", "bot": "all"}
 
 
+def test_load_config_ignores_reference_when_surface_gap(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        d_mode="surface_gap",
+        d_reference={"top": ["Xx"], "bot": ["Pt"]},
+    )
+
+    config = load_config(config_file)
+
+    assert config.d_reference is None
+
+
+def test_load_config_rejects_invalid_reference_element(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        d_mode="reference_plane_gap",
+        d_reference={"top": ["Xx"], "bot": ["Mo"]},
+    )
+
+    with pytest.raises(ConfigError, match="d_reference.top"):
+        load_config(config_file)
+
+
 def test_load_config_rejects_invalid_d_mode(tmp_path):
     config_file = tmp_path / "config.yaml"
     write_config(config_file, d_mode="center_distance")
