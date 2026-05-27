@@ -11,7 +11,7 @@ from ase.build import make_supercell, sort
 from ase import Atoms
 from ase.io.vasp import read_vasp, write_vasp
 
-from .config import DPmoireLiteConfig, load_config
+from .config import ConfigError, DPmoireLiteConfig, load_config
 from .inputs import (
     copy_submit_script,
     copy_vdw_if_needed,
@@ -126,6 +126,10 @@ def build_stage_all(
     wait: bool = False,
     runner_factory: Callable[[DPmoireLiteConfig], SlurmRunner] | None = None,
 ) -> None:
+    if config.stage != "all":
+        raise ConfigError("build_stage_all requires stage: all")
+    config.validate_build_mode(wait)
+
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +201,8 @@ def check_stage1_inputs(config: DPmoireLiteConfig, stackings: list[tuple[int, in
 def prepare_init_mlff_step2(init_dir: Path, input_dir: Path, sc: tuple[int, int]) -> None:
     init_dir = Path(init_dir)
     input_dir = Path(input_dir)
-    stage_mlff_files(init_dir, init_dir)
+    (init_dir / "ML_ABN").replace(init_dir / "ML_AB")
+    (init_dir / "ML_FFN").replace(init_dir / "ML_FF")
     write_supercell_poscar(input_dir / "top_layer.poscar", init_dir / "POSCAR", sc)
 
 

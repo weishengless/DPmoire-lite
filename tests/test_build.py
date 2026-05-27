@@ -7,8 +7,8 @@ import pytest
 import yaml
 
 import dpmoire_lite.build as build_module
-from dpmoire_lite.build import _ordered_elements, run_build
-from dpmoire_lite.config import ConfigError
+from dpmoire_lite.build import _ordered_elements, build_stage_all, run_build
+from dpmoire_lite.config import ConfigError, load_config
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
 
 
@@ -161,6 +161,8 @@ def test_prepare_init_mlff_step2_renames_ml_files_and_replaces_poscar(tmp_path):
 
     assert (init_dir / "ML_AB").read_text(encoding="utf-8") == "abn-data"
     assert (init_dir / "ML_FF").read_text(encoding="utf-8") == "ffn-data"
+    assert not (init_dir / "ML_ABN").exists()
+    assert not (init_dir / "ML_FFN").exists()
     atoms = read_vasp(init_dir / "POSCAR")
     assert len(atoms) == 6
     assert atoms.cell.lengths()[0] == pytest.approx(6.0)
@@ -172,6 +174,22 @@ def test_run_build_rejects_stage_all_without_submit_wait(tmp_path):
 
     with pytest.raises(ConfigError, match="stage: all"):
         run_build(config, wait=True)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "wait"),
+    [
+        ({"stage": 0, "submit": True}, True),
+        ({"stage": "all", "submit": False}, True),
+        ({"stage": "all", "submit": True}, False),
+    ],
+)
+def test_build_stage_all_validates_direct_calls(tmp_path, overrides, wait):
+    config_path = write_build_config(tmp_path, **overrides)
+    config = load_config(config_path)
+
+    with pytest.raises(ConfigError, match="stage: all"):
+        build_stage_all(config, wait=wait)
 
 
 def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
