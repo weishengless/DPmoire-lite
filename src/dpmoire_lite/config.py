@@ -55,6 +55,8 @@ REQUIRED_FIELDS = (
     "include_monolayer_md",
 )
 
+VALID_D_MODES = {"surface_gap", "reference_plane_gap"}
+
 
 def normalize_pair(value: Any, field: str) -> tuple[int, int]:
     if isinstance(value, bool):
@@ -73,6 +75,47 @@ def normalize_pair(value: Any, field: str) -> tuple[int, int]:
             raise ConfigError(f"{field} values must be positive")
         return x, y
     raise ConfigError(f"{field} must be a positive integer or a two-element list")
+
+
+def normalize_d_mode(value: Any) -> str:
+    mode = str(value).strip()
+    if mode not in VALID_D_MODES:
+        allowed = ", ".join(sorted(VALID_D_MODES))
+        raise ConfigError(f"d_mode must be one of: {allowed}")
+    return mode
+
+
+def normalize_reference_selector(value: Any, field: str) -> str | tuple[str, ...]:
+    if value is None:
+        return "all"
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "all":
+            return "all"
+        if not text:
+            raise ConfigError(f"{field} cannot be empty")
+        return (text,)
+    if isinstance(value, (list, tuple)):
+        items = tuple(str(item).strip() for item in value)
+        if not items or any(not item for item in items):
+            raise ConfigError(f"{field} must contain at least one non-empty element symbol")
+        return items
+    raise ConfigError(f"{field} must be 'all', an element symbol, or a list of element symbols")
+
+
+def normalize_d_reference(value: Any) -> dict[str, str | tuple[str, ...]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ConfigError("d_reference must be a mapping with optional top and bot keys")
+    allowed = {"top", "bot"}
+    extra = sorted(set(value) - allowed)
+    if extra:
+        raise ConfigError(f"d_reference has unknown keys: {', '.join(extra)}")
+    return {
+        "top": normalize_reference_selector(value.get("top"), "d_reference.top"),
+        "bot": normalize_reference_selector(value.get("bot"), "d_reference.bot"),
+    }
 
 
 @dataclass(frozen=True)
@@ -95,6 +138,8 @@ class DPmoireLiteConfig:
     n_sectors: tuple[int, int]
     sc: tuple[int, int]
     d: float
+    d_mode: str
+    d_reference: dict[str, str | tuple[str, ...]] | None
     k_mesh: int
     encut_factor: float
     r_cut: float
@@ -231,6 +276,8 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         n_sectors=normalize_pair(_require(raw, "n_sectors"), field="n_sectors"),
         sc=normalize_pair(_require(raw, "sc"), field="sc"),
         d=_float(_require(raw, "d"), "d"),
+        d_mode=normalize_d_mode(raw.get("d_mode", "surface_gap")),
+        d_reference=normalize_d_reference(raw.get("d_reference")),
         k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
         encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),
         r_cut=_float(_require(raw, "r_cut"), "r_cut"),
