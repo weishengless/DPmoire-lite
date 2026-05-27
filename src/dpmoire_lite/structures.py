@@ -22,6 +22,105 @@ def supercell_matrix(sc: tuple[int, int]) -> list[list[int]]:
     return [[sc_x, 0, 0], [0, sc_y, 0], [0, 0, 1]]
 
 
+TOP_LAYER_TAG = 1
+BOT_LAYER_TAG = 2
+
+
+def layer_indices_from_tags(atoms: Atoms) -> tuple[list[int], list[int]] | None:
+    tags = atoms.get_tags()
+    top_idx = [idx for idx, tag in enumerate(tags) if tag == TOP_LAYER_TAG]
+    bot_idx = [idx for idx, tag in enumerate(tags) if tag == BOT_LAYER_TAG]
+    if top_idx and bot_idx and len(top_idx) + len(bot_idx) == len(atoms):
+        return top_idx, bot_idx
+    return None
+
+
+def z_bounds(atoms: Atoms, indexes: list[int]) -> tuple[float, float]:
+    z = atoms.positions[indexes, 2]
+    return float(z.min()), float(z.max())
+
+
+def z_thickness(atoms: Atoms, indexes: list[int]) -> float:
+    z_min, z_max = z_bounds(atoms, indexes)
+    return z_max - z_min
+
+
+def reference_indexes(atoms: Atoms, indexes: list[int], selector: str | tuple[str, ...]) -> list[int]:
+    if selector == "all":
+        return list(indexes)
+    allowed = {selector} if isinstance(selector, str) else set(selector)
+    symbols = atoms.get_chemical_symbols()
+    selected = [idx for idx in indexes if symbols[idx] in allowed]
+    if not selected:
+        raise ValueError(f"No atoms matched d_reference selector: {sorted(allowed)}")
+    return selected
+
+
+def mean_z(atoms: Atoms, indexes: list[int]) -> float:
+    return float(atoms.positions[indexes, 2].mean())
+
+
+def translate_indexes_z(atoms: Atoms, indexes: list[int], delta_z: float) -> None:
+    positions = atoms.get_positions()
+    positions[indexes, 2] += delta_z
+    atoms.set_positions(positions)
+
+
+def _cell_z_length(atoms: Atoms) -> float:
+    c_z = float(atoms.cell.array[2, 2])
+    if abs(c_z) > 1e-12:
+        return abs(c_z)
+    return float(atoms.cell.lengths()[2])
+
+
+def ensure_cell_contains_z_range(atoms: Atoms, indexes: list[int], vacuum_budget: float) -> None:
+    z = atoms.positions[indexes, 2]
+    z_min = float(z.min())
+    z_max = float(z.max())
+    current_c = _cell_z_length(atoms)
+    target_c = max(current_c, z_max - z_min + vacuum_budget)
+    if target_c > current_c:
+        new_cell = atoms.cell.array.copy()
+        new_cell[2] *= target_c / current_c
+        atoms.set_cell(new_cell, scale_atoms=False)
+    final_c = _cell_z_length(atoms)
+    z_center = float(atoms.positions[indexes, 2].min() + atoms.positions[indexes, 2].max()) / 2
+    translate_indexes_z(atoms, indexes, final_c / 2 - z_center)
+
+
+def apply_interlayer_spacing(
+    atoms: Atoms,
+    top_idx: list[int],
+    bot_idx: list[int],
+    d: float,
+    d_mode: str,
+    d_reference: dict[str, str | tuple[str, ...]] | None,
+) -> None:
+    top_height = z_thickness(atoms, top_idx)
+    bot_height = z_thickness(atoms, bot_idx)
+    current_c = _cell_z_length(atoms)
+    vacuum_budget = max(current_c - top_height - bot_height, 0.0)
+
+    top_selector = (d_reference or {}).get("top", "all")
+    bot_selector = (d_reference or {}).get("bot", "all")
+    top_ref = reference_indexes(atoms, top_idx, top_selector)
+    bot_ref = reference_indexes(atoms, bot_idx, bot_selector)
+
+    center_z = current_c / 2
+    if d_mode == "surface_gap":
+        top_anchor, _ = z_bounds(atoms, top_idx)
+        _, bot_anchor = z_bounds(atoms, bot_idx)
+    elif d_mode == "reference_plane_gap":
+        top_anchor = mean_z(atoms, top_ref)
+        bot_anchor = mean_z(atoms, bot_ref)
+    else:
+        raise ValueError(f"Unsupported d_mode: {d_mode}")
+
+    translate_indexes_z(atoms, bot_idx, center_z - d / 2 - bot_anchor)
+    translate_indexes_z(atoms, top_idx, center_z + d / 2 - top_anchor)
+    ensure_cell_contains_z_range(atoms, top_idx + bot_idx, vacuum_budget)
+
+
 def rewrite_contcar_as_poscar(contcar: Path, poscar: Path) -> None:
     atoms = read_vasp(contcar)
     write_vasp(poscar, atoms=atoms, direct=True, sort=False)
@@ -37,11 +136,21 @@ def normalize_symbol_label(label: str) -> str:
 class StructureHandler:
     """Handle crystal structures during DPmoire-lite preprocessing."""
 
-    def __init__(self, input_dir: Path, work_dir: Path, n_sectors: tuple[int, int], d: float):
+    def __init__(
+        self,
+        input_dir: Path,
+        work_dir: Path,
+        n_sectors: tuple[int, int],
+        d: float,
+        d_mode: str = "surface_gap",
+        d_reference: dict[str, str | tuple[str, ...]] | None = None,
+    ):
         self.input_dir = Path(input_dir)
         self.work_dir = Path(work_dir)
         self.n_sectors = n_sectors
         self.d = d
+        self.d_mode = d_mode
+        self.d_reference = d_reference
         self.top_atoms: Atoms | None = None
         self.bot_atoms: Atoms | None = None
         self.top_indexes: list[int] = []
@@ -84,6 +193,10 @@ class StructureHandler:
         self.bot_atoms = self.read_atoms(self.input_dir / "bot_layer.poscar")
 
     def find_layer_idx(self, atoms: Atoms) -> tuple[list[int], list[int]]:
+        tagged = layer_indices_from_tags(atoms)
+        if tagged is not None:
+            return tagged
+
         cell_mat = atoms.get_cell().array
         frac_mat = np.linalg.inv(cell_mat)
         frac_pos = np.dot(atoms.get_positions(), frac_mat)
@@ -136,17 +249,33 @@ class StructureHandler:
         fractional_pos_top = np.dot(self.top_atoms.get_positions(), np.linalg.inv(top_cell_mat))
         fractional_pos_bot = np.dot(self.bot_atoms.get_positions(), np.linalg.inv(bot_cell_mat))
         new_cell_mat = np.array([top_cell_mat[k] * (1 + bot_cell_len[k] / top_cell_len[k]) / 2 for k in range(3)])
-        c_top = np.mean([k[2] for k in fractional_pos_top])
-        c_bot = np.mean([k[2] for k in fractional_pos_bot])
-        total_c = self.top_atoms.get_cell().lengths()[2] + self.bot_atoms.get_cell().lengths()[2]
-        for i, _ in enumerate(fractional_pos_top):
-            fractional_pos_top[i][2] += 0.5 - c_top + d / total_c
-        for i, _ in enumerate(fractional_pos_bot):
-            fractional_pos_bot[i][2] += 0.5 - c_bot - d / total_c
-        new_pos_top = [[item[0], item[1], item[2]] for item in np.dot(fractional_pos_top, new_cell_mat)]
-        new_pos_bot = [[item[0], item[1], item[2]] for item in np.dot(fractional_pos_bot, new_cell_mat)]
-        new_symbols = self.top_atoms.get_chemical_symbols() + self.bot_atoms.get_chemical_symbols()
-        atoms = sort(Atoms(positions=new_pos_top + new_pos_bot, symbols=new_symbols, cell=new_cell_mat, pbc=[True, True, True]))
+
+        top_positions = np.dot(fractional_pos_top, new_cell_mat)
+        bot_positions = np.dot(fractional_pos_bot, new_cell_mat)
+        top_positions[:, 2] = self.top_atoms.get_positions()[:, 2]
+        bot_positions[:, 2] = self.bot_atoms.get_positions()[:, 2]
+
+        top_atoms = Atoms(
+            positions=top_positions,
+            symbols=self.top_atoms.get_chemical_symbols(),
+            cell=new_cell_mat,
+            pbc=[True, True, True],
+        )
+        bot_atoms = Atoms(
+            positions=bot_positions,
+            symbols=self.bot_atoms.get_chemical_symbols(),
+            cell=new_cell_mat,
+            pbc=[True, True, True],
+        )
+        top_atoms.set_tags([TOP_LAYER_TAG] * len(top_atoms))
+        bot_atoms.set_tags([BOT_LAYER_TAG] * len(bot_atoms))
+
+        atoms = top_atoms + bot_atoms
+        top_idx = list(range(len(top_atoms)))
+        bot_idx = list(range(len(top_atoms), len(atoms)))
+        apply_interlayer_spacing(atoms, top_idx, bot_idx, d, self.d_mode, self.d_reference)
+
+        atoms = sort(atoms)
         top_idx, bot_idx = self.find_layer_idx(atoms)
         return atoms, top_idx, bot_idx
 
@@ -206,18 +335,20 @@ class StructureHandler:
         write_vasp(outfile, atoms_sc)
 
     def make_twist_struct(self, N_min: int, N_max: int, out_dir: Path | str):
-        from ._find_homo_twist import adjust_atoms_d, search_twist
+        from ._find_homo_twist import search_twist
 
-        top_atoms = copy.deepcopy(self.top_atoms)
-        bot_atoms = copy.deepcopy(self.bot_atoms)
-        top_atoms, bot_atoms = adjust_atoms_d(top_atoms, bot_atoms, self.d)
         angle_list, mat_list = search_twist(N_min, N_max)
         out_atoms_list = []
         base_out_dir = Path(out_dir)
         for idx, mat in enumerate(mat_list):
-            top_sc = make_supercell(top_atoms, P=mat[0])
-            bot_sc = make_supercell(bot_atoms, P=mat[1])
-            out_atoms = stack(bot_sc, top_sc, maxstrain=None, reorder=True)
+            top_sc = make_supercell(copy.deepcopy(self.top_atoms), P=mat[0])
+            bot_sc = make_supercell(copy.deepcopy(self.bot_atoms), P=mat[1])
+            out_atoms = stack(bot_sc, top_sc, maxstrain=None, reorder=False)
+            bot_idx = list(range(len(bot_sc)))
+            top_idx = list(range(len(bot_sc), len(out_atoms)))
+            out_atoms.set_tags([BOT_LAYER_TAG] * len(bot_idx) + [TOP_LAYER_TAG] * len(top_idx))
+            apply_interlayer_spacing(out_atoms, top_idx, bot_idx, self.d, self.d_mode, self.d_reference)
+            out_atoms = sort(out_atoms)
             out_atoms_list.append(out_atoms)
             target_dir = base_out_dir / angle_list[idx]
             target_dir.mkdir(parents=True, exist_ok=True)
