@@ -1,116 +1,160 @@
 # DPmoire-lite
 
-DPmoire-lite generates VASP calculation folders and collects `extxyz` datasets for moire and bilayer force-field data construction. It is focused on data preparation: it does not train MLFF models, and it does not automatically merge datasets.
+DPmoire-lite is a clean VASP dataset-generation framework extracted from the
+original DPmoire workflow. It generates calculation folders for bilayer or moire
+force-field dataset construction, submits optional Slurm jobs, and collects
+completed calculations into separate `extxyz` datasets.
 
-DPmoire-lite 用于为莫尔/双层体系力场数据构建生成 VASP 计算目录，并从计算结果收集 `extxyz` 数据集。它只负责数据准备：不训练 MLFF 模型，也不会自动合并数据集。
+The project focuses only on dataset preparation. It does not train a model and
+does not merge relaxation, MD, and validation datasets automatically.
 
-## Quick Start / 快速开始
+## Quick Start
 
 ```bash
 DPmoireLite init-example my_case
 cd my_case
-# Edit config.yaml, input files, scripts, and POTCAR path first.
+# Edit config.yaml, input files, scripts, and potcar_dir first.
 DPmoireLite build config.yaml
 DPmoireLite collect config.yaml --stage rlx
 DPmoireLite collect config.yaml --stage md
 DPmoireLite collect config.yaml --stage validation
 ```
 
-先用 `init-example` 复制示例工程，然后修改 `config.yaml`、`input/`、`scripts/` 和 `potcar_dir`。`build` 负责生成计算目录，`collect` 只收集用户显式指定的阶段。
+`init-example` copies a self-contained template with `config.yaml`, `input/`,
+and `scripts/`. The generated `config.yaml` contains inline comments for every
+supported tag.
 
-## Workflow / 工作流
+## Required Input Files
 
-Stage0 creates the first calculation set. Depending on config flags, it can generate `init_mlff`, relaxation folders under `rlx/`, and optional validation folders under `validation/`.
+`input_dir` must contain these structure and INCAR template files:
 
-Stage1 creates MD folders under `md/`. It depends on completed relaxation outputs and, when `vasp_ml: true`, the initialized MLFF files.
+- `top_layer.poscar`: top monolayer primitive or pre-matched cell.
+- `bot_layer.poscar`: bottom monolayer primitive or pre-matched cell.
+- `init_INCAR`: INCAR template for the initial single-layer MLFF calculation.
+- `rlx_INCAR`: INCAR template for stacking relaxation calculations.
+- `MD_INCAR`: INCAR template for bilayer MD calculations.
+- `MD_monolayer_INCAR`: INCAR template for optional monolayer MD calculations.
+- `val_INCAR`: INCAR template for optional twist validation calculations.
 
-Stage0 负责第一批计算目录：根据配置生成 `init_mlff`、`rlx/` 下的弛豫目录，以及可选的 `validation/` 目录。Stage1 负责生成 `md/` 下的 MD 目录；它依赖已经完成的弛豫结果，并在 `vasp_ml: true` 时依赖初始化好的 MLFF 文件。
+If an INCAR template contains `LUSE_VDW = T`, `input_dir` must also contain
+`vdw_kernel.bindat`; it will be copied into generated calculation folders.
 
-Manual folder generation is also supported: set the desired `stage` in `config.yaml`, run `DPmoireLite build config.yaml`, inspect or submit the generated folders, then run `collect` only after the relevant VASP jobs have finished.
+`script_dir` must contain the Slurm script named by `dft_script`.
 
-也可以手动分阶段生成目录：在 `config.yaml` 中设置需要的 `stage`，运行 `DPmoireLite build config.yaml`，检查或提交生成目录；相关 VASP 作业完成后，再运行对应的 `collect`。
+`potcar_dir` should point to a VASP POTCAR root. For elements with VASP's
+recommended mapped folders, DPmoire-lite tries the mapped folder first, for
+example `Li_sv` for `Li`, then falls back to the plain element folder.
 
-## Submission / 提交作业
+## Workflow
 
-`submit: false` only generates folders. `submit: true` generates folders and submits the relevant Slurm jobs, but returns after submission unless the command also receives `--wait`.
+`stage: 0` creates the first calculation set:
 
-`submit: true` plus `DPmoireLite build config.yaml --wait` waits for submitted jobs where the workflow requires downstream outputs. `stage: all` requires both `submit: true` and `--wait`, because it must submit stage0, wait for the main dependency chain, and then generate stage1.
+- `init_mlff/` if `init_mlff: true`
+- `rlx/<i>_<j>/` folders if `do_relaxation: true`
+- `validation/<angle>/` folders if `twist_val: true`
 
-`submit: false` 只生成目录。`submit: true` 会生成目录并提交相关 Slurm 作业，但如果命令没有加 `--wait`，提交后就返回。
+`stage: 1` creates MD folders under `md/`. It checks the relaxation outputs
+before writing any MD folder. When `vasp_ml: true`, it also requires
+`init_mlff/ML_ABN` and `init_mlff/ML_FFN`, then distributes them as `ML_AB` and
+`ML_FF` into each MD folder.
 
-`submit: true` 配合 `DPmoireLite build config.yaml --wait` 会在流程需要下游输出时等待作业完成。`stage: all` 必须同时使用 `submit: true` 和 `--wait`，因为它需要先提交 stage0，等待主依赖链完成，再生成 stage1。
+`stage: all` is an automated submit-and-wait workflow. It requires both
+`submit: true` and `DPmoireLite build config.yaml --wait`, because stage1 needs
+completed stage0 outputs.
 
-## Validation / 验证集
-
-Validation is an independent timeline. Validation jobs do not block stage1, and validation data is collected only by:
+Validation is an independent timeline. Validation jobs do not block stage1, and
+validation data is collected only when the user explicitly runs:
 
 ```bash
 DPmoireLite collect config.yaml --stage validation
 ```
 
-验证集是独立时间线。validation 作业不会阻塞 stage1；验证集数据只会在用户显式运行 `collect --stage validation` 时收集。
+## Submission Semantics
 
-## Stage1 Checks / Stage1 严格检查
+`submit: false` only generates folders.
 
-Stage1 is intentionally strict. Before writing MD folders, it checks that each required relaxation source exists and is converged. When `vasp_ml: true`, it also checks that `init_mlff/ML_ABN` and `init_mlff/ML_FFN` exist. If any check fails, stage1 stops and reports all detected failures instead of generating a partial MD set.
+`submit: true` without `--wait` generates folders, submits all jobs requested by
+the current stage, and exits. In this mode `n_nodes` and `auto_resub` cannot be
+enforced because the process does not keep polling Slurm.
 
-Stage1 会严格检查输入。在写入 MD 目录前，它会检查每个必需的弛豫来源是否存在并已收敛；当 `vasp_ml: true` 时，还会检查 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN`。只要有检查失败，stage1 就停止，并报告所有检测到的问题，而不是生成不完整的 MD 集合。
+`submit: true` with `--wait` submits jobs while keeping at most `n_nodes` active
+jobs in the DPmoire-lite polling loop. If `auto_resub: true`, failed Slurm jobs
+are resubmitted at most once per calculation directory.
 
-## Collection / 数据收集
+The initial MLFF workflow is intentionally explicit:
 
-Collection is permissive. Missing, invalid, or unreadable sources are skipped where possible, and the stage manifest records collected frame counts plus skipped or failed records. This lets one bad calculation avoid destroying the whole collection pass.
+- Manual mode: stage0 creates and optionally submits only the first `init_mlff`
+  job. After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use
+  those files.
+- Automated mode: `stage: all`, `submit: true`, and `--wait` run the two-step
+  init MLFF dependency chain before generating stage1.
 
-Outputs are written separately:
+## Collection Semantics
 
-- `rlx_data.extxyz` for `collect --stage rlx`
-- `MD_data.extxyz` for `collect --stage md`
-- `valid.extxyz` for `collect --stage validation`
+Collection is permissive. Missing or unreadable sources are skipped where
+possible, and the stage manifest records collected frame counts plus skipped or
+failed records.
 
-DPmoire-lite does not automatically merge these files into one dataset.
+Output files are kept separate:
 
-收集逻辑是宽容的。缺失、无效或无法读取的来源会尽量跳过，并在对应阶段的 manifest 中记录帧数、跳过项和失败项。这样单个坏计算不会直接破坏整个收集过程。
+- `work_dir/rlx_data.extxyz` from `collect --stage rlx`
+- `work_dir/MD_data.extxyz` from `collect --stage md`
+- `work_dir/valid.extxyz` from `collect --stage validation`
 
-输出文件保持分开：`rlx_data.extxyz`、`MD_data.extxyz` 和 `valid.extxyz`。DPmoire-lite 不会自动把它们合并成一个总数据集。
+For relaxation data, DPmoire-lite reads the configured OUTCAR series and keeps
+one frame every `outcar_collect_freq` ionic steps.
 
-## Geometry Options / 几何参数
+For MD data:
 
-`n_sectors` controls stacking-sector sampling and accepts either an integer or a rectangular pair:
+- If `vasp_ml: true`, DPmoire-lite reads `ML_ABN` and collects only the ab initio
+  configurations. If `ML_AB` exists, already-seen configurations are skipped.
+- If `vasp_ml: false`, DPmoire-lite reads OUTCAR files using
+  `outcar_collect_freq`.
 
-```yaml
-n_sectors: 9       # same as [9, 9]
-n_sectors: [9, 8]  # rectangular grid
-```
+For validation data, all OUTCAR ionic steps are collected with frequency 1.
 
-`sc` controls supercell expansion and also accepts either an integer or a rectangular pair:
+## Config Tags
 
-```yaml
-sc: 2       # same as [2, 2]
-sc: [2, 1]  # rectangular supercell
-```
+Config files use snake_case keys only. Old DPmoire names such as `VASP_ML`,
+`K-mesh`, `POTCAR_dir`, `DFT_script`, `ENMAX`, and `OUTCAR_collect_freq` are
+rejected.
 
-`n_sectors` 控制堆垛采样网格，可以写成整数或矩形二元组。`sc` 控制超胞扩展，也可以写成整数或矩形二元组。
+| Tag | Type | Meaning |
+| --- | --- | --- |
+| `dft_script` | string | Slurm submit script filename. The file is copied from `script_dir` into each generated calculation folder and submitted with `sbatch`. |
+| `potcar_dir` | path | Root directory containing POTCAR subfolders. DPmoire-lite applies VASP recommended element-folder mapping where available, then falls back to the plain element name. |
+| `script_dir` | path | Directory containing prepared submit scripts. |
+| `input_dir` | path | Directory containing layer POSCAR files, INCAR templates, and optional `vdw_kernel.bindat`. |
+| `work_dir` | path | Root output directory for generated stages, manifests, backups, and collected datasets. |
+| `n_nodes` | positive int | Maximum number of active Slurm jobs in `--wait` mode. Non-wait mode submits all jobs and exits. |
+| `stage` | `0`, `1`, or `all` | Build stage. `0` generates init, relaxation, and validation folders. `1` generates MD folders from completed relaxation outputs. `all` runs the automated dependency chain. |
+| `submit` | bool | If `false`, only generate folders. If `true`, submit generated folders with Slurm. |
+| `auto_resub` | bool | In `--wait` mode, resubmit failed Slurm jobs once per calculation directory. Ignored in non-wait mode. |
+| `vasp_ml` | bool | Use VASP MLFF workflow for MD. Stage1 distributes `init_mlff/ML_ABN` and `init_mlff/ML_FFN`; MD collection reads `ML_ABN` instead of OUTCAR. |
+| `outcar_collect_freq` | positive int | OUTCAR sampling stride for relaxation and non-ML MD collection. Validation always uses stride 1. VASP-ML MD collection reads `ML_ABN`, so this tag does not affect that path. |
+| `do_relaxation` | bool | In stage0, generate relaxation folders under `rlx/`. |
+| `init_mlff` | bool | In stage0, generate the initial `init_mlff/` folder. |
+| `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |
+| `n_sectors` | int or `[nx, ny]` | Stacking-shift grid. `9` means `[9, 9]`; `[9, 8]` creates a rectangular grid. |
+| `sc` | int or `[sx, sy]` | Supercell expansion used for MD and, when `sc_rlx: true`, relaxation. `2` means `[2, 2]`. |
+| `d` | number | Interlayer distance used when constructing bilayer and validation structures. |
+| `k_mesh` | int | KPOINTS target. DPmoire-lite writes a Gamma mesh from the in-plane cell lengths and the active supercell scale. |
+| `encut_factor` | number | INCAR `ENCUT` is rendered as `encut_factor * max(POTCAR ENMAX)` for the selected elements. |
+| `r_cut` | number | Value written to `ML_RCUT1` and `ML_RCUT2`. If negative, DPmoire-lite uses an automatic value based on the largest input-layer in-plane lattice length and `d`. |
+| `symm_reduce` | bool | Reduce stacking shifts by symmetry using `pymatgen`/`spglib` and write `sym_reduced_stackings.txt`. |
+| `twist_val` | bool | Generate twist validation calculation folders in stage0. Validation is not part of the MD timeline. |
+| `min_val_n` | int | Minimum `n` used by the twist validation search. Used only when `twist_val: true`. |
+| `max_val_n` | int | Maximum `n` used by the twist validation search. Used only when `twist_val: true`. |
+| `include_monolayer_md` | bool | In stage1, also generate `md/top_layer` and `md/bot_layer` monolayer MD folders. |
+| `outcar_patterns` | list of regex strings, optional | Regex list used to discover OUTCAR series during collection. Defaults to `OUTCAR`, `OUTCAR<number>`, `OUT<number>`, and `out<number>`. |
 
-## Init MLFF / 初始化 MLFF
+## Directory Replacement Policy
 
-Manual workflow: run stage0 with `init_mlff: true`, wait for the initial MLFF calculation to finish, make sure `ML_ABN` and `ML_FFN` are present in `init_mlff/`, then run stage1.
+When a generated child directory already exists, DPmoire-lite backs up that
+child directory with a timestamp suffix and regenerates it. This is scoped to
+the stage child being regenerated, not to the whole `work_dir`.
 
-Automatic workflow: use `stage: all`, `submit: true`, and `DPmoireLite build config.yaml --wait`. DPmoire-lite submits the init MLFF and relaxation jobs, waits for the required dependency chain, prepares the second init MLFF step when needed, and then generates/submits stage1.
-
-手动流程：设置 `init_mlff: true` 运行 stage0，等待初始化 MLFF 计算完成，确认 `init_mlff/` 中已有 `ML_ABN` 和 `ML_FFN`，再运行 stage1。
-
-自动流程：使用 `stage: all`、`submit: true` 和 `DPmoireLite build config.yaml --wait`。DPmoire-lite 会提交 init MLFF 和弛豫作业，等待必需依赖链，在需要时准备第二步 init MLFF，然后生成/提交 stage1。
-
-## Config Rules / 配置规则
-
-Config keys use snake_case only. Old DPmoire field names are not accepted.
-
-`encut_factor` multiplies the maximum `ENMAX` read from the selected POTCAR files to produce the rendered INCAR `ENCUT`.
-
-配置键只接受 snake_case。旧版 DPmoire 字段名不会被接受。
-
-`encut_factor` 的含义是：读取所选 POTCAR 中最大的 `ENMAX`，再乘以该系数，得到写入 INCAR 的 `ENCUT`。
-
-## CLI / 命令
+## CLI
 
 ```bash
 DPmoireLite init-example my_case
@@ -120,4 +164,3 @@ DPmoireLite collect config.yaml --stage rlx
 DPmoireLite collect config.yaml --stage md
 DPmoireLite collect config.yaml --stage validation
 ```
-

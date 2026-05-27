@@ -1,25 +1,100 @@
+# DPmoire-lite example configuration.
+# All keys use snake_case. Old DPmoire names such as VASP_ML, K-mesh,
+# POTCAR_dir, DFT_script, ENMAX, and OUTCAR_collect_freq are rejected.
+
+# Slurm submit script filename. The file must exist in script_dir and is copied
+# into every generated calculation folder.
 dft_script: DFT_script.sh
+
+# Root directory containing POTCAR subfolders. DPmoire-lite tries VASP
+# recommended mapped names first where available, for example Li_sv for Li,
+# then falls back to the plain element name.
 potcar_dir: ./potcars
+
+# Directory containing prepared submit scripts.
 script_dir: ./scripts
+
+# Directory containing top_layer.poscar, bot_layer.poscar, INCAR templates, and
+# optional vdw_kernel.bindat.
 input_dir: ./input
+
+# Root directory for generated stages, manifests, backups, and collected data.
 work_dir: ./work
+
+# Maximum number of active Slurm jobs while running build --wait. Non-wait mode
+# submits all jobs requested by the current stage and exits.
 n_nodes: 1
+
+# Build stage: 0 generates init_mlff, rlx, and optional validation folders; 1
+# generates md folders; all runs the automated submit-and-wait dependency chain.
 stage: 0
+
+# false: only generate folders. true: submit generated folders with Slurm.
 submit: false
+
+# In build --wait mode, resubmit failed Slurm jobs once per calculation
+# directory. Ignored without --wait.
 auto_resub: false
+
+# true: use VASP MLFF for MD. Stage1 distributes init_mlff/ML_ABN and ML_FFN as
+# ML_AB and ML_FF, and MD collection reads ML_ABN. false: collect MD from OUTCAR.
 vasp_ml: true
+
+# OUTCAR sampling stride for relaxation and non-ML MD collection. Validation
+# always uses stride 1. VASP-ML MD collection reads ML_ABN, so this does not
+# affect that path.
 outcar_collect_freq: 8
+
+# In stage0, generate stacking relaxation folders under rlx/.
 do_relaxation: true
+
+# In stage0, generate the initial init_mlff/ folder.
 init_mlff: true
+
+# true: relax supercell stacking structures. false: relax primitive glide
+# structures, then expand the converged CONTCAR during stage1.
 sc_rlx: true
+
+# Stacking-shift grid. An integer means [n, n]; a pair allows rectangular grids.
 n_sectors: [3, 2]
+
+# Supercell expansion for MD and, when sc_rlx is true, relaxation. An integer
+# means [n, n]; a pair allows rectangular supercells.
 sc: [2, 2]
+
+# Interlayer distance used when building bilayer and validation structures.
 d: 6.3
+
+# KPOINTS target used to render a Gamma-centered mesh from the in-plane cell
+# lengths and active supercell scale.
 k_mesh: 40
+
+# INCAR ENCUT is rendered as encut_factor * max(POTCAR ENMAX).
 encut_factor: 1.6
+
+# Value written to ML_RCUT1 and ML_RCUT2. Use a negative value for the automatic
+# estimate based on the largest input-layer in-plane lattice length and d.
 r_cut: -1
+
+# Reduce stacking shifts by symmetry using pymatgen/spglib and write
+# sym_reduced_stackings.txt.
 symm_reduce: false
+
+# Generate twist validation folders in stage0. Validation is independent from
+# stage1 and is collected only by collect --stage validation.
 twist_val: false
+
+# Minimum and maximum n values for the twist validation search.
 min_val_n: 4
 max_val_n: 5
+
+# In stage1, also generate md/top_layer and md/bot_layer monolayer MD folders.
 include_monolayer_md: true
+
+# Optional regex list used to discover OUTCAR series during collection.
+# Defaults are kept explicit here for readability.
+outcar_patterns:
+  - '^OUTCAR$'
+  - '^OUTCAR\d+$'
+  - '^OUT\d+$'
+  - '^out\d+$'
