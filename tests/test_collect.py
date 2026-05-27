@@ -130,6 +130,53 @@ def test_collect_ml_md_skips_existing_ml_ab_prefix(tmp_path, sample_dir):
     assert manifest.collect["sources"] == 1
 
 
+def test_collect_ml_md_skips_source_when_ml_ab_count_fails(tmp_path, sample_dir):
+    config_path = write_collect_config(tmp_path, vasp_ml=True)
+    work = tmp_path / "work"
+    md_dir = work / "md" / "0_0"
+    md_dir.mkdir(parents=True)
+    shutil.copy2(sample_dir / "ML_ABN", md_dir / "ML_ABN")
+    (md_dir / "ML_AB").write_text("not\nan\nML_AB\nfile\nbad-count\n", encoding="utf-8")
+    write_manifest(
+        work,
+        Manifest(stage="md", generated_at="test", directories=["md/0_0"]),
+    )
+
+    run_collect(config_path, stage="md")
+
+    manifest = read_manifest(work, "md")
+    assert not (work / "MD_data.extxyz").exists()
+    assert manifest.collect["frames"] == 0
+    assert manifest.collect["sources"] == 0
+    assert manifest.collect["written"] is False
+    assert any(
+        record["path"] == "md/0_0/ML_AB"
+        and "Could not read ML_AB count" in record["reason"]
+        for record in manifest.failed
+    )
+
+
+def test_collect_removes_stale_output_when_no_frames_are_collected(tmp_path):
+    config_path = write_collect_config(tmp_path, vasp_ml=True)
+    work = tmp_path / "work"
+    work.mkdir(parents=True)
+    stale_output = work / "MD_data.extxyz"
+    stale_output.write_text("old dataset\n", encoding="utf-8")
+    write_manifest(
+        work,
+        Manifest(stage="md", generated_at="test", directories=[]),
+    )
+
+    run_collect(config_path, stage="md")
+
+    manifest = read_manifest(work, "md")
+    assert not stale_output.exists()
+    assert manifest.collect["frames"] == 0
+    assert manifest.collect["output"] == "MD_data.extxyz"
+    assert manifest.collect["written"] is False
+    assert manifest.collect["removed_stale_output"] is True
+
+
 def test_collect_validation_uses_all_ionic_steps(monkeypatch, tmp_path):
     config_path = write_collect_config(tmp_path, vasp_ml=False, outcar_collect_freq=11)
     work = tmp_path / "work"

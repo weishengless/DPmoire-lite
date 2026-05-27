@@ -36,6 +36,14 @@ def run_collect(config_path: Path, stage: str) -> None:
     if dataset.n_configs > 0:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         dataset.save_extxyz(output_path)
+        manifest.collect["written"] = True
+        manifest.collect["removed_stale_output"] = False
+    else:
+        removed_stale_output = output_path.exists()
+        if removed_stale_output:
+            output_path.unlink()
+        manifest.collect["written"] = False
+        manifest.collect["removed_stale_output"] = removed_stale_output
     write_manifest(config.work_dir, manifest)
 
 
@@ -77,6 +85,7 @@ def _collect_md_ml(config: DPmoireLiteConfig, manifest: Manifest) -> tuple[Datas
                 skip_configs = count_ml_ab_configs(ml_ab)
             except Exception as exc:
                 _record(manifest.failed, config.work_dir, ml_ab, f"Could not read ML_AB count: {exc}")
+                continue
 
         source_count += 1
         try:
