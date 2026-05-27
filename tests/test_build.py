@@ -1,11 +1,14 @@
 import math
+import shutil
 
 from ase import Atoms
 from ase.io.vasp import read_vasp, write_vasp
 import pytest
 import yaml
 
+import dpmoire_lite.build as build_module
 from dpmoire_lite.build import _ordered_elements, run_build
+from dpmoire_lite.config import ConfigError
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
 
 
@@ -99,6 +102,41 @@ def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_bl
     return target
 
 
+class FakeRunner:
+    def __init__(self):
+        self.events = []
+        self.submit_paths = []
+        self._next_id = 1
+
+    def submit(self, work_dir, rel_path):
+        self.events.append(("submit", rel_path))
+        self.submit_paths.append(rel_path)
+        job = SlurmJob(job_id=str(self._next_id), path=rel_path)
+        self._next_id += 1
+        return job
+
+    def wait(self, jobs):
+        paths = [job.path for job in jobs]
+        self.events.append(("wait", paths))
+        for job in jobs:
+            work_dir = self.root / job.path
+            if job.path == "init_mlff":
+                if (work_dir / "ML_AB").exists():
+                    (work_dir / "ML_ABN").write_text("step2-abn", encoding="utf-8")
+                    (work_dir / "ML_FFN").write_text("step2-ffn", encoding="utf-8")
+                else:
+                    (work_dir / "ML_ABN").write_text("step1-abn", encoding="utf-8")
+                    (work_dir / "ML_FFN").write_text("step1-ffn", encoding="utf-8")
+            elif job.path.startswith("rlx/"):
+                shutil.copy2(work_dir / "POSCAR", work_dir / "CONTCAR")
+                (work_dir / "OUTCAR").write_text(
+                    "reached required accuracy - stopping structural energy minimisation\n",
+                    encoding="utf-8",
+                )
+            job.status = "COMPLETED"
+        return jobs
+
+
 def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     config = write_build_config(tmp_path)
     run_build(config, wait=False)
@@ -107,6 +145,33 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "0_0" / "INCAR").exists()
     assert (work / "rlx" / "1_0" / "KPOINTS").exists()
     assert (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_prepare_init_mlff_step2_renames_ml_files_and_replaces_poscar(tmp_path):
+    from dpmoire_lite.build import prepare_init_mlff_step2
+
+    input_dir, _, _ = write_minimal_inputs(tmp_path, top_a=3.0, bot_a=4.0)
+    init_dir = tmp_path / "work" / "init_mlff"
+    init_dir.mkdir(parents=True)
+    (init_dir / "ML_ABN").write_text("abn-data", encoding="utf-8")
+    (init_dir / "ML_FFN").write_text("ffn-data", encoding="utf-8")
+    (init_dir / "POSCAR").write_text("old poscar\n", encoding="utf-8")
+
+    prepare_init_mlff_step2(init_dir, input_dir, (2, 3))
+
+    assert (init_dir / "ML_AB").read_text(encoding="utf-8") == "abn-data"
+    assert (init_dir / "ML_FF").read_text(encoding="utf-8") == "ffn-data"
+    atoms = read_vasp(init_dir / "POSCAR")
+    assert len(atoms) == 6
+    assert atoms.cell.lengths()[0] == pytest.approx(6.0)
+    assert atoms.cell.lengths()[1] == pytest.approx(9.0)
+
+
+def test_run_build_rejects_stage_all_without_submit_wait(tmp_path):
+    config = write_build_config(tmp_path, stage="all", submit=False)
+
+    with pytest.raises(ConfigError, match="stage: all"):
+        run_build(config, wait=True)
 
 
 def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
@@ -231,6 +296,63 @@ def test_ordered_elements_preserves_consecutive_symbol_groups():
     atoms = Atoms("MoSMo", positions=[[0, 0, 0], [0, 0, 1], [0, 0, 2]], cell=[4, 4, 12], pbc=True)
 
     assert _ordered_elements(atoms) == ["Mo", "S", "Mo"]
+
+
+def test_stage_all_waits_init_step2_and_rlx_before_generating_md(monkeypatch, tmp_path):
+    fake_runner = FakeRunner()
+    fake_runner.root = tmp_path / "work"
+    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
+
+    def fake_twist_struct(self, _min_n, _max_n, _out_dir):
+        return ["1.00deg"], [Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True)]
+
+    monkeypatch.setattr(build_module.StructureHandler, "make_twist_struct", fake_twist_struct)
+    config = write_build_config(
+        tmp_path,
+        stage="all",
+        submit=True,
+        n_sectors=[1, 1],
+        twist_val=True,
+        include_monolayer_md=False,
+    )
+
+    run_build(config, wait=True)
+
+    work = tmp_path / "work"
+    assert (work / "init_mlff" / "ML_AB").read_text(encoding="utf-8") == "step1-abn"
+    assert (work / "init_mlff" / "ML_FF").read_text(encoding="utf-8") == "step1-ffn"
+    assert (work / "init_mlff" / "ML_ABN").read_text(encoding="utf-8") == "step2-abn"
+    assert (work / "init_mlff" / "ML_FFN").read_text(encoding="utf-8") == "step2-ffn"
+    assert (work / "md" / "0_0" / "ML_AB").read_text(encoding="utf-8") == "step2-abn"
+    assert (work / "md" / "0_0" / "ML_FF").read_text(encoding="utf-8") == "step2-ffn"
+    assert fake_runner.events == [
+        ("submit", "init_mlff"),
+        ("wait", ["init_mlff"]),
+        ("submit", "init_mlff"),
+        ("wait", ["init_mlff"]),
+        ("submit", "rlx/0_0"),
+        ("wait", ["rlx/0_0"]),
+        ("submit", "validation/1.00deg"),
+        ("submit", "md/0_0"),
+    ]
+
+
+def test_stage0_submit_without_wait_submits_only_init_step1(monkeypatch, tmp_path):
+    fake_runner = FakeRunner()
+    fake_runner.root = tmp_path / "work"
+    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
+    config = write_build_config(
+        tmp_path,
+        submit=True,
+        do_relaxation=False,
+        twist_val=False,
+    )
+
+    run_build(config, wait=False)
+
+    assert fake_runner.events == [("submit", "init_mlff")]
+    assert not (tmp_path / "work" / "init_mlff" / "ML_AB").exists()
+    assert not (tmp_path / "work" / "init_mlff" / "ML_FF").exists()
 
 
 def test_parse_sbatch_output_extracts_job_id():

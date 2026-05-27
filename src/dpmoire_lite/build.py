@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import tempfile
+import shutil
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -62,7 +63,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
         _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait)
 
 
-def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
+def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -101,7 +102,10 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
                 stage_mlff_files(init_mlff_dir, target)
             directories.append(target)
 
-    runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
+    if not config.submit:
+        runner = None
+    elif runner is None:
+        runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub)
     jobs = _submit_dirs(config, runner, directories, wait)
     write_manifest(
         config.work_dir,
@@ -117,9 +121,35 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False) -> None:
     )
 
 
-def build_stage_all(config: DPmoireLiteConfig, wait: bool = False) -> None:
-    _ = (config, wait)
-    raise NotImplementedError("stage all build is added in a later task")
+def build_stage_all(
+    config: DPmoireLiteConfig,
+    wait: bool = False,
+    runner_factory: Callable[[DPmoireLiteConfig], SlurmRunner] | None = None,
+) -> None:
+    generated_at = datetime.now().isoformat(timespec="seconds")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    config.work_dir.mkdir(parents=True, exist_ok=True)
+    structures = StructureHandler(config.input_dir, config.work_dir, config.n_sectors, config.d)
+    rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
+    stackings = (
+        structures.find_sym_reduced_stackings()
+        if config.symm_reduce
+        else generate_stackings(config.n_sectors)
+    )
+    runner = (
+        runner_factory(config)
+        if runner_factory is not None
+        else SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub)
+    )
+
+    if config.init_mlff:
+        _build_init_mlff(config, structures, rcut, generated_at, timestamp, runner, wait=True)
+    if config.do_relaxation:
+        _build_relaxations(config, structures, stackings, rcut, generated_at, timestamp, runner, wait=True)
+    if config.twist_val:
+        _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait=False)
+
+    build_stage1(config, wait=False, runner=runner)
 
 
 def check_relaxation_converged(directory: Path) -> None:
@@ -164,6 +194,13 @@ def check_stage1_inputs(config: DPmoireLiteConfig, stackings: list[tuple[int, in
         raise RuntimeError(f"Stage 1 input preflight failed:\n{details}")
 
 
+def prepare_init_mlff_step2(init_dir: Path, input_dir: Path, sc: tuple[int, int]) -> None:
+    init_dir = Path(init_dir)
+    input_dir = Path(input_dir)
+    stage_mlff_files(init_dir, init_dir)
+    write_supercell_poscar(input_dir / "top_layer.poscar", init_dir / "POSCAR", sc)
+
+
 def _build_init_mlff(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
@@ -180,6 +217,9 @@ def _build_init_mlff(
     atoms = structures.read_atoms(init_dir / "POSCAR")
     _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", config.sc, rcut)
     jobs = _submit_dirs(config, runner, [init_dir], wait)
+    if runner is not None and wait:
+        prepare_init_mlff_step2(init_dir, config.input_dir, config.sc)
+        jobs.extend(_submit_dirs(config, runner, [init_dir], wait=True))
     write_manifest(
         config.work_dir,
         Manifest(
@@ -239,8 +279,11 @@ def _build_validation(
     wait: bool,
 ) -> None:
     validation_dir = stage_dir(config.work_dir, "validation")
-    with tempfile.TemporaryDirectory(dir=config.work_dir, prefix=".validation-") as tmp_dir:
+    tmp_dir = _make_temp_work_dir(config.work_dir, "validation", timestamp)
+    try:
         angles, atoms_list = structures.make_twist_struct(config.min_val_n, config.max_val_n, tmp_dir)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     directories = [validation_dir / angle for angle in angles]
     backups = _backup_targets(config.work_dir, "validation", directories, timestamp)
     for angle, atoms in zip(angles, atoms_list, strict=True):
@@ -279,6 +322,17 @@ def _stage1_stackings(config: DPmoireLiteConfig) -> list[tuple[int, int]]:
         return [(int(i), int(j)) for i, j in data.tolist()]
 
     return generate_stackings(config.n_sectors)
+
+
+def _make_temp_work_dir(work_dir: Path, name: str, timestamp: str) -> Path:
+    base = Path(work_dir) / f".{name}-{timestamp}"
+    candidate = base
+    counter = 1
+    while candidate.exists():
+        candidate = Path(f"{base}-{counter}")
+        counter += 1
+    candidate.mkdir(parents=True)
+    return candidate
 
 
 def _check_mlff_files(init_mlff_dir: Path) -> None:
