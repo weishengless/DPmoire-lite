@@ -52,7 +52,7 @@ def test_init_example_copies_bundled_template():
         assert main(["init-example", str(target)]) == 0
         assert (target / "config.yaml").is_file()
         assert (target / "input" / "rlx_INCAR").is_file()
-        assert (target / "scripts" / "DFT_script.sh").is_file()
+        assert (target / "scripts" / "sub").is_file()
 
 
 def test_wheel_includes_bundled_example_template():
@@ -87,4 +87,4 @@ def test_wheel_includes_bundled_example_template():
             names = set(wheel.namelist())
     assert "dpmoire_lite/example/config.yaml" in names
     assert "dpmoire_lite/example/input/rlx_INCAR" in names
-    assert "dpmoire_lite/example/scripts/DFT_script.sh" in names
+    assert "dpmoire_lite/example/scripts/sub" in names

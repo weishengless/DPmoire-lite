@@ -7,24 +7,24 @@ ICHARG = 2
 !prec
 ISMEAR = 0
 SIGMA = 0.01
-LREAL = A
+LREAL = F
 PREC = N
 EDIFF  = 1e-5
 ENCUT = 350
 
 !relax
-ISIF = 2
-NSW = 300
+ISIF = 4
+NSW = 100
 IBRION = 2
 POTIM = 0.5
 EDIFFG = -1E-2
-#OPTLT = 3
+OPTLT = 3
 
 
 !algo
 NELMIN = 4
 ALGO = N
-NELM = 200
+NELM = 300
 
 !parallel
 IRMMD = 4

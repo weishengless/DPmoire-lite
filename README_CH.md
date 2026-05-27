@@ -1,6 +1,6 @@
 # DPmoire-lite 中文说明
 
-英文说明见 [README.md](README.md)。
+英文说明见 [README.md](README.md)。详细工作流说明见 [workflow_CH.md](workflow_CH.md)，英文版见 [workflow.md](workflow.md)。
 
 DPmoire-lite 是从原始 DPmoire 工作流中整理出来的干净 VASP 数据集生成框架。它用于生成双层或莫尔体系力场数据集所需的 VASP 计算目录，可选择提交 Slurm 作业，并从完成的计算中收集独立的 `extxyz` 数据集。
 
@@ -66,7 +66,7 @@ python -m pip install .
 
 `stage: 1` 在 `md/` 下生成 MD 目录。它会在写入任何 MD 目录前检查弛豫输出是否完整并收敛。当 `vasp_ml: true` 时，它还会要求 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN` 存在，并把它们作为 `ML_AB` 和 `ML_FF` 分发到每个 MD 目录中。
 
-`stage: all` 是自动提交并等待的工作流。它要求同时设置 `submit: true` 并使用 `DPmoireLite build config.yaml --wait`，因为 stage1 依赖已经完成的 stage0 输出。
+`stage: all` 是自动提交并等待的工作流。它要求同时设置 `submit: true` 并使用 `DPmoireLite build config.yaml --wait`，因为 stage1 依赖已经完成的 stage0 输出。在 `stage: all` 中，DPmoire-lite 会等待 init MLFF 和弛豫这条主依赖链；validation 和最终 MD 作业会被提交后交给调度系统继续运行。
 
 validation 是独立时间线。validation 作业不会阻塞 stage1，validation 数据也只会在用户显式运行以下命令时收集：
 
@@ -80,11 +80,11 @@ DPmoireLite collect config.yaml --stage validation
 
 `submit: true` 但不加 `--wait` 时，会生成目录、提交当前 stage 请求的所有作业，然后退出。在这个模式下，进程不会持续轮询 Slurm，因此无法执行 `n_nodes` 节流和 `auto_resub` 重提逻辑。
 
-`submit: true` 并加上 `--wait` 时，DPmoire-lite 会在轮询循环中最多保持 `n_nodes` 个活跃 Slurm 作业。如果 `auto_resub: true`，失败作业会按计算目录最多重提一次。
+`submit: true` 并加上 `--wait` 时，DPmoire-lite 会在轮询循环中最多保持 `n_nodes` 个活跃 Slurm 作业。如果 `auto_resub: true`，失败作业会按计算目录最多重提一次。在 `stage: all` 中，这个等待节流和重提逻辑只覆盖 init MLFF 和弛豫作业；validation 和最终 MD 是非等待提交。
 
 初始 MLFF 流程是显式设计的：
 
-- 手动模式：stage0 只创建并可选提交第一步 `init_mlff` 作业。用户完成 `ML_ABN` 和 `ML_FFN` 准备后，stage1 再使用这些文件。
+- 手动模式：stage0 会创建第一步 `init_mlff` 作业；如果 `submit: true` 但不加 `--wait`，只会提交这第一步 init 作业。stage0 仍会继续生成并可选提交已经启用的弛豫或 validation 目录。用户完成 `ML_ABN` 和 `ML_FFN` 准备后，stage1 再使用这些文件。
 - 自动模式：`stage: all`、`submit: true` 和 `--wait` 会在生成 stage1 前跑完两步 init MLFF 依赖链。
 
 ## 数据收集语义

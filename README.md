@@ -1,6 +1,8 @@
 # DPmoire-lite
 
-Chinese documentation is available in [README_CH.md](README_CH.md).
+Chinese documentation is available in [README_CH.md](README_CH.md). A detailed
+workflow guide is available in [workflow.md](workflow.md), with the Chinese
+version in [workflow_CH.md](workflow_CH.md).
 
 DPmoire-lite is a clean VASP dataset-generation framework extracted from the
 original DPmoire workflow. It generates calculation folders for bilayer or moire
@@ -78,7 +80,9 @@ before writing any MD folder. When `vasp_ml: true`, it also requires
 
 `stage: all` is an automated submit-and-wait workflow. It requires both
 `submit: true` and `DPmoireLite build config.yaml --wait`, because stage1 needs
-completed stage0 outputs.
+completed stage0 outputs. In `stage: all`, DPmoire-lite waits for the init MLFF
+and relaxation dependency chain; validation and final MD jobs are submitted and
+then left to the scheduler.
 
 Validation is an independent timeline. Validation jobs do not block stage1, and
 validation data is collected only when the user explicitly runs:
@@ -97,13 +101,17 @@ enforced because the process does not keep polling Slurm.
 
 `submit: true` with `--wait` submits jobs while keeping at most `n_nodes` active
 jobs in the DPmoire-lite polling loop. If `auto_resub: true`, failed Slurm jobs
-are resubmitted at most once per calculation directory.
+are resubmitted at most once per calculation directory. In `stage: all`, this
+wait-loop throttling and resubmission applies to init MLFF and relaxation jobs;
+validation and final MD submissions are non-wait submissions.
 
 The initial MLFF workflow is intentionally explicit:
 
-- Manual mode: stage0 creates and optionally submits only the first `init_mlff`
-  job. After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use
-  those files.
+- Manual mode: stage0 creates the first `init_mlff` job, and if `submit: true`
+  without `--wait`, submits that first init job only. Stage0 still continues to
+  generate and optionally submit any enabled relaxation or validation folders.
+  After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use those
+  files.
 - Automated mode: `stage: all`, `submit: true`, and `--wait` run the two-step
   init MLFF dependency chain before generating stage1.
 

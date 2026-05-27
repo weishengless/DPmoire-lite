@@ -104,4 +104,4 @@ def test_copy_example_uses_bundled_template_independent_of_source_checkout(tmp_p
     assert (target_dir / "config.yaml").is_file()
     assert (target_dir / "input" / "top_layer.poscar").is_file()
     assert (target_dir / "input" / "bot_layer.poscar").is_file()
-    assert (target_dir / "scripts" / "DFT_script.sh").is_file()
+    assert (target_dir / "scripts" / "sub").is_file()

@@ -1,4 +1,54 @@
-ENCUT = 400
-ML_RCUT1 = 6.0
-ML_RCUT2 = 6.0
-LANGEVIN_GAMMA = 1
+System = 1L
+
+!start
+ISTART = 0
+ICHARG = 2
+
+!prec
+ISMEAR = 0
+SIGMA = 0.01
+LREAL = A
+PREC = N
+EDIFF  = 1e-5
+ENCUT = 350
+
+!relax
+ISIF = 2
+NSW = 300
+IBRION = 2
+POTIM = 0.5
+EDIFFG = -1E-2
+#OPTLT = 3
+
+
+!algo
+NELMIN = 4
+ALGO = N
+NELM = 200
+
+!parallel
+IRMMD = 4
+NSIM = 4
+KPAR = 4
+NPAR = 1
+
+!SPIN
+ISPIN = 1
+#MAGMOM = 8 2*0 4*0
+LORBIT = 11
+
+!output
+LCHARG = F
+LWAVE = F
+LELF = F
+
+!method
+#SYMPREC = 5E-3
+
+!method
+METAGGA   = R2SCAN
+LASPH     = .TRUE.
+IVDW = 12
+VDW_S8 = 0.7898
+VDW_A1 = 0.4948
+VDW_A2 = 5.7307
