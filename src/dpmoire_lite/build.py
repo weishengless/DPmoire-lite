@@ -100,7 +100,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         target.mkdir(parents=True, exist_ok=True)
         _write_md_poscar(source_dir / "CONTCAR", target / "POSCAR", config.sc if not config.sc_rlx else None)
         atoms = structures.read_atoms(target / "POSCAR")
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", config.sc, rcut)
+        _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
         if config.vasp_ml:
             stage_mlff_files(init_mlff_dir, target)
         directories.append(target)
@@ -111,7 +111,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             target.mkdir(parents=True, exist_ok=True)
             write_supercell_poscar(config.input_dir / f"{layer_name}.poscar", target / "POSCAR", config.sc)
             atoms = structures.read_atoms(target / "POSCAR")
-            _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_monolayer_INCAR", config.sc, rcut)
+            _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_monolayer_INCAR", rcut)
             if config.vasp_ml:
                 stage_mlff_files(init_mlff_dir, target)
             directories.append(target)
@@ -241,7 +241,7 @@ def _build_init_mlff(
     init_dir.mkdir(parents=True, exist_ok=True)
     write_supercell_poscar(config.input_dir / "bot_layer.poscar", init_dir / "POSCAR", config.sc)
     atoms = structures.read_atoms(init_dir / "POSCAR")
-    _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", config.sc, rcut)
+    _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", rcut)
     jobs = _submit_dirs(config, runner, [init_dir], wait)
     if runner is not None and wait:
         prepare_init_mlff_step2(init_dir, config.input_dir, config.sc)
@@ -278,7 +278,7 @@ def _build_relaxations(
         target.mkdir(parents=True, exist_ok=True)
         atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
         write_vasp(target / "POSCAR", atoms=atoms)
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", config.sc if config.sc_rlx else (1, 1), rcut)
+        _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", rcut)
         directories.append(target)
     jobs = _submit_dirs(config, runner, directories, wait)
     write_manifest(
@@ -316,7 +316,7 @@ def _build_validation(
         target = validation_dir / angle
         target.mkdir(parents=True, exist_ok=True)
         write_vasp(target / "POSCAR", atoms=atoms)
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "val_INCAR", (1, 1), rcut)
+        _write_vasp_inputs(config, target, atoms, config.input_dir / "val_INCAR", rcut)
     jobs = _submit_dirs(config, runner, directories, wait)
     write_manifest(
         config.work_dir,
@@ -392,7 +392,6 @@ def _write_vasp_inputs(
     output_dir: Path,
     atoms: Atoms,
     incar_template: Path,
-    k_scale: tuple[int, int],
     rcut: float,
 ) -> None:
     elements = _ordered_elements(atoms)
@@ -405,7 +404,7 @@ def _write_vasp_inputs(
         rcut2=rcut,
         elements=elements,
     )
-    write_kpoints(output_dir, atoms.cell.array, config.k_mesh, k_scale)
+    write_kpoints(output_dir, atoms.cell.array, config.k_mesh)
     copy_submit_script(config.script_dir, config.dft_script, output_dir)
     copy_vdw_if_needed(incar_template, config.input_dir, output_dir)
 

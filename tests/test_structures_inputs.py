@@ -209,13 +209,13 @@ def test_write_potcar_uses_minimal_policy(tmp_path):
     assert (tmp_path / "POTCAR").read_bytes() == mo_source + te_source
 
 
-def test_write_kpoints_uses_rectangular_scale_as_supercell_length(tmp_path):
+def test_write_kpoints_uses_actual_cell_lengths(tmp_path):
     lat_vec = [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 10.0]]
 
-    write_kpoints(tmp_path, lat_vec=lat_vec, k_mesh=12, k_scale=(2, 3))
+    write_kpoints(tmp_path, lat_vec=lat_vec, k_mesh=12)
 
     lines = (tmp_path / "KPOINTS").read_text(encoding="utf-8").splitlines()
-    assert lines[3] == "4 2 1"
+    assert lines[3] == "6 4 1"
 
 
 def test_copy_example_uses_bundled_template_independent_of_source_checkout(tmp_path, monkeypatch):

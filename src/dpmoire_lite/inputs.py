@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from importlib import resources
+import math
 import re
 import shutil
+from importlib import resources
 from pathlib import Path
 from typing import Iterable
 
@@ -183,13 +184,13 @@ def write_potcar(
     return max_enmax
 
 
-def write_kpoints(output_dir: Path, lat_vec, k_mesh: int, k_scale: tuple[int, int]) -> None:
+def write_kpoints(output_dir: Path, lat_vec, k_mesh: int, k_scale: tuple[int, int] | None = None) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lat_vec = np.asarray(lat_vec, dtype=float)
     lengths = np.linalg.norm(lat_vec[:2], axis=1)
-    kx = max(1, int(k_mesh / (lengths[0] * k_scale[0])) + 1)
-    ky = max(1, int(k_mesh / (lengths[1] * k_scale[1])) + 1)
+    kx = max(1, math.ceil(k_mesh / lengths[0]))
+    ky = max(1, math.ceil(k_mesh / lengths[1]))
     (output_dir / "KPOINTS").write_text(
         "\n".join(["Automatic mesh", "0", "Gamma", f"{kx} {ky} 1", "0 0 0"]) + "\n",
         encoding="utf-8",
