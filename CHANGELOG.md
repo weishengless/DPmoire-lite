@@ -14,6 +14,7 @@
 - Generated POTCAR files are now byte-concatenated from source potentials without inserting extra blank lines.
 - Mo and W now resolve to the VASP-recommended `Mo_sv` and `W_sv` potentials when those directories are available.
 - Generated KPOINTS now use each output POSCAR's actual in-plane cell lengths, so primitive and supercell stages get distinct meshes.
+- `stage: all` Slurm throttling now covers validation and final MD submissions, and held jobs continue to count as active.
 - Preserved layer thickness when stacking thick interface structures.
 - Applied the selected spacing mode consistently to twist validation structures.
 - Rejected tilted slab cells whose spacing direction is not aligned with Cartesian z.

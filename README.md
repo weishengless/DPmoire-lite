@@ -105,11 +105,13 @@ DPmoireLite collect config.yaml --stage validation
 the current stage, and exits. In this mode `n_nodes` and `auto_resub` cannot be
 enforced because the process does not keep polling Slurm.
 
-`submit: true` with `--wait` submits jobs while keeping at most `n_nodes` active
-jobs in the DPmoire-lite polling loop. If `auto_resub: true`, failed Slurm jobs
-are resubmitted at most once per calculation directory. In `stage: all`, this
-wait-loop throttling and resubmission applies to init MLFF and relaxation jobs;
-validation and final MD submissions are non-wait submissions.
+`stage: all`, `submit: true`, and `--wait` run the full automatic dataset
+workflow with DPmoire-lite-side throttling. The polling loop keeps at most
+`n_nodes` active Slurm jobs across init MLFF, relaxation, validation, and final
+MD submissions. Active jobs include pending, running, suspended, and held/requeue
+hold states, so a held job continues to occupy a slot until Slurm reports a
+terminal state. If `auto_resub: true`, failed Slurm jobs are resubmitted at most
+once per calculation directory.
 
 The initial MLFF workflow is intentionally explicit:
 
@@ -159,7 +161,7 @@ rejected.
 | `script_dir` | path | Directory containing prepared submit scripts. |
 | `input_dir` | path | Directory containing layer POSCAR files, INCAR templates, and optional `vdw_kernel.bindat`. |
 | `work_dir` | path | Root output directory for generated stages, manifests, backups, and collected datasets. |
-| `n_nodes` | positive int | Maximum number of active Slurm jobs in `--wait` mode. Non-wait mode submits all jobs and exits. |
+| `n_nodes` | positive int | Maximum number of active Slurm jobs in the `stage: all`, `submit: true`, `--wait` automatic workflow. Non-wait mode submits all requested jobs and exits. |
 | `stage` | `0`, `1`, or `all` | Build stage. `0` generates init, relaxation, and validation folders. `1` generates MD folders from completed relaxation outputs. `all` runs the automated dependency chain. |
 | `submit` | bool | If `false`, only generate folders. If `true`, submit generated folders with Slurm. |
 | `auto_resub` | bool | In `--wait` mode, resubmit failed Slurm jobs once per calculation directory. Ignored in non-wait mode. |

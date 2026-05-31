@@ -82,7 +82,7 @@ DPmoireLite collect config.yaml --stage validation
 
 `submit: true` 但不加 `--wait` 时，会生成目录、提交当前 stage 请求的所有作业，然后退出。在这个模式下，进程不会持续轮询 Slurm，因此无法执行 `n_nodes` 节流和 `auto_resub` 重提逻辑。
 
-`submit: true` 并加上 `--wait` 时，DPmoire-lite 会在轮询循环中最多保持 `n_nodes` 个活跃 Slurm 作业。如果 `auto_resub: true`，失败作业会按计算目录最多重提一次。在 `stage: all` 中，这个等待节流和重提逻辑只覆盖 init MLFF 和弛豫作业；validation 和最终 MD 是非等待提交。
+`stage: all`、`submit: true` 并加上 `--wait` 时，DPmoire-lite 会运行完整的自动数据集流程，并在轮询循环中最多保持 `n_nodes` 个活跃 Slurm 作业。这个节流覆盖 init MLFF、弛豫、validation 和最终 MD 提交。活跃作业包括 pending、running、suspended 以及 held/requeue hold 状态，因此被 hold 的作业会继续占用一个槽位，直到 Slurm 报告终止状态。如果 `auto_resub: true`，失败作业会按计算目录最多重提一次。
 
 初始 MLFF 流程是显式设计的：
 
@@ -120,7 +120,7 @@ DPmoireLite collect config.yaml --stage validation
 | `script_dir` | 路径 | 存放提交脚本的目录。 |
 | `input_dir` | 路径 | 存放单层 POSCAR、INCAR 模板和可选 `vdw_kernel.bindat` 的目录。 |
 | `work_dir` | 路径 | 生成 stage、manifest、备份目录和数据集文件的根目录。 |
-| `n_nodes` | 正整数 | `--wait` 模式下最多保持的活跃 Slurm 作业数。非等待模式会提交所有作业后退出。 |
+| `n_nodes` | 正整数 | `stage: all`、`submit: true`、`--wait` 自动流程中最多保持的活跃 Slurm 作业数。非等待模式会提交所有请求的作业后退出。 |
 | `stage` | `0`、`1` 或 `all` | 构建阶段。`0` 生成 init、rlx 和 validation 目录；`1` 从完成的弛豫输出生成 MD 目录；`all` 运行自动依赖链。 |
 | `submit` | 布尔值 | `false` 只生成目录；`true` 会用 Slurm 提交生成的目录。 |
 | `auto_resub` | 布尔值 | 在 `--wait` 模式下，对失败 Slurm 作业按计算目录最多重提一次。非等待模式忽略。 |

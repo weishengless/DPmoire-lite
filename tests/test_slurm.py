@@ -49,6 +49,26 @@ def test_submit_many_wait_throttles_to_one_active_job():
     ]
 
 
+def test_submit_many_wait_treats_held_jobs_as_active():
+    runner = QueueRunner(
+        n_nodes=1,
+        state_sequences={
+            "1": ["REQUEUE_HOLD", "SPECIAL_EXIT", "COMPLETED"],
+            "2": ["COMPLETED"],
+        },
+    )
+    items = [(Path("held"), "rlx/0_0"), (Path("second"), "rlx/1_0")]
+
+    jobs = runner.submit_many(items, wait=True, poll_seconds=0)
+
+    assert runner.submitted == [("rlx/0_0", "1"), ("rlx/1_0", "2")]
+    assert runner.query_log == [["1"], ["1"], ["1"], ["2"]]
+    assert [(job.path, job.status) for job in jobs] == [
+        ("rlx/0_0", "COMPLETED"),
+        ("rlx/1_0", "COMPLETED"),
+    ]
+
+
 def test_submit_dirs_without_wait_submits_all_jobs_even_when_n_nodes_is_one(tmp_path):
     runner = QueueRunner(n_nodes=1)
     directories = [tmp_path / "first", tmp_path / "second"]
