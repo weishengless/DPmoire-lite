@@ -396,7 +396,7 @@ def _write_vasp_inputs(
     rcut: float,
 ) -> None:
     elements = _ordered_elements(atoms)
-    max_enmax = write_potcar(elements, config.potcar_dir, output_dir / "POTCAR")
+    max_enmax = write_potcar(elements, config.potcar_dir, output_dir / "POTCAR", potcar_policy=config.potcar_policy)
     render_incar(
         incar_template,
         output_dir / "INCAR",
@@ -460,6 +460,7 @@ def _config_summary(config: DPmoireLiteConfig) -> dict[str, object]:
         "d": config.d,
         "d_mode": config.d_mode,
         "d_reference": d_reference,
+        "potcar_policy": config.potcar_policy,
         "k_mesh": config.k_mesh,
         "encut_factor": config.encut_factor,
         "r_cut": config.r_cut,

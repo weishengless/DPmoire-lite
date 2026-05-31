@@ -57,6 +57,7 @@ REQUIRED_FIELDS = (
 )
 
 VALID_D_MODES = {"surface_gap", "reference_plane_gap"}
+VALID_POTCAR_POLICIES = {"recommend", "minimal"}
 
 
 def normalize_pair(value: Any, field: str) -> tuple[int, int]:
@@ -84,6 +85,14 @@ def normalize_d_mode(value: Any) -> str:
         allowed = ", ".join(sorted(VALID_D_MODES))
         raise ConfigError(f"d_mode must be one of: {allowed}")
     return mode
+
+
+def normalize_potcar_policy(value: Any) -> str:
+    policy = str(value).strip()
+    if policy not in VALID_POTCAR_POLICIES:
+        allowed = ", ".join(sorted(VALID_POTCAR_POLICIES))
+        raise ConfigError(f"potcar_policy must be one of: {allowed}")
+    return policy
 
 
 def _normalize_element_symbol(value: Any, field: str) -> str:
@@ -150,6 +159,7 @@ class DPmoireLiteConfig:
     d: float
     d_mode: str
     d_reference: dict[str, str | tuple[str, ...]] | None
+    potcar_policy: str
     k_mesh: int
     encut_factor: float
     r_cut: float
@@ -268,6 +278,7 @@ def load_config(path: Path) -> DPmoireLiteConfig:
     outcar_patterns = raw.get("outcar_patterns", DEFAULT_OUTCAR_PATTERNS)
     d_mode = normalize_d_mode(raw.get("d_mode", "surface_gap"))
     d_reference = normalize_d_reference(raw.get("d_reference")) if d_mode == "reference_plane_gap" else None
+    potcar_policy = normalize_potcar_policy(raw.get("potcar_policy", "recommend"))
 
     return DPmoireLiteConfig(
         config_path=config_path,
@@ -290,6 +301,7 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         d=_float(_require(raw, "d"), "d"),
         d_mode=d_mode,
         d_reference=d_reference,
+        potcar_policy=potcar_policy,
         k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
         encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),
         r_cut=_float(_require(raw, "r_cut"), "r_cut"),

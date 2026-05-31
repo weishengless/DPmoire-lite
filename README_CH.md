@@ -56,7 +56,7 @@ python -m pip install .
 
 `script_dir` 中必须包含 `dft_script` 指定的 Slurm 提交脚本。
 
-`potcar_dir` 应指向 VASP POTCAR 根目录。对于新版 VASP 推荐的元素映射目录，DPmoire-lite 会先尝试映射后的目录名，例如 Li 对应 `Li_sv`，然后再回退到普通元素名目录。
+`potcar_dir` 应指向 VASP POTCAR 根目录。默认 `potcar_policy: recommend` 时，DPmoire-lite 会先尝试 VASP 推荐的元素映射目录，例如 Li 对应 `Li_sv`，然后再回退到普通元素名目录。设置 `potcar_policy: minimal` 时，会在 `potcar_dir` 中选择常规 POTCAR 候选里 `ZVAL` 最小的目录。
 
 ## 工作流
 
@@ -115,7 +115,8 @@ DPmoireLite collect config.yaml --stage validation
 | 配置项 | 类型 | 含义 |
 | --- | --- | --- |
 | `dft_script` | 字符串 | Slurm 提交脚本文件名。该文件会从 `script_dir` 复制到每个生成的计算目录中，并用 `sbatch` 提交。 |
-| `potcar_dir` | 路径 | POTCAR 子目录的根目录。DPmoire-lite 会优先使用 VASP 推荐的元素目录映射，然后回退到普通元素名。 |
+| `potcar_dir` | 路径 | POTCAR 子目录的根目录。 |
+| `potcar_policy` | `recommend` 或 `minimal` | POTCAR 选择策略。`recommend` 使用 VASP 推荐映射并作为默认值；`minimal` 会扫描 `potcar_dir` 中的常规 POTCAR 变体并选择 `ZVAL` 最小的候选。 |
 | `script_dir` | 路径 | 存放提交脚本的目录。 |
 | `input_dir` | 路径 | 存放单层 POSCAR、INCAR 模板和可选 `vdw_kernel.bindat` 的目录。 |
 | `work_dir` | 路径 | 生成 stage、manifest、备份目录和数据集文件的根目录。 |

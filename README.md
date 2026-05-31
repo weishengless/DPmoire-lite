@@ -65,9 +65,11 @@ If an INCAR template contains `LUSE_VDW = T`, `input_dir` must also contain
 
 `script_dir` must contain the Slurm script named by `dft_script`.
 
-`potcar_dir` should point to a VASP POTCAR root. For elements with VASP's
-recommended mapped folders, DPmoire-lite tries the mapped folder first, for
-example `Li_sv` for `Li`, then falls back to the plain element folder.
+`potcar_dir` should point to a VASP POTCAR root. With the default
+`potcar_policy: recommend`, DPmoire-lite tries VASP's recommended mapped folder
+first, for example `Li_sv` for `Li`, then falls back to the plain element
+folder. With `potcar_policy: minimal`, it selects the regular POTCAR candidate
+with the smallest `ZVAL` in `potcar_dir`.
 
 ## Workflow
 
@@ -152,7 +154,8 @@ rejected.
 | Tag | Type | Meaning |
 | --- | --- | --- |
 | `dft_script` | string | Slurm submit script filename. The file is copied from `script_dir` into each generated calculation folder and submitted with `sbatch`. |
-| `potcar_dir` | path | Root directory containing POTCAR subfolders. DPmoire-lite applies VASP recommended element-folder mapping where available, then falls back to the plain element name. |
+| `potcar_dir` | path | Root directory containing POTCAR subfolders. |
+| `potcar_policy` | `recommend` or `minimal` | POTCAR selection policy. `recommend` uses VASP recommended element-folder mapping and is the default. `minimal` scans regular POTCAR variants in `potcar_dir` and uses the lowest-`ZVAL` candidate. |
 | `script_dir` | path | Directory containing prepared submit scripts. |
 | `input_dir` | path | Directory containing layer POSCAR files, INCAR templates, and optional `vdw_kernel.bindat`. |
 | `work_dir` | path | Root output directory for generated stages, manifests, backups, and collected datasets. |

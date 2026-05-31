@@ -31,6 +31,7 @@ VASP_POTCAR_LINK = {
     "Y": "Y_sv",
     "Zr": "Zr_sv",
     "Nb": "Nb_sv",
+    "Mo": "Mo_sv",
     "Tc": "Tc_pv",
     "Ru": "Ru_pv",
     "Rh": "Rh_pv",
@@ -57,9 +58,14 @@ VASP_POTCAR_LINK = {
     "Pb": "Pb_d",
     "Bi": "Bi_d",
     "Po": "Po_d",
+    "W": "W_sv",
     "Fr": "Fr_sv",
     "Ra": "Ra_sv",
 }
+
+
+MINIMAL_VALENCE_EXCLUDED_SUFFIXES = ("_AE", "_GW", "_h", "_s")
+VALID_POTCAR_POLICIES = {"recommend", "minimal"}
 
 
 def needs_vdw_kernel(incar_text: str) -> bool:
@@ -75,8 +81,13 @@ def needs_vdw_kernel(incar_text: str) -> bool:
     return False
 
 
-def resolve_potcar_dir(element: str, potcar_dir: Path) -> Path:
+def resolve_potcar_dir(element: str, potcar_dir: Path, potcar_policy: str = "recommend") -> Path:
     potcar_dir = Path(potcar_dir)
+    if potcar_policy == "minimal":
+        return resolve_minimal_valence_potcar_dir(element, potcar_dir)
+    if potcar_policy != "recommend":
+        allowed = ", ".join(sorted(VALID_POTCAR_POLICIES))
+        raise ValueError(f"potcar_policy must be one of: {allowed}")
     candidates = []
     if element in VASP_POTCAR_LINK:
         candidates.append(VASP_POTCAR_LINK[element])
@@ -88,11 +99,39 @@ def resolve_potcar_dir(element: str, potcar_dir: Path) -> Path:
     raise FileNotFoundError(f"No POTCAR found for {element} in {potcar_dir}. Tried: {', '.join(candidates)}")
 
 
+def resolve_minimal_valence_potcar_dir(element: str, potcar_dir: Path) -> Path:
+    candidates = []
+    for path in Path(potcar_dir).iterdir():
+        if not path.is_dir() or not _is_regular_potcar_variant(element, path.name):
+            continue
+        potcar = path / "POTCAR"
+        if not potcar.exists():
+            continue
+        candidates.append((read_zval(potcar), 0 if path.name == element else 1, path.name, path))
+    if not candidates:
+        raise FileNotFoundError(f"No regular POTCAR candidates found for {element} in {potcar_dir}")
+    return sorted(candidates)[0][3]
+
+
+def _is_regular_potcar_variant(element: str, name: str) -> bool:
+    if name != element and not name.startswith(f"{element}_"):
+        return False
+    return not name.endswith(MINIMAL_VALENCE_EXCLUDED_SUFFIXES)
+
+
 def read_enmax(potcar_file: Path) -> float:
     text = Path(potcar_file).read_text(encoding="utf-8", errors="ignore")
     match = re.search(r"\bENMAX\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*;", text)
     if match is None:
         raise ValueError(f"ENMAX not found in {potcar_file}")
+    return float(match.group(1))
+
+
+def read_zval(potcar_file: Path) -> float:
+    text = Path(potcar_file).read_text(encoding="utf-8", errors="ignore")
+    match = re.search(r"\bZVAL\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\b", text)
+    if match is None:
+        raise ValueError(f"ZVAL not found in {potcar_file}")
     return float(match.group(1))
 
 
@@ -127,16 +166,20 @@ def get_ordered_elements(atoms: Atoms) -> list[str]:
     return elements
 
 
-def write_potcar(elements: Iterable[str], potcar_dir: Path, output_file: Path) -> float:
+def write_potcar(
+    elements: Iterable[str],
+    potcar_dir: Path,
+    output_file: Path,
+    potcar_policy: str = "recommend",
+) -> float:
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     max_enmax = 0.0
     with output_file.open("wb") as output:
         for element in elements:
-            source = resolve_potcar_dir(element, Path(potcar_dir)) / "POTCAR"
+            source = resolve_potcar_dir(element, Path(potcar_dir), potcar_policy=potcar_policy) / "POTCAR"
             max_enmax = max(max_enmax, read_enmax(source))
             output.write(source.read_bytes())
-            output.write(b"\n")
     return max_enmax
 
 
