@@ -436,7 +436,9 @@ def test_stage_all_waits_init_step2_and_rlx_before_generating_md(monkeypatch, tm
         ("submit", "rlx/0_0"),
         ("wait", ["rlx/0_0"]),
         ("submit", "validation/1.00deg"),
+        ("wait", ["validation/1.00deg"]),
         ("submit", "md/0_0"),
+        ("wait", ["md/0_0"]),
     ]
 
 

@@ -172,9 +172,9 @@ def build_stage_all(
     if config.do_relaxation:
         _build_relaxations(config, structures, stackings, rcut, generated_at, timestamp, runner, wait=True)
     if config.twist_val:
-        _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait=False)
+        _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait=True)
 
-    build_stage1(config, wait=False, runner=runner)
+    build_stage1(config, wait=True, runner=runner)
 
 
 def check_relaxation_converged(directory: Path) -> None:
