@@ -133,6 +133,25 @@ def test_d_mode_defaults_to_surface_gap(tmp_path):
 
     assert config.d_mode == "surface_gap"
     assert config.d_reference is None
+    assert config.potcar_policy == "recommend"
+
+
+@pytest.mark.parametrize("policy", ["recommend", "minimal"])
+def test_load_config_accepts_valid_potcar_policies(tmp_path, policy):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, potcar_policy=policy)
+
+    config = load_config(config_file)
+
+    assert config.potcar_policy == policy
+
+
+def test_load_config_rejects_invalid_potcar_policy(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, potcar_policy="vasp_recommended")
+
+    with pytest.raises(ConfigError, match="potcar_policy"):
+        load_config(config_file)
 
 
 @pytest.mark.parametrize("mode", ["surface_gap", "reference_plane_gap"])

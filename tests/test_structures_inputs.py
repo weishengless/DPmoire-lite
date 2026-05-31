@@ -5,6 +5,7 @@ from dpmoire_lite import inputs
 from dpmoire_lite.inputs import (
     VASP_POTCAR_LINK,
     needs_vdw_kernel,
+    read_zval,
     replace_incar_values,
     resolve_potcar_dir,
     write_kpoints,
@@ -152,6 +153,33 @@ def test_resolve_potcar_dir_prefers_mo_sv(tmp_path):
     assert resolve_potcar_dir("Mo", potcars) == potcars / "Mo_sv"
 
 
+def test_resolve_potcar_dir_minimal_policy_uses_lowest_zval(tmp_path):
+    potcars = tmp_path / "potcars"
+    (potcars / "Mo").mkdir(parents=True)
+    (potcars / "Mo_sv").mkdir(parents=True)
+    (potcars / "Mo" / "POTCAR").write_text(" ENMAX = 224; ZVAL = 6; \n", encoding="utf-8")
+    (potcars / "Mo_sv" / "POTCAR").write_text(" ENMAX = 242; ZVAL = 14; \n", encoding="utf-8")
+
+    assert resolve_potcar_dir("Mo", potcars, potcar_policy="minimal") == potcars / "Mo"
+
+
+def test_resolve_potcar_dir_minimal_policy_ignores_hydrogen_fractional_variants(tmp_path):
+    potcars = tmp_path / "potcars"
+    (potcars / "H").mkdir(parents=True)
+    (potcars / "H.25").mkdir(parents=True)
+    (potcars / "H" / "POTCAR").write_text(" ENMAX = 250; ZVAL = 1; \n", encoding="utf-8")
+    (potcars / "H.25" / "POTCAR").write_text(" ENMAX = 250; ZVAL = 0.25; \n", encoding="utf-8")
+
+    assert resolve_potcar_dir("H", potcars, potcar_policy="minimal") == potcars / "H"
+
+
+def test_read_zval_accepts_vasp_mass_and_valenz_line(tmp_path):
+    potcar = tmp_path / "POTCAR"
+    potcar.write_text("   POMASS =   95.940; ZVAL   =    6.000    mass and valenz\n", encoding="utf-8")
+
+    assert read_zval(potcar) == 6.0
+
+
 def test_write_potcar_concatenates_source_bytes_without_extra_newlines(tmp_path):
     potcars = tmp_path / "potcars"
     h_source = b"H potential\n ENMAX = 10; \n End of Dataset\n"
@@ -165,6 +193,20 @@ def test_write_potcar_concatenates_source_bytes_without_extra_newlines(tmp_path)
 
     assert max_enmax == 20
     assert (tmp_path / "POTCAR").read_bytes() == h_source + he_source
+
+
+def test_write_potcar_uses_minimal_policy(tmp_path):
+    potcars = tmp_path / "potcars"
+    mo_source = b"Mo minimal\n ENMAX = 224; ZVAL = 6; \n End of Dataset\n"
+    mo_sv_source = b"Mo recommended\n ENMAX = 242; ZVAL = 14; \n End of Dataset\n"
+    te_source = b"Te\n ENMAX = 174; ZVAL = 6; \n End of Dataset\n"
+    for name, source in {"Mo": mo_source, "Mo_sv": mo_sv_source, "Te": te_source}.items():
+        (potcars / name).mkdir(parents=True)
+        (potcars / name / "POTCAR").write_bytes(source)
+
+    write_potcar(["Mo", "Te"], potcars, tmp_path / "POTCAR", potcar_policy="minimal")
+
+    assert (tmp_path / "POTCAR").read_bytes() == mo_source + te_source
 
 
 def test_write_kpoints_uses_rectangular_scale_as_supercell_length(tmp_path):

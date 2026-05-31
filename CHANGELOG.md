@@ -7,6 +7,7 @@
 - Added `d_mode` to control how `d` is interpreted when constructing bilayer and validation structures.
 - Added `surface_gap` mode, where `d` sets `min_z(top) - max_z(bot)`.
 - Added `reference_plane_gap` mode with optional `d_reference` selectors, where `d` sets the selected reference-plane mean-z distance.
+- Added `potcar_policy` with `recommend` and `minimal` modes for choosing VASP-recommended or lowest-`ZVAL` regular POTCAR variants.
 
 ### Fixed
 

@@ -2,6 +2,7 @@
 ############################ ENVIRONMENT SETTINGS ############################
 dft_script: sub                             #Name of VASP submit script.
 potcar_dir: /gpfs/home/cwang/pps/pbe64      #Diretory to access POTCAR
+potcar_policy: recommend                    #recommend: VASP recommended mapping. minimal: lowest-ZVAL regular POTCAR candidate.
 script_dir: ./scripts                       #Prepared slurm scripts.
 input_dir: ./input                          #Prepared VASP files and nequIP presets.
 work_dir: ./1-calculate                     #Work directory for DPmoire.

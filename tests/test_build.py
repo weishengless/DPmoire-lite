@@ -169,6 +169,36 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "manifest.yaml").exists()
 
 
+def test_stage0_uses_minimal_potcar_policy(tmp_path):
+    config = write_build_config(tmp_path, n_sectors=[1, 1], potcar_policy="minimal")
+    input_dir = tmp_path / "input"
+    potcars = tmp_path / "potcars"
+    mo_poscar = """Mo
+1.0
+  3.0 0.0 0.0
+  0.0 3.0 0.0
+  0.0 0.0 12.0
+Mo
+1
+Direct
+  0.0 0.0 0.25
+"""
+    (input_dir / "top_layer.poscar").write_text(mo_poscar, encoding="utf-8")
+    (input_dir / "bot_layer.poscar").write_text(mo_poscar, encoding="utf-8")
+    (potcars / "Mo").mkdir(parents=True)
+    (potcars / "Mo_sv").mkdir(parents=True)
+    (potcars / "Mo" / "POTCAR").write_text("minimal-mo\n ENMAX = 224; ZVAL = 6; \n", encoding="utf-8")
+    (potcars / "Mo_sv" / "POTCAR").write_text("recommended-mo\n ENMAX = 242; ZVAL = 14; \n", encoding="utf-8")
+
+    run_build(config, wait=False)
+
+    assert (tmp_path / "work" / "init_mlff" / "POTCAR").read_text(encoding="utf-8") == (
+        "minimal-mo\n ENMAX = 224; ZVAL = 6; \n"
+    )
+    manifest = yaml.safe_load((tmp_path / "work" / "init_mlff" / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["config_summary"]["potcar_policy"] == "minimal"
+
+
 @pytest.mark.parametrize(
     ("sc_rlx", "sc", "expected_atom_count"),
     [
