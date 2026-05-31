@@ -2,7 +2,14 @@ from ase import Atoms
 from ase.io.vasp import read_vasp
 
 from dpmoire_lite import inputs
-from dpmoire_lite.inputs import needs_vdw_kernel, replace_incar_values, resolve_potcar_dir, write_kpoints
+from dpmoire_lite.inputs import (
+    VASP_POTCAR_LINK,
+    needs_vdw_kernel,
+    replace_incar_values,
+    resolve_potcar_dir,
+    write_kpoints,
+    write_potcar,
+)
 from dpmoire_lite.structures import StructureHandler, generate_stackings, rewrite_contcar_as_poscar
 
 
@@ -80,6 +87,84 @@ def test_resolve_potcar_dir_uses_strict_mapping(tmp_path):
     (potcars / "Na_pv").mkdir(parents=True)
     (potcars / "Na_pv" / "POTCAR").write_text(" ENMAX = 200; \n", encoding="utf-8")
     assert resolve_potcar_dir("Na", potcars) == potcars / "Na_pv"
+
+
+def test_recommended_potcar_link_matches_vasp_potpaw64_suffix_recommendations():
+    expected = {
+        "Ba": "Ba_sv",
+        "Bi": "Bi_d",
+        "Ca": "Ca_sv",
+        "Cr": "Cr_pv",
+        "Cs": "Cs_sv",
+        "Dy": "Dy_3",
+        "Er": "Er_3",
+        "Eu": "Eu_2",
+        "Fr": "Fr_sv",
+        "Ga": "Ga_d",
+        "Gd": "Gd_3",
+        "Ge": "Ge_d",
+        "Hf": "Hf_pv",
+        "Ho": "Ho_3",
+        "In": "In_d",
+        "K": "K_sv",
+        "Li": "Li_sv",
+        "Lu": "Lu_3",
+        "Mn": "Mn_pv",
+        "Mo": "Mo_sv",
+        "Na": "Na_pv",
+        "Nb": "Nb_sv",
+        "Nd": "Nd_3",
+        "Pb": "Pb_d",
+        "Pm": "Pm_3",
+        "Po": "Po_d",
+        "Pr": "Pr_3",
+        "Ra": "Ra_sv",
+        "Rb": "Rb_sv",
+        "Rh": "Rh_pv",
+        "Ru": "Ru_pv",
+        "Sc": "Sc_sv",
+        "Sm": "Sm_3",
+        "Sn": "Sn_d",
+        "Sr": "Sr_sv",
+        "Ta": "Ta_pv",
+        "Tb": "Tb_3",
+        "Tc": "Tc_pv",
+        "Ti": "Ti_sv",
+        "Tl": "Tl_d",
+        "Tm": "Tm_3",
+        "V": "V_sv",
+        "W": "W_sv",
+        "Y": "Y_sv",
+        "Yb": "Yb_2",
+        "Zr": "Zr_sv",
+    }
+
+    assert VASP_POTCAR_LINK == expected
+
+
+def test_resolve_potcar_dir_prefers_mo_sv(tmp_path):
+    potcars = tmp_path / "potcars"
+    (potcars / "Mo").mkdir(parents=True)
+    (potcars / "Mo_sv").mkdir(parents=True)
+    (potcars / "Mo" / "POTCAR").write_text(" ENMAX = 224; \n", encoding="utf-8")
+    (potcars / "Mo_sv" / "POTCAR").write_text(" ENMAX = 242; \n", encoding="utf-8")
+
+    assert resolve_potcar_dir("Mo", potcars) == potcars / "Mo_sv"
+
+
+def test_write_potcar_concatenates_source_bytes_without_extra_newlines(tmp_path):
+    potcars = tmp_path / "potcars"
+    h_source = b"H potential\n ENMAX = 10; \n End of Dataset\n"
+    he_source = b"He potential\n ENMAX = 20; \n End of Dataset\n"
+    (potcars / "H").mkdir(parents=True)
+    (potcars / "He").mkdir(parents=True)
+    (potcars / "H" / "POTCAR").write_bytes(h_source)
+    (potcars / "He" / "POTCAR").write_bytes(he_source)
+
+    max_enmax = write_potcar(["H", "He"], potcars, tmp_path / "POTCAR")
+
+    assert max_enmax == 20
+    assert (tmp_path / "POTCAR").read_bytes() == h_source + he_source
 
 
 def test_write_kpoints_uses_rectangular_scale_as_supercell_length(tmp_path):

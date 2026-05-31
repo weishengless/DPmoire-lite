@@ -31,6 +31,7 @@ VASP_POTCAR_LINK = {
     "Y": "Y_sv",
     "Zr": "Zr_sv",
     "Nb": "Nb_sv",
+    "Mo": "Mo_sv",
     "Tc": "Tc_pv",
     "Ru": "Ru_pv",
     "Rh": "Rh_pv",
@@ -57,6 +58,7 @@ VASP_POTCAR_LINK = {
     "Pb": "Pb_d",
     "Bi": "Bi_d",
     "Po": "Po_d",
+    "W": "W_sv",
     "Fr": "Fr_sv",
     "Ra": "Ra_sv",
 }
@@ -136,7 +138,6 @@ def write_potcar(elements: Iterable[str], potcar_dir: Path, output_file: Path) -
             source = resolve_potcar_dir(element, Path(potcar_dir)) / "POTCAR"
             max_enmax = max(max_enmax, read_enmax(source))
             output.write(source.read_bytes())
-            output.write(b"\n")
     return max_enmax
 
 
