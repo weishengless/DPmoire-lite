@@ -173,7 +173,7 @@ rejected.
 | `d` | number | Distance value interpreted according to `d_mode`. |
 | `d_mode` | `surface_gap` or `reference_plane_gap` | `surface_gap` sets `min_z(top) - max_z(bot) = d`; `reference_plane_gap` sets the selected reference-plane mean-z distance to `d`. Defaults to `surface_gap`. |
 | `d_reference` | mapping, optional | Reference atom selectors for `reference_plane_gap`, for example `{top: [Mo], bot: [Mo]}` for the bundled MoTe2 example. Omit or use `all` to average all atoms in that layer. |
-| `k_mesh` | int | KPOINTS target. DPmoire-lite writes a Gamma mesh from the in-plane cell lengths and the active supercell scale. |
+| `k_mesh` | int | KPOINTS target. DPmoire-lite writes a Gamma mesh from the generated POSCAR in-plane cell lengths. |
 | `encut_factor` | number | INCAR `ENCUT` is rendered as `encut_factor * max(POTCAR ENMAX)` for the selected elements. |
 | `r_cut` | number | Value written to `ML_RCUT1` and `ML_RCUT2`. If negative, DPmoire-lite uses an automatic value based on the largest input-layer in-plane lattice length and `d`. |
 | `symm_reduce` | bool | Reduce stacking shifts by symmetry using `pymatgen`/`spglib` and write `sym_reduced_stackings.txt`. |

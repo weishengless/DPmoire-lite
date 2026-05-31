@@ -169,6 +169,24 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "manifest.yaml").exists()
 
 
+@pytest.mark.parametrize(("sc_rlx", "expected_rlx_mesh"), [(False, "5 5 1"), (True, "3 3 1")])
+def test_stage0_kpoints_use_generated_poscar_cell_lengths(tmp_path, sc_rlx, expected_rlx_mesh):
+    config = write_build_config(
+        tmp_path,
+        n_sectors=[1, 1],
+        sc=[2, 2],
+        sc_rlx=sc_rlx,
+        input_kwargs={"top_a": 4.0, "bot_a": 4.0},
+    )
+
+    run_build(config, wait=False)
+
+    init_lines = (tmp_path / "work" / "init_mlff" / "KPOINTS").read_text(encoding="utf-8").splitlines()
+    rlx_lines = (tmp_path / "work" / "rlx" / "0_0" / "KPOINTS").read_text(encoding="utf-8").splitlines()
+    assert init_lines[3] == "3 3 1"
+    assert rlx_lines[3] == expected_rlx_mesh
+
+
 def test_stage0_uses_minimal_potcar_policy(tmp_path):
     config = write_build_config(tmp_path, n_sectors=[1, 1], potcar_policy="minimal")
     input_dir = tmp_path / "input"
