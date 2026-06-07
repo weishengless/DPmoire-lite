@@ -68,9 +68,9 @@ python -m pip install .
 
 `stage: 1` 在 `md/` 下生成 MD 目录。它会在写入任何 MD 目录前检查弛豫输出是否完整并收敛。当 `vasp_ml: true` 时，它还会要求 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN` 存在，并把它们作为 `ML_AB` 和 `ML_FF` 分发到每个 MD 目录中。
 
-`stage: all` 是自动提交并等待的工作流。它要求同时设置 `submit: true` 并使用 `DPmoireLite build config.yaml --wait`，因为 stage1 依赖已经完成的 stage0 输出。在 `stage: all` 中，DPmoire-lite 会等待 init MLFF 和弛豫这条主依赖链；validation 和最终 MD 作业会被提交后交给调度系统继续运行。
+`stage: all` 是自动提交并等待的工作流。它要求同时设置 `submit: true` 并使用 `DPmoireLite build config.yaml --wait`，因为 stage1 依赖已经完成的 stage0 输出。在 `stage: all` 中，DPmoire-lite 会等待 init MLFF 和弛豫这条主依赖链、启用时的 validation 作业，以及最终 MD 作业。这些提交都会走同一个 DPmoire-lite 轮询循环。
 
-validation 是独立时间线。validation 作业不会阻塞 stage1，validation 数据也只会在用户显式运行以下命令时收集：
+validation 输出独立于 MD 时间线：stage1 不会使用 validation 结果，validation 数据也只会在用户显式运行以下命令时收集：
 
 ```bash
 DPmoireLite collect config.yaml --stage validation
@@ -120,7 +120,7 @@ DPmoireLite collect config.yaml --stage validation
 | `script_dir` | 路径 | 存放提交脚本的目录。 |
 | `input_dir` | 路径 | 存放单层 POSCAR、INCAR 模板和可选 `vdw_kernel.bindat` 的目录。 |
 | `work_dir` | 路径 | 生成 stage、manifest、备份目录和数据集文件的根目录。 |
-| `n_nodes` | 正整数 | `stage: all`、`submit: true`、`--wait` 自动流程中最多保持的活跃 Slurm 作业数。非等待模式会提交所有请求的作业后退出。 |
+| `n_nodes` | 正整数 | DPmoire-lite `--wait` 轮询模式中最多保持的活跃 Slurm 作业数。`stage: all`、`submit: true` 和 `--wait` 会把它用于 init MLFF、弛豫、validation 和最终 MD 提交。非等待模式会提交所有请求的作业后退出。 |
 | `stage` | `0`、`1` 或 `all` | 构建阶段。`0` 生成 init、rlx 和 validation 目录；`1` 从完成的弛豫输出生成 MD 目录；`all` 运行自动依赖链。 |
 | `submit` | 布尔值 | `false` 只生成目录；`true` 会用 Slurm 提交生成的目录。 |
 | `auto_resub` | 布尔值 | 在 `--wait` 模式下，对失败 Slurm 作业按计算目录最多重提一次。非等待模式忽略。 |

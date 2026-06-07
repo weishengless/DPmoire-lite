@@ -184,10 +184,10 @@ DPmoireLite build config.yaml --wait
 3. 准备、提交并等待第二步 init MLFF；
 4. 生成并提交弛豫目录；
 5. 等待弛豫目录完成；
-6. 如果 `twist_val: true`，生成并提交 validation 目录，但 validation 不阻塞 stage1；
-7. 生成并提交 MD 目录。
+6. 如果 `twist_val: true`，生成、提交并等待 validation 目录；
+7. 生成、提交并等待 MD 目录。
 
-在 `stage: all` 中，`n_nodes` 节流和 `auto_resub` 重提只覆盖被等待的 init/弛豫依赖链。validation 和最终 MD 目录以非等待模式提交，因此提交后不会继续由 DPmoire-lite 进程节流或重提。
+在 `stage: all` 中，`n_nodes` 节流和 `auto_resub` 重提会覆盖自动链条里的每个等待提交：init MLFF、弛豫、validation 和最终 MD。validation 输出不是 stage1 的输入，但当 `twist_val: true` 时，validation 作业仍会被等待和节流。
 
 只有当同一台机器和同一个调度系统能连续运行整个依赖链时，才建议使用 `stage: all`。对于多集群或手动分段计算，建议分别使用 `stage: 0` 和 `stage: 1`。
 

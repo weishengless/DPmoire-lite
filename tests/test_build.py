@@ -159,6 +159,17 @@ class FakeRunner:
         return jobs
 
 
+class SubmitManyRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.submit_many_calls = []
+
+    def submit_many(self, items, wait=False, poll_seconds=30):
+        self.submit_many_calls.append(([rel_path for _work_dir, rel_path in items], wait))
+        jobs = [self.submit(work_dir, rel_path) for work_dir, rel_path in items]
+        return self.wait(jobs) if wait else jobs
+
+
 def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     config = write_build_config(tmp_path)
     run_build(config, wait=False)
@@ -439,6 +450,36 @@ def test_stage_all_waits_init_step2_and_rlx_before_generating_md(monkeypatch, tm
         ("wait", ["validation/1.00deg"]),
         ("submit", "md/0_0"),
         ("wait", ["md/0_0"]),
+    ]
+
+
+def test_stage_all_uses_submit_many_wait_for_validation_and_md(monkeypatch, tmp_path):
+    fake_runner = SubmitManyRunner()
+    fake_runner.root = tmp_path / "work"
+    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
+
+    def fake_twist_struct(self, _min_n, _max_n, _out_dir):
+        atoms = Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True)
+        return ["1.00deg", "2.00deg"], [atoms, atoms.copy()]
+
+    monkeypatch.setattr(build_module.StructureHandler, "make_twist_struct", fake_twist_struct)
+    config = write_build_config(
+        tmp_path,
+        stage="all",
+        submit=True,
+        n_sectors=[2, 1],
+        twist_val=True,
+        include_monolayer_md=False,
+    )
+
+    run_build(config, wait=True)
+
+    assert fake_runner.submit_many_calls == [
+        (["init_mlff"], True),
+        (["init_mlff"], True),
+        (["rlx/0_0", "rlx/1_0"], True),
+        (["validation/1.00deg", "validation/2.00deg"], True),
+        (["md/0_0", "md/1_0"], True),
     ]
 
 

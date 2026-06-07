@@ -212,14 +212,13 @@ The workflow is:
 3. prepare, submit, and wait for the second init MLFF step;
 4. generate and submit relaxation folders;
 5. wait for relaxation folders to finish;
-6. generate and submit validation folders if `twist_val: true`, without making
-   validation block stage1;
-7. generate and submit MD folders.
+6. generate, submit, and wait for validation folders if `twist_val: true`;
+7. generate, submit, and wait for MD folders.
 
-In `stage: all`, `n_nodes` throttling and `auto_resub` apply to the waited
-init/relaxation dependency chain. Validation and final MD folders are submitted
-in non-wait mode, so they are not throttled or resubmitted by the DPmoire-lite
-process after submission.
+In `stage: all`, `n_nodes` throttling and `auto_resub` apply to every waited
+submission in the automatic chain: init MLFF, relaxation, validation, and final
+MD. Validation outputs are not inputs to stage1, but validation jobs are still
+waited and throttled when `twist_val: true`.
 
 Use `stage: all` only when the same machine and scheduler can run the dependency
 chain continuously. For multi-cluster or manually staged workflows, use

@@ -87,11 +87,12 @@ before writing any MD folder. When `vasp_ml: true`, it also requires
 `stage: all` is an automated submit-and-wait workflow. It requires both
 `submit: true` and `DPmoireLite build config.yaml --wait`, because stage1 needs
 completed stage0 outputs. In `stage: all`, DPmoire-lite waits for the init MLFF
-and relaxation dependency chain; validation and final MD jobs are submitted and
-then left to the scheduler.
+and relaxation dependency chain, validation jobs when enabled, and final MD jobs.
+Those submissions all use the same DPmoire-lite polling loop.
 
-Validation is an independent timeline. Validation jobs do not block stage1, and
-validation data is collected only when the user explicitly runs:
+Validation outputs are independent of the MD timeline: stage1 does not consume
+validation results, and validation data is collected only when the user
+explicitly runs:
 
 ```bash
 DPmoireLite collect config.yaml --stage validation
@@ -161,7 +162,7 @@ rejected.
 | `script_dir` | path | Directory containing prepared submit scripts. |
 | `input_dir` | path | Directory containing layer POSCAR files, INCAR templates, and optional `vdw_kernel.bindat`. |
 | `work_dir` | path | Root output directory for generated stages, manifests, backups, and collected datasets. |
-| `n_nodes` | positive int | Maximum number of active Slurm jobs in the `stage: all`, `submit: true`, `--wait` automatic workflow. Non-wait mode submits all requested jobs and exits. |
+| `n_nodes` | positive int | Maximum number of active Slurm jobs in DPmoire-lite `--wait` polling mode. `stage: all`, `submit: true`, and `--wait` apply it across init MLFF, relaxation, validation, and final MD submissions. Non-wait mode submits all requested jobs and exits. |
 | `stage` | `0`, `1`, or `all` | Build stage. `0` generates init, relaxation, and validation folders. `1` generates MD folders from completed relaxation outputs. `all` runs the automated dependency chain. |
 | `submit` | bool | If `false`, only generate folders. If `true`, submit generated folders with Slurm. |
 | `auto_resub` | bool | In `--wait` mode, resubmit failed Slurm jobs once per calculation directory. Ignored in non-wait mode. |
