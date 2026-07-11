@@ -6,6 +6,14 @@ import yaml
 from dpmoire_lite.config import ConfigError, load_config, normalize_pair
 
 
+def assert_temporary_safety_error(error: ConfigError) -> None:
+    message = str(error)
+    assert "temporarily disabled" in message
+    assert "Slurm terminal-state validation and failure propagation" in message
+    assert "submit: false" in message
+    assert "manually" in message
+
+
 def write_config(path: Path, **overrides):
     data = {
         "dft_script": "DFT_script.sh",
@@ -63,14 +71,57 @@ def test_load_config_resolves_paths(tmp_path):
     assert config.work_dir == tmp_path / "work"
 
 
-def test_stage_all_requires_submit_wait_at_build_time(tmp_path):
+def test_stage_all_is_temporarily_disabled_for_submit_false(tmp_path):
     (tmp_path / "potcars").mkdir()
     (tmp_path / "scripts").mkdir()
     (tmp_path / "input").mkdir()
     config_file = tmp_path / "config.yaml"
     write_config(config_file, stage="all", submit=False)
     config = load_config(config_file)
-    with pytest.raises(ConfigError, match="stage: all"):
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=False)
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_stage_all_is_temporarily_disabled_for_submit_true_wait(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, stage="all", submit=True)
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_submitted_wait_is_disabled_for_stage0(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, stage=0, submit=True)
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_submitted_wait_is_disabled_for_stage1(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, stage=1, submit=True)
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_manual_stage0_and_stage1_remain_allowed(tmp_path):
+    for stage in (0, 1):
+        config_file = tmp_path / f"config-stage{stage}.yaml"
+        write_config(config_file, stage=stage, submit=False)
+        config = load_config(config_file)
+
         config.validate_build_mode(wait=False)
 
 

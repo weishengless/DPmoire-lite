@@ -43,6 +43,7 @@ def run_build(config_path: Path, wait: bool = False) -> None:
 
 
 def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
+    config.validate_build_mode(wait)
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +72,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
 
 
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
+    config.validate_build_mode(wait)
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)

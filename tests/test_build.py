@@ -7,9 +7,17 @@ import pytest
 import yaml
 
 import dpmoire_lite.build as build_module
-from dpmoire_lite.build import _ordered_elements, build_stage_all, run_build
+from dpmoire_lite.build import _ordered_elements, build_stage0, build_stage1, build_stage_all, run_build
 from dpmoire_lite.config import ConfigError, load_config
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
+
+
+def assert_temporary_safety_error(error: ConfigError) -> None:
+    message = str(error)
+    assert "temporarily disabled" in message
+    assert "Slurm terminal-state validation and failure propagation" in message
+    assert "submit: false" in message
+    assert "manually" in message
 
 
 def write_minimal_inputs(root, *, top_a=4.0, bot_a=4.0):
@@ -159,17 +167,6 @@ class FakeRunner:
         return jobs
 
 
-class SubmitManyRunner(FakeRunner):
-    def __init__(self):
-        super().__init__()
-        self.submit_many_calls = []
-
-    def submit_many(self, items, wait=False, poll_seconds=30):
-        self.submit_many_calls.append(([rel_path for _work_dir, rel_path in items], wait))
-        jobs = [self.submit(work_dir, rel_path) for work_dir, rel_path in items]
-        return self.wait(jobs) if wait else jobs
-
-
 def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     config = write_build_config(tmp_path)
     run_build(config, wait=False)
@@ -286,6 +283,43 @@ def test_build_stage_all_validates_direct_calls(tmp_path, overrides, wait):
 
     with pytest.raises(ConfigError, match="stage: all"):
         build_stage_all(config, wait=wait)
+
+
+@pytest.mark.parametrize("stage", [0, 1])
+def test_safety_gate_runs_before_work_dir_creation(monkeypatch, tmp_path, stage):
+    config_path = write_build_config(tmp_path, stage=stage, submit=True)
+    work_dir = tmp_path / "work"
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("SlurmRunner was constructed before the safety gate")
+
+    monkeypatch.setattr(build_module, "SlurmRunner", fail_if_constructed)
+
+    with pytest.raises(ConfigError) as exc_info:
+        run_build(config_path, wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(("stage", "builder"), [(0, build_stage0), (1, build_stage1)])
+def test_safety_gate_runs_before_runner_construction(monkeypatch, tmp_path, stage, builder):
+    config_path = write_build_config(tmp_path, stage=stage, submit=True)
+    config = load_config(config_path)
+    runner_constructed = False
+
+    def fail_if_constructed(*_args, **_kwargs):
+        nonlocal runner_constructed
+        runner_constructed = True
+        raise AssertionError("SlurmRunner was constructed before the safety gate")
+
+    monkeypatch.setattr(build_module, "SlurmRunner", fail_if_constructed)
+
+    with pytest.raises(ConfigError) as exc_info:
+        builder(config, wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+    assert runner_constructed is False
 
 
 def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
@@ -412,78 +446,7 @@ def test_ordered_elements_preserves_consecutive_symbol_groups():
     assert _ordered_elements(atoms) == ["Mo", "S", "Mo"]
 
 
-def test_stage_all_waits_init_step2_and_rlx_before_generating_md(monkeypatch, tmp_path):
-    fake_runner = FakeRunner()
-    fake_runner.root = tmp_path / "work"
-    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
-
-    def fake_twist_struct(self, _min_n, _max_n, _out_dir):
-        return ["1.00deg"], [Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True)]
-
-    monkeypatch.setattr(build_module.StructureHandler, "make_twist_struct", fake_twist_struct)
-    config = write_build_config(
-        tmp_path,
-        stage="all",
-        submit=True,
-        n_sectors=[1, 1],
-        twist_val=True,
-        include_monolayer_md=False,
-    )
-
-    run_build(config, wait=True)
-
-    work = tmp_path / "work"
-    assert (work / "init_mlff" / "ML_AB").read_text(encoding="utf-8") == "step1-abn"
-    assert (work / "init_mlff" / "ML_FF").read_text(encoding="utf-8") == "step1-ffn"
-    assert (work / "init_mlff" / "ML_ABN").read_text(encoding="utf-8") == "step2-abn"
-    assert (work / "init_mlff" / "ML_FFN").read_text(encoding="utf-8") == "step2-ffn"
-    assert (work / "md" / "0_0" / "ML_AB").read_text(encoding="utf-8") == "step2-abn"
-    assert (work / "md" / "0_0" / "ML_FF").read_text(encoding="utf-8") == "step2-ffn"
-    assert fake_runner.events == [
-        ("submit", "init_mlff"),
-        ("wait", ["init_mlff"]),
-        ("submit", "init_mlff"),
-        ("wait", ["init_mlff"]),
-        ("submit", "rlx/0_0"),
-        ("wait", ["rlx/0_0"]),
-        ("submit", "validation/1.00deg"),
-        ("wait", ["validation/1.00deg"]),
-        ("submit", "md/0_0"),
-        ("wait", ["md/0_0"]),
-    ]
-
-
-def test_stage_all_uses_submit_many_wait_for_validation_and_md(monkeypatch, tmp_path):
-    fake_runner = SubmitManyRunner()
-    fake_runner.root = tmp_path / "work"
-    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
-
-    def fake_twist_struct(self, _min_n, _max_n, _out_dir):
-        atoms = Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True)
-        return ["1.00deg", "2.00deg"], [atoms, atoms.copy()]
-
-    monkeypatch.setattr(build_module.StructureHandler, "make_twist_struct", fake_twist_struct)
-    config = write_build_config(
-        tmp_path,
-        stage="all",
-        submit=True,
-        n_sectors=[2, 1],
-        twist_val=True,
-        include_monolayer_md=False,
-    )
-
-    run_build(config, wait=True)
-
-    assert fake_runner.submit_many_calls == [
-        (["init_mlff"], True),
-        (["init_mlff"], True),
-        (["rlx/0_0", "rlx/1_0"], True),
-        (["validation/1.00deg", "validation/2.00deg"], True),
-        (["md/0_0", "md/1_0"], True),
-    ]
-
-
-def test_stage0_submit_without_wait_submits_only_init_step1(monkeypatch, tmp_path):
+def test_fire_and_forget_stage0_remains_allowed(monkeypatch, tmp_path):
     fake_runner = FakeRunner()
     fake_runner.root = tmp_path / "work"
     monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)

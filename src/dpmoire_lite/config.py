@@ -187,8 +187,12 @@ class DPmoireLiteConfig:
         return self.n_sectors[1]
 
     def validate_build_mode(self, wait: bool) -> None:
-        if self.stage == "all" and (not self.submit or not wait):
-            raise ConfigError("stage: all requires submit: true and DPmoireLite build ... --wait")
+        if self.stage == "all" or (self.submit and wait):
+            raise ConfigError(
+                "stage: all and submitted --wait workflows are temporarily disabled because "
+                "Slurm terminal-state validation and failure propagation are not yet reliable. "
+                "Generate stages with submit: false and submit them manually."
+            )
 
 
 def _require(data: dict[str, Any], field_name: str) -> Any:
