@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import re
 import tempfile
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -265,8 +266,18 @@ class StructureHandler:
         return atoms
 
     def find_sym_reduced_stackings(self, prec: float = 0.0001) -> list[tuple[int, int]]:
-        from pymatgen.analysis.structure_matcher import StructureMatcher
-        from pymatgen.io.ase import AseAtomsAdaptor
+        try:
+            try:
+                from pymatgen.core.structure_matcher import StructureMatcher
+            except ImportError:
+                from pymatgen.analysis.structure_matcher import StructureMatcher
+            from pymatgen.io.ase import AseAtomsAdaptor
+
+            import_module("spglib")
+        except ImportError as exc:
+            raise RuntimeError(
+                "Symmetry reduction requires optional dependencies pymatgen and spglib"
+            ) from exc
 
         adaptor = AseAtomsAdaptor()
         matcher = StructureMatcher(ltol=prec, stol=prec, angle_tol=prec)
