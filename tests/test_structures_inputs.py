@@ -1,3 +1,5 @@
+import pytest
+
 from ase import Atoms
 from ase.io.vasp import read_vasp
 
@@ -68,8 +70,29 @@ def test_needs_vdw_kernel_detects_nonlocal_vdw():
     assert needs_vdw_kernel("GGA = PE\n") is False
 
 
+def test_render_incar_uses_shared_document_analysis(tmp_path):
+    template = tmp_path / "input" / "MD_INCAR"
+    template.parent.mkdir()
+    template.write_text("ISMEAR=-1\nISMEAR=0\nENCUT=400\n", encoding="utf-8")
+    output = tmp_path / "stage0" / "INCAR"
+
+    with pytest.raises(ValueError, match="ISMEAR"):
+        inputs.render_incar(template, output, 600.0, 7.2, 7.2, ["Mo", "S"])
+
+    assert not output.parent.exists()
+
+
+def test_needs_vdw_kernel_detects_semicolon_and_lowercase_definition():
+    assert needs_vdw_kernel("ENCUT=400; luse_vdw=.TRUE.\n") is True
+
+
+def test_needs_vdw_kernel_rejects_conflicting_definitions():
+    with pytest.raises(ValueError, match="LUSE_VDW"):
+        needs_vdw_kernel("LUSE_VDW=T\nluse_vdw=F\n")
+
+
 def test_replace_incar_values_updates_encut_rcut_and_langevin():
-    template = "ENCUT = 400\nML_RCUT1 = 1\nML_RCUT2 = 1\nLANGEVIN_GAMMA = 1\n"
+    template = "ENCUT=400\nML_RCUT1 = 1\nML_RCUT2 = 1\nLANGEVIN_GAMMA = 10 20 30\n"
     rendered = replace_incar_values(
         template,
         encut=520.0,
@@ -80,7 +103,22 @@ def test_replace_incar_values_updates_encut_rcut_and_langevin():
     assert "ENCUT = 520.0" in rendered
     assert "ML_RCUT1 = 7.1" in rendered
     assert "ML_RCUT2 = 7.1" in rendered
-    assert "LANGEVIN_GAMMA = 1 1 1" in rendered
+    assert "LANGEVIN_GAMMA = 10 20 30" in rendered
+    assert "LANGEVIN_GAMMA = 1 1 1" not in rendered
+
+
+def test_copy_vdw_if_needed_uses_the_same_effective_luse_vdw(tmp_path):
+    template = tmp_path / "MD_INCAR"
+    template.write_text("ENCUT=400; luse_vdw=T\n", encoding="utf-8")
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    kernel = b"synthetic vdw kernel\n"
+    (input_dir / "vdw_kernel.bindat").write_bytes(kernel)
+    output_dir = tmp_path / "stage0"
+
+    inputs.copy_vdw_if_needed(template, input_dir, output_dir)
+
+    assert (output_dir / "vdw_kernel.bindat").read_bytes() == kernel
 
 
 def test_resolve_potcar_dir_uses_strict_mapping(tmp_path):

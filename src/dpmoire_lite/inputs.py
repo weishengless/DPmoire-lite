@@ -12,6 +12,7 @@ from ase import Atoms
 from ase.build import make_supercell, sort
 from ase.io.vasp import read_vasp, write_vasp
 
+from .incar import IncarAnalysis, IncarRenderResult, parse_incar
 from .structures import supercell_matrix
 
 
@@ -69,17 +70,15 @@ MINIMAL_VALENCE_EXCLUDED_SUFFIXES = ("_AE", "_GW", "_h", "_s")
 VALID_POTCAR_POLICIES = {"recommend", "minimal"}
 
 
-def needs_vdw_kernel(incar_text: str) -> bool:
-    for raw_line in incar_text.splitlines():
-        line = raw_line.split("#", 1)[0].split("!", 1)[0].strip()
-        if not line:
-            continue
-        parts = line.replace("=", " = ").split()
-        if not parts or parts[0].upper() != "LUSE_VDW":
-            continue
-        value = "".join(parts[2:] if len(parts) > 1 and parts[1] == "=" else parts[1:]).upper()
-        return value in {".TRUE.", "TRUE", "T", ".T."}
-    return False
+def validate_incar(
+    incar_text: str, *, source_name: str = "<memory>"
+) -> IncarAnalysis:
+    return parse_incar(incar_text, source_name=source_name).analyze()
+
+
+def needs_vdw_kernel(incar_text: str, *, source_name: str = "<memory>") -> bool:
+    analysis = validate_incar(incar_text, source_name=source_name)
+    return analysis.is_effectively_true("LUSE_VDW")
 
 
 def resolve_potcar_dir(element: str, potcar_dir: Path, potcar_policy: str = "recommend") -> Path:
@@ -137,24 +136,12 @@ def read_zval(potcar_file: Path) -> float:
 
 
 def replace_incar_values(incar_text: str, encut: float, rcut1: float, rcut2: float, elements: list[str]) -> str:
-    output = []
-    for line in incar_text.splitlines():
-        words = line.split()
-        if not words:
-            output.append(line)
-            continue
-        key = words[0].upper()
-        if key == "ENCUT":
-            output.append(f"ENCUT = {encut}")
-        elif key == "ML_RCUT1":
-            output.append(f"ML_RCUT1 = {rcut1}")
-        elif key == "ML_RCUT2":
-            output.append(f"ML_RCUT2 = {rcut2}")
-        elif key == "LANGEVIN_GAMMA":
-            output.append("LANGEVIN_GAMMA = " + " ".join(["1"] * len(elements)))
-        else:
-            output.append(line)
-    return "\n".join(output) + "\n"
+    del elements
+    document = parse_incar(incar_text)
+    result = document.render(
+        {"ENCUT": encut, "ML_RCUT1": rcut1, "ML_RCUT2": rcut2}
+    )
+    return result.text
 
 
 def get_ordered_elements(atoms: Atoms) -> list[str]:
@@ -197,16 +184,29 @@ def write_kpoints(output_dir: Path, lat_vec, k_mesh: int, k_scale: tuple[int, in
     )
 
 
-def render_incar(template_file: Path, output_file: Path, encut: float, rcut1: float, rcut2: float, elements: list[str]) -> None:
+def render_incar(
+    template_file: Path,
+    output_file: Path,
+    encut: float,
+    rcut1: float,
+    rcut2: float,
+    elements: list[str],
+) -> IncarRenderResult:
     text = Path(template_file).read_text(encoding="utf-8")
+    del elements
+    document = parse_incar(text, source_name=str(template_file))
+    result = document.render(
+        {"ENCUT": encut, "ML_RCUT1": rcut1, "ML_RCUT2": rcut2}
+    )
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(replace_incar_values(text, encut, rcut1, rcut2, elements), encoding="utf-8")
+    output_file.write_text(result.text, encoding="utf-8")
+    return result
 
 
 def copy_vdw_if_needed(template_file: Path, input_dir: Path, output_dir: Path) -> None:
     text = Path(template_file).read_text(encoding="utf-8")
-    if not needs_vdw_kernel(text):
+    if not needs_vdw_kernel(text, source_name=str(template_file)):
         return
     source = Path(input_dir) / "vdw_kernel.bindat"
     if not source.exists():
