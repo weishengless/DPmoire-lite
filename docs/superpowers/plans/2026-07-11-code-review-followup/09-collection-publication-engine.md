@@ -1,7 +1,10 @@
 # Plan 09: Collection Publication Engine
 
-Authoritative spec:
-[P2-3 Collection output safety](../../../code-review-notes/P2-3-collection-output-safety.md)
+Authoritative specs:
+
+- [P2-3 Collection output safety](../../../code-review-notes/P2-3-collection-output-safety.md)
+- [P2-6 Legacy-compatible result manifest](../../../code-review-notes/P2-6-collect-exit-codes.md)
+- [Approved full-dedup design](../../specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 
 Consumes: [Plan 02 Manifest v2 and atomic I/O](02-manifest-v2.md)
 
@@ -25,12 +28,18 @@ Done means:
 - the P/C/empty/X state table and committed-journal residual behavior are fully
   parameterized in tests;
 - publication errors preserve the journal/backup evidence required for recovery;
+- the request can target either the validated current stage manifest or the exact
+  MLFF compatibility result path without accepting an arbitrary path;
+- legacy/missing collection can pair `MD_data.extxyz` with
+  `MD_data.collect.yaml` without rewriting source build provenance;
 - a manifest-only atomic operation exists for Plan 10 no-data results.
 
 ## Non-goals
 
 - Do not parse VASP sources or choose source status.
 - Do not choose complete/degraded/no_data/fatal from diagnostics.
+- Do not choose current versus compatibility result-manifest target; Plan 10 owns
+  that policy.
 - Do not map CLI exit codes.
 - Do not delete older backups automatically.
 - Do not create a generic database transaction framework.
@@ -56,7 +65,8 @@ Modify:
 
 ## Publication Session and Request Contract
 
-The engine first opens a publication session for validated stage/output paths.
+The engine first opens a publication session for validated stage/output and
+result-manifest paths.
 Entering the session acquires the OS lock, reads previous identity, and resolves
 any existing pending/committed journal. If recovery completes an earlier
 transaction, the caller returns that recovered result without collecting new
@@ -65,13 +75,25 @@ classifies the new candidate.
 
 The held session then receives an immutable request containing:
 
-- stage and validated final output/manifest paths;
+- stage, validated final output path, validated result-manifest target kind, and
+  exact result-manifest path;
 - transaction ID;
 - candidate Dataset/frame count;
 - already selected aggregate status and source diagnostics;
 - expected previous output/manifest identity already read by this session under
   the lock;
 - functions or serializers for data and manifest candidates.
+
+The result-manifest target has two closed variants:
+
+- current stage Manifest v2 at the standard stage manifest path;
+- MLFF MD compatibility result at exact `work_dir/MD_data.collect.yaml`.
+
+The second target never authorizes overwriting a legacy `md/manifest.yaml` and
+is invalid for other output/stage combinations. The journal records target kind
+and normalized path so recovery verifies the same artifact selected when the
+transaction began. Caller-supplied arbitrary manifest paths are rejected before
+candidate creation.
 
 Plan 09 may use a test request with explicit status; Plan 10 owns real status
 selection. The session returns committed paths/hashes/backup identity or raises a
@@ -125,6 +147,10 @@ Add failing tests:
 - `test_data_candidate_requires_energy_forces_and_stress()`;
 - `test_data_candidate_rejects_shape_or_truncated_tail()`;
 - `test_manifest_candidate_contains_transaction_and_data_hash()`;
+- `test_current_target_writes_stage_manifest_candidate()`;
+- `test_compatibility_target_writes_md_data_collect_candidate()`;
+- `test_compatibility_target_rejects_wrong_stage_output_or_path()`;
+- `test_compatibility_candidate_preserves_legacy_stage_manifest_bytes()`;
 - `test_both_candidates_exist_and_validate_before_pending_journal()`;
 - `test_candidate_failure_leaves_final_and_previous_manifest_unchanged()`.
 
@@ -134,9 +160,12 @@ Implementation requirements:
 2. Reread to EOF and validate frame count, atoms/composition/cell/positions,
    energy, forces, stress, and array shapes.
 3. Compute SHA-256 only after candidate fsync/validation.
-4. Build the final manifest candidate with transaction/data/backup/source fields.
-5. Fsync, reread, schema-validate, and hash the manifest candidate.
+4. Build the selected current or compatibility result-manifest candidate with
+   transaction/data/backup/source fields.
+5. Fsync, reread, target-schema-validate, and hash the result-manifest candidate.
 6. Do not create a journal until both candidates are finalized.
+7. Never open a legacy source stage manifest for replacement when the
+   compatibility target is selected.
 
 Focused command:
 
@@ -192,7 +221,9 @@ Add failing tests:
 - `test_manifest_hash_and_internal_transaction_verified()`;
 - `test_journal_marked_committed_before_unlink()`;
 - `test_lock_held_from_recovery_through_journal_cleanup()`;
-- `test_normal_publish_returns_matching_paths_and_hashes()`.
+- `test_normal_publish_returns_matching_paths_and_hashes()`;
+- `test_pending_journal_records_result_manifest_target_kind_and_path()`;
+- `test_normal_publish_supports_compatibility_result_manifest()`.
 
 The journal contains every field required by the P2-3 note, including nullable
 previous/backup fields for first publication.
@@ -208,6 +239,7 @@ Implementation requirements:
 6. Replace and hash/transaction-verify manifest.
 7. Atomically update journal to committed, then unlink it.
 8. Release lock last.
+9. Apply the same ordering to both result-manifest target kinds.
 
 Focused command:
 
@@ -238,7 +270,9 @@ Add tests:
 - `test_pending_recovery_state_table()` parameterized by every row;
 - `test_nonfirst_pending_requires_valid_backup()`;
 - `test_recovery_never_guesses_rollback_or_continue()`;
-- `test_fatal_recovery_preserves_journal_and_backup()`.
+- `test_fatal_recovery_preserves_journal_and_backup()`;
+- `test_recovery_state_table_is_identical_for_both_manifest_targets()`;
+- `test_recovery_rejects_changed_manifest_target_kind_or_path()`.
 
 Implementation requirements:
 
@@ -248,6 +282,8 @@ Implementation requirements:
 4. Perform the single action specified by the matching row.
 5. Treat unmatched/impossible/external-modification states as fatal.
 6. Preserve evidence on fatal.
+7. Verify the observed result-manifest path and target kind before applying a
+   state-table row.
 
 Focused command:
 
@@ -266,6 +302,7 @@ Add tests:
 - `test_committed_journal_with_matching_files_is_removed()`;
 - `test_committed_journal_hash_or_transaction_mismatch_is_fatal()`;
 - `test_manifest_only_publish_is_atomic_under_same_lock()`;
+- `test_compatibility_manifest_only_publish_does_not_create_stage_manifest()`;
 - `test_manifest_only_failure_preserves_old_manifest_and_data()`;
 - `test_failure_before_pending_cleans_unneeded_candidates()`;
 - `test_failure_after_pending_preserves_recovery_evidence()`;
@@ -277,8 +314,10 @@ Implementation requirements:
 
 1. Apply the exact committed-residual rule from P2-3.
 2. Provide a manifest-only operation for no-data results under the same lock.
-3. Distinguish safe pre-pending cleanup from post-pending evidence preservation.
-4. Never report success while a fatal mismatch remains.
+3. Permit compatibility-result manifest-only publication without creating or
+   replacing a legacy stage manifest.
+4. Distinguish safe pre-pending cleanup from post-pending evidence preservation.
+5. Never report success while a fatal mismatch remains.
 
 Focused command:
 
@@ -303,9 +342,12 @@ git status --short
 | OS-level single writer | Task 1 |
 | double candidates before journal | Task 2 |
 | extxyz semantic reread | Task 2 |
+| closed current/compatibility targets | Task 2 |
+| legacy stage manifest remains untouched | Tasks 2 and 6 |
 | old output remains in place during backup | Task 3 |
 | backup hash/atomic name | Task 3 |
 | fixed publish sequence | Task 4 |
+| journal binds target kind/path | Tasks 4 and 5 |
 | first publication null fields | Tasks 3 through 5 |
 | deterministic P/C/empty/X recovery | Task 5 |
 | committed journal residual | Task 6 |
@@ -314,7 +356,8 @@ git status --short
 
 ## Plan Checkpoint
 
-Plan 09 is complete when lock, candidate, backup, transaction, recovery, committed
-residual, manifest-only, fault-injection, and full suites pass. It must not be
-described as user-visible collect safety until Plan 10 wires the real
-orchestration and CLI contract.
+Plan 09 is complete when lock, candidate, backup, closed result-manifest targets,
+transaction, recovery, committed residual, manifest-only, fault-injection, and
+full suites pass. It must not be described as user-visible collect safety until
+Plan 10 chooses the target from a validated input layout and wires the real
+orchestration/CLI contract.

@@ -395,8 +395,11 @@ implementation:
   manifest.
 - Plan 03: expose reusable per-configuration canonical identity and add VASP
   6.4.1/6.5.1 sanitized fixtures.
-- Plan 08: add the mode split, exact dedup fold, legacy/missing inventory, and
-  source-local identity commit boundary.
+- Plan 08: keep parsed ML_ABN payloads source-local and expose the default
+  seed-aware candidate without eager ASE conversion.
+- Plan 08A: add the mode contract, exact dedup fold, bounded legacy/missing
+  inventory, and source-local identity commit boundary as a separate checkpoint
+  so Plan 08 does not become oversized.
 - Plan 09: support the validated alternate compatibility result-manifest path in
   the same publication/recovery engine.
 - Plan 10: wire the CLI enum, validation, audit fields, and exact exit codes.

@@ -1,17 +1,18 @@
-# Plan 03: ML_AB Parser and Canonical Seed Digest
+# Plan 03: ML_AB Parser and Canonical Identities
 
 Authoritative spec:
 [P2-1 Partial collection and MLFF seed](../../../code-review-notes/P2-1-partial-collection-and-mlff-seed.md)
 
 Depends on: Plan 00
 
-Unlocks: Plans 04, 06, and 08
+Unlocks: Plans 04, 06, 08, and 08A
 
 ## Goal and Done State
 
 Replace regex-splitting and incremental Dataset mutation with a pure structured
 ML_AB/ML_ABN parser that can prove complete versus tail-partial input and compute
-the exact `mlab-seed-v1` scientific-content digest.
+the exact `mlab-seed-v1` prefix digest plus reusable `mlab-config-v1`
+per-configuration identity.
 
 Done means:
 
@@ -24,6 +25,9 @@ Done means:
 - equivalent scientific content with harmless text formatting changes hashes the
   same;
 - changed scientific content hashes differently;
+- one canonical configuration serializer is shared by `mlab-seed-v1` and
+  `mlab-config-v1` without changing existing seed sequence framing;
+- sanitized VASP 6.4.1 and 6.5.1 fixtures exercise the same structured contract;
 - Dataset compatibility code does not mutate the shared dataset until a source
   parse result is known.
 
@@ -33,6 +37,7 @@ Done means:
 - Do not publish extxyz; Plans 09 and 10 own publication.
 - Do not inspect current `md/ML_AB` to infer an initial seed.
 - Do not implement fuzzy structure deduplication.
+- Do not perform cross-source exact deduplication; Plan 08A consumes the identity.
 - Do not convert digest stress through ASE sign/unit conventions.
 
 ## Files
@@ -78,7 +83,23 @@ Create the smallest fixtures needed for:
 - truncation in the final stress block;
 - first configuration incomplete;
 - internal corruption followed by a later recognizable configuration;
-- identical scientific content with different whitespace/number formatting.
+- identical scientific content with different whitespace/number formatting;
+- one minimum complete VASP 6.4.1 configuration source;
+- one minimum complete VASP 6.5.1 configuration source.
+
+If `example-test/0-walltime_restart/README.md` exists, read it before deriving
+fixtures. The ML_AB/ML_ABN files listed there are complete snapshots: their last
+configuration reaches a complete stress block. Build position/force/stress
+tail-truncation cases by deterministic cropping and label them as constructed;
+do not call them natural walltime-truncated ML_ABN files. Do not assume the
+provided `init_mlff/ML_ABN` is the original seed for `md/0_0`.
+
+The ignored local corpus contains VASP 6.4.1 and 6.5.1 ML_ABN evidence. Crop
+minimum labeled scientific blocks from each version. Do not copy basis-set
+tables or full databases when the parser boundary can be represented without
+them. Version provenance comes from the associated calculation OUTCAR and must
+be recorded in the fixture inventory; the ML_ABN header alone is not treated as
+a VASP executable version declaration.
 
 For every file, `tests/data/mlab/README.md` records:
 
@@ -92,9 +113,24 @@ For every file, `tests/data/mlab/README.md` records:
 Add failing fixture tests:
 
 - `test_mlab_fixture_inventory_has_provenance_entry()`;
+- `test_mlab_fixture_inventory_records_vasp_641_and_651()`;
 - `test_mlab_fixtures_contain_no_private_path_or_potcar_marker()`.
 
 Do not add a fixture until its exact test exists.
+
+Focused command:
+
+```powershell
+$python = 'C:\Users\Nice_Try\anaconda3\envs\vdwID\python.exe'
+$env:PIP_NO_CACHE_DIR = '1'
+& $python -m pytest tests/test_mlab.py -q -p no:cacheprovider -k "fixture_inventory or private_path or potcar_marker"
+```
+
+Expected RED: the tracked fixture inventory and sanitized version-specific files
+do not exist. Add only the minimum files owned by these tests, run the command to
+green, and inspect the staged fixture bytes before committing.
+
+Checkpoint: portable fixture corpus and provenance only.
 
 ## Task 2: Implement Complete Structured Parsing
 
@@ -107,7 +143,9 @@ Add failing tests:
 - `test_parse_mlab_rejects_type_count_sum_mismatch()`;
 - `test_parse_mlab_rejects_position_or_force_shape_mismatch()`;
 - `test_parse_mlab_rejects_nan_and_infinity()`;
-- `test_initial_seed_requires_header_count_equal_complete_count()`.
+- `test_initial_seed_requires_header_count_equal_complete_count()`;
+- `test_vasp_641_fixture_parses_canonical_fields()`;
+- `test_vasp_651_fixture_parses_canonical_fields()`.
 
 Red command:
 
@@ -168,7 +206,7 @@ Run the focused command to green.
 
 Checkpoint: partial/error classification.
 
-## Task 4: Implement `mlab-seed-v1` Canonical Serialization
+## Task 4: Implement Shared Canonical Serialization and Identities
 
 Add failing tests:
 
@@ -179,7 +217,12 @@ Add failing tests:
 - `test_canonical_digest_changes_for_lattice_position_energy_force_or_stress()`;
 - `test_prefix_digest_hashes_exactly_first_n_configurations()`;
 - `test_prefix_digest_rejects_short_source()`;
-- `test_digest_schema_name_is_mlab_seed_v1()`.
+- `test_digest_schema_name_is_mlab_seed_v1()`;
+- `test_config_identity_schema_name_is_mlab_config_v1()`;
+- `test_config_identity_hashes_exactly_one_configuration()`;
+- `test_config_identity_reuses_seed_configuration_bytes()`;
+- `test_adding_config_identity_does_not_change_seed_digest()`;
+- `test_config_identity_can_hash_incrementally_without_file_sized_buffer()`.
 
 Implementation requirements:
 
@@ -189,14 +232,18 @@ Implementation requirements:
    float64 bytes.
 4. Normalize `-0.0` to `+0.0`; reject nonfinite values before serialization.
 5. Perform no tolerance rounding.
-6. Keep schema name and digest together in the returned identity object.
+6. Expose one canonical-configuration byte/update routine used by both identity
+   schemas; the collector must not reimplement field serialization.
+7. Define `mlab-config-v1` as SHA-256 of exactly one canonical configuration.
+8. Preserve `mlab-seed-v1` sequence framing and existing digest semantics.
+9. Keep schema name and digest together in each returned identity object.
 
 Focused command:
 
 ```powershell
 $python = 'C:\Users\Nice_Try\anaconda3\envs\vdwID\python.exe'
 $env:PIP_NO_CACHE_DIR = '1'
-& $python -m pytest tests/test_mlab.py -q -p no:cacheprovider -k "canonical or digest or prefix"
+& $python -m pytest tests/test_mlab.py -q -p no:cacheprovider -k "canonical or digest or prefix or config_identity"
 ```
 
 Checkpoint: canonical identity implementation.
@@ -251,11 +298,15 @@ git status --short
 | negative zero and nonfinite handling | Tasks 2 and 4 |
 | stable canonical digest | Task 4 |
 | scientific changes alter digest | Task 4 |
+| reusable per-configuration exact identity | Task 4 |
+| seed digest remains backward-compatible | Task 4 |
+| VASP 6.4.1 and 6.5.1 portable formats | Tasks 1 and 2 |
 | no incremental Dataset mutation | Task 5 |
 | portable fixtures and provenance | Task 1 |
 
 ## Plan Checkpoint
 
-Plan 03 is complete when the pure parser/digest and Dataset compatibility tests
-plus the full suite pass. Accepting partial frames into a published collection and
-verifying Stage1/MD seed provenance remain open for Plans 06 and 08.
+Plan 03 is complete when the pure parser/identity and Dataset compatibility tests
+plus the full suite pass. Accepting partial frames into a published collection,
+verifying Stage1/MD seed provenance, and cross-source exact dedup remain open for
+Plans 06, 08, and 08A.

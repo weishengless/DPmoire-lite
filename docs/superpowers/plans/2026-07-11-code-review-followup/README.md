@@ -2,11 +2,13 @@
 
 Date: 2026-07-11
 
-Status: implementation plans drafted from the approved decomposition design;
-production implementation has not started
+Status: implementation in progress; Plans 00 and 01 are complete, Plan 02 is
+active, and later collection plans include the approved 2026-07-12 amendment
 
-Approved design:
-[`2026-07-11-code-review-followup-decomposition-design.md`](../../specs/2026-07-11-code-review-followup-decomposition-design.md)
+Approved designs:
+
+- [`2026-07-11-code-review-followup-decomposition-design.md`](../../specs/2026-07-11-code-review-followup-decomposition-design.md)
+- [`2026-07-12-mlff-full-dedup-legacy-collection-design.md`](../../specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 
 Reusable low-reasoning execution prompt:
 [`LOW-REASONING-EXECUTION-PROMPT.md`](LOW-REASONING-EXECUTION-PROMPT.md)
@@ -14,16 +16,18 @@ Reusable low-reasoning execution prompt:
 Authoritative requirement index:
 [`docs/code-review-notes/README.md`](../../../code-review-notes/README.md)
 
-Design checkpoint: `01b1b49`
+Design checkpoints: `01b1b49`, `54e9886`; authoritative amendment: `d69a15b`
 
 ## Objective
 
 Implement the confirmed code-review follow-up without creating one oversized
 change, duplicating shared contracts, or reopening deferred automation. The work
-is divided into eleven leaf plans. Each leaf plan has a bounded done state,
+is divided into twelve leaf plans, counting the bounded Plan 08A amendment. Each
+leaf plan has a bounded done state,
 test-first tasks, explicit dependencies, and a review/rollback checkpoint.
 
-The implementation is complete only after Plan 10 and the final integration gate.
+The implementation is complete only after Plan 08A, Plan 10, and the final
+integration gate.
 Completion of an earlier plan must not be described as completion of the full
 follow-up.
 
@@ -70,19 +74,48 @@ changes in that commit.
 
 ## Test-material Availability
 
-The ignored local sample currently provides candidate source material for later
-parser plans:
+The ignored local samples provide candidate source material for later parser
+plans. Before Plans 03, 07, 08, or 08A use the newer walltime/restart tree, read its
+local evidence record when present:
 
-- one complete-format ML_ABN of about 0.8 MB with 110 configuration markers;
-- one OUTCAR of about 6.8 MB with roughly 532 ionic force blocks.
+`example-test/0-walltime_restart/README.md`
 
-Plans 03 and 07 may crop minimum redistributable fixtures and construct controlled
-tail-truncation/internal-corruption variants from these files. Raw sample files
-remain ignored and must never be staged. A natural walltime-truncated ML_ABN,
-tail-truncated OUTCAR, or multi-restart final ML_ABN plus original seed would
-strengthen validation but is not a prerequisite for Plan 02 or for beginning the
-parser plans. Request additional material only when the existing source cannot
-represent an authoritative format boundary.
+That partial tree is about 544 MB and includes POTCAR files, so it remains local
+and must never be staged or used as a direct automated-test dependency. Its
+relevant evidence is:
+
+- three MD OUTCAR segments that naturally ended without a timing footer, after
+  hundreds of complete force/free-energy blocks and inside later electronic
+  output;
+- VASP 6.5.1 complete ML_AB/ML_ABN snapshots for `md/0_0` and `md/0_1`, plus an
+  existing ignored VASP 6.4.1 ML_ABN sample elsewhere in the local corpus;
+- `md/0_0/OUTCAR0` records a fresh on-the-fly start and the later `OUTCAR`
+  records restart mode; `md/0_1/OUTCAR` records a fresh start;
+- the user confirmed that this calculation did not use the supplied
+  `init_mlff/ML_ABN`/`ML_FFN` as the MD starting database;
+- the retained current `md/0_0/ML_AB` has a smaller count than final ML_ABN, but
+  its exact copy-time provenance is not required and must not be invented;
+- the `init_mlff/ML_ABN` reference also differs in configuration count and
+  maximum system size from current `md/0_0/ML_AB`, reinforcing that directory
+  proximity is not seed identity.
+
+All supplied ML_ABN snapshots end in complete stress blocks. Therefore, Plans 03
+and 08 must create explicitly labelled controlled crops for ML_ABN tail
+truncation unless a naturally incomplete file is supplied later. Plans 07 and 08
+may derive minimal sanitized OUTCAR fixtures from the natural walltime tails, but
+must prove parser frame/error behavior rather than infer it from block counts or
+the missing footer alone.
+
+Plan 03 may derive minimal VASP 6.4.1/6.5.1 format fixtures. Plan 08A must use a
+portable synthetic/cropped fresh-start restart regression rather than treating
+the current ML_AB as a proven historical copy. The raw sample is corroborating
+evidence, not an automated test oracle.
+
+Raw files remain ignored and must never be staged. Every derived fixture must be
+minimal, sanitized, redistributable, and documented in its tracked
+`tests/data/.../README.md`. Additional large files are not a prerequisite for
+Plan 02 or for beginning the parser plans; request more material only when the
+existing source cannot represent an authoritative format boundary.
 
 ## Plan Index
 
@@ -90,15 +123,16 @@ represent an authoritative format boundary.
 | --- | --- | --- | --- | --- |
 | 00 | [Containment baseline](00-containment-baseline.md) | P0, P1-2, independent test gaps | approved plans | 01, 02, 03, 07 |
 | 01 | [INCAR engine](01-incar-engine.md) | P1-4 | 00 | 04 |
-| 02 | [Manifest v2](02-manifest-v2.md) | shared P1-5/P2-2/P2-3/P2-6 contracts | 00 | 04, 05, 08, 09 |
-| 03 | [ML_AB parser and digest](03-mlab-parser-digest.md) | P2-1 parsing/identity core | 00 | 04, 06, 08 |
+| 02 | [Manifest v2](02-manifest-v2.md) | shared P1-5/P2-2/P2-3/P2-6 contracts | 00 | 04, 05, 08, 08A, 09 |
+| 03 | [ML_AB parser and identities](03-mlab-parser-digest.md) | P2-1 parsing/identity core | 00 | 04, 06, 08, 08A |
 | 04 | [One-shot build](04-one-shot-build.md) | P2-2 | 01, 02, 03 | 05 |
 | 05 | [Stage provenance](05-stage-provenance.md) | P1-5 | 02, 04 | 06 |
 | 06 | [MD normalization and seed staging](06-md-normalization-seed-staging.md) | P1-1, P1-6, P2-1 producer side | 03, 05 | 10 |
 | 07 | [OUTCAR ingestion](07-outcar-ingestion.md) | P2-4, P2-5 | 00 | 08 |
-| 08 | [Per-source collection](08-source-collection.md) | P2-1 consumer side | 02, 03, 07 | 10 |
+| 08 | [Per-source collection](08-source-collection.md) | P2-1 source classification and seed-aware consumer | 02, 03, 07 | 08A, 10 |
+| 08A | [MLFF full-dedup and legacy inventory](08a-mlff-full-dedup-legacy-collection.md) | P2-1 exact optional consumer; P2-6 missing-manifest exception | 02, 03, 08 | 10 |
 | 09 | [Collection publication engine](09-collection-publication-engine.md) | P2-3 persistence engine | 02 | 10 |
-| 10 | [Collect integration and CLI](10-collect-integration-cli.md) | P2-3 orchestration, P2-6 | 06, 08, 09 | final gate |
+| 10 | [Collect integration and CLI](10-collect-integration-cli.md) | P2-3 orchestration, P2-6 | 06, 08, 08A, 09 | final gate |
 
 ## Dependency Graph
 
@@ -123,10 +157,15 @@ flowchart LR
     P03 --> P08
     P07 --> P08
 
+    P02 --> P08A["08A Exact dedup + legacy inventory"]
+    P03 --> P08A
+    P08 --> P08A
+
     P02 --> P09["09 Publication engine"]
 
     P06 --> P10["10 Collect integration"]
     P08 --> P10
+    P08A --> P10
     P09 --> P10
 ```
 
@@ -141,7 +180,7 @@ flowchart LR
 
 - Plan 01: INCAR parser and build-preflight adapter.
 - Plan 02: Manifest v2 and atomic persistence primitives.
-- Plan 03: ML_AB/ML_ABN parser and canonical seed digest.
+- Plan 03: ML_AB/ML_ABN parser and shared seed/configuration identities.
 - Plan 07: deterministic OUTCAR discovery and streaming.
 
 These plans have no semantic dependency on one another. Plans 01 and 07 both
@@ -156,6 +195,16 @@ or rebase carefully.
 
 Plan 09 and Plan 10 should normally share one PR unless the project explicitly
 accepts a tested but temporarily unwired internal publication API.
+
+### Wave 2A
+
+- Plan 08A: exact MLFF full-dedup and bounded legacy/missing inventory, after
+  Plan 08 is green.
+
+Plan 08A remains a separate checkpoint because it changes optional collection
+semantics and compatibility discovery, not the default per-source classifier.
+If project policy rejects merging the unwired mode core, keep its commit boundary
+but merge it with Plan 10.
 
 ### Wave 3
 
@@ -203,7 +252,9 @@ Required schema extension points include:
 ### `src/dpmoire_lite/mlab.py`
 
 Owns ML_AB/ML_ABN structured parsing, EOF classification, canonical
-`mlab-seed-v1` serialization, and seed-prefix verification primitives.
+configuration serialization, `mlab-seed-v1` prefix identity, and
+`mlab-config-v1` exact per-configuration identity. Adding the latter must not
+change existing seed digest semantics.
 `dataset.py` converts accepted parsed configurations into ASE objects; it does not
 parse the raw format itself after Plan 03.
 
@@ -225,9 +276,20 @@ Owns structured source and aggregate results. Required vocabulary:
 
 - source: `complete`, `partial`, `skipped`, `failed`;
 - aggregate: `complete`, `degraded`, `no_data`, `fatal`.
+- MLFF collection mode: `seed-aware`, `full-dedup`;
+- inventory coverage: known or unknown;
+- exact-dedup seen/unique/duplicate count invariants.
 
 The CLI must map an aggregate enum to an integer directly; it must not infer
 status from log messages or manifest text.
+
+### `src/dpmoire_lite/mlff_collect.py`
+
+Owns the optional full-dedup fold and bounded MLFF inventory adapter. It consumes
+Plan 08 finalized parsed source payloads and Plan 03 identities, retains the
+deterministic first occurrence, and scans a missing manifest only for explicit
+full-dedup. It does not parse CLI arguments, publish output, or infer VASP mode
+from INCAR/OUTCAR/current ML_AB.
 
 ### `src/dpmoire_lite/collect_publish.py`
 
@@ -236,14 +298,17 @@ and publication. It exposes a publication session that acquires the lock and
 recovers any existing transaction before the caller starts a new source
 collection. The caller later supplies an already classified `CollectResult` to
 the same held session. The module does not parse VASP files or choose source
-status.
+status. It validates a closed result-manifest target: current stage Manifest v2
+or exact MLFF compatibility path `work_dir/MD_data.collect.yaml`; arbitrary paths
+are rejected.
 
 ### `src/dpmoire_lite/collect.py`
 
 Remains the orchestration layer: load config and the strict manifest, open the
 publication session, finish any recovery, enumerate declared sources while the
 session lock remains held, build a candidate dataset, choose the aggregate result,
-and ask that same session to publish it.
+and ask that same session to publish it. The only missing-manifest exception is
+delegated to Plan 08A after mode validation.
 
 ## Spec-to-Plan Traceability
 
@@ -255,12 +320,12 @@ and ask that same session to publish it.
 | P1-4 INCAR rendering | 01; preflight wiring in 04 | 04 no-side-effect integration |
 | P1-5 Stage provenance | 02 schema; 05 validation/inference | 06 Stage1 integration |
 | P1-6 MD velocities | 06 | 06 focused and full suites |
-| P2-1 partial/seed | 03 parser; 06 producer; 08 consumer | 10 end-to-end seed contract |
+| P2-1 partial/seed/exact mode | 03 parser/identity; 06 producer; 08 seed-aware consumer; 08A full-dedup | 10 both-mode end-to-end contract |
 | P2-2 one-shot build | 02 strict manifest; 04 lifecycle; 05/06 validators | 06 Stage1 preflight regression |
 | P2-3 safe publication | 02 atomic primitives; 09 engine; 10 orchestration | 10 fault-injection integration |
 | P2-4 OUTCAR patterns | 07 | 08 source-order manifest tests |
 | P2-5 OUTCAR streaming | 07 | 08 partial/source tests |
-| P2-6 collect exit codes | 02 schema; 08 source results; 10 aggregate/CLI | 10 CLI integer assertions |
+| P2-6 collect exit codes | 02 classification; 08 source results; 08A coverage evidence; 09 result targets; 10 aggregate/CLI | 10 CLI integer assertions |
 | Testing/tooling scope | every plan | final gate below |
 
 ## Per-Task TDD Contract
@@ -318,6 +383,9 @@ Do not use bare `python` or `python3`.
 - Plans 03 and 09 create reusable internal components. If project policy rejects
   merging unused internal APIs, merge Plan 03 with its first Plan 04 consumer and
   Plan 09 with Plan 10, while keeping separate commits and review checklists.
+- Plan 08A creates an optional internal mode consumed only in Plan 10. If an
+  unwired merge is disallowed, keep the Plan 08A checkpoint commit separate but
+  merge it together with Plan 10.
 - Do not rewrite or squash user-owned commits without explicit approval.
 
 ## Final Integration Gate
@@ -335,17 +403,24 @@ After Plan 10:
    constraint clearing, velocity clearing, and seed identity.
 7. Exercise complete, degraded, no-data, and fatal collect paths with exact CLI
    integer assertions.
-8. Run all P2-3 fault-injection and recovery-table cases.
-9. Validate ASE 3.28 locally. Record ASE 3.29 as external validation unless an
+8. Exercise omitted/explicit `seed-aware` equivalence, fresh-start full-dedup,
+   repeated-seed exact removal, legacy declared inventory, and missing-manifest
+   degraded scan.
+9. Verify exact dedup retains near/scientifically changed frames, uses one
+   identity per complete configuration, and never calls a pairwise/fuzzy path.
+10. Run all P2-3 fault-injection and recovery-table cases for both current and
+    compatibility result-manifest targets.
+11. Validate sanitized VASP 6.4.1 and 6.5.1 ML_ABN fixtures.
+12. Validate ASE 3.28 locally. Record ASE 3.29 as external validation unless an
    existing environment is available or environment modification is approved.
-10. Inspect the final diff against the traceability table and confirm every spec
+13. Inspect the final diff against the traceability table and confirm every spec
     acceptance criterion maps to a passing test or explicit audit command.
 
 ## Definition of Complete
 
 The follow-up is complete only when:
 
-- Plans 00 through 10 are implemented in dependency order;
+- Plans 00 through 10, including Plan 08A, are implemented in dependency order;
 - all focused and full tests pass;
 - the final integration gate passes;
 - the approved notes and bundled examples match production behavior;

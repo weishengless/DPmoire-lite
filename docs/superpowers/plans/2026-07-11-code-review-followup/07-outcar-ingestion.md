@@ -159,13 +159,21 @@ steps with energy, forces, and stress. Record in `tests/data/outcar/README.md`:
 - redistribution confirmation;
 - expected frame count and fields.
 
+If `example-test/0-walltime_restart/README.md` exists, read it first. The listed
+MD OUTCAR segments are natural walltime-tail source evidence: each has hundreds
+of complete force/free-energy blocks, no normal timing footer, and later
+electronic output at EOF. A minimal sanitized crop may be derived from one of
+those files, but the fixture record must name the relative source segment and
+exact crop boundary. The test must establish what ASE yields; marker counts and
+a missing footer are supporting evidence, not the parser result.
+
 Add tests:
 
 - `test_outcar_fixture_inventory_has_provenance_entry()`;
 - `test_outcar_fixture_parses_expected_frames_and_properties()`;
 - `test_outcar_fixture_contains_no_private_path_or_potcar_marker()`.
 
-Do not use the large local OUTCAR as a committed fixture.
+Do not copy a large local OUTCAR into the committed fixture corpus.
 
 ## Task 4: Implement the Context-managed File-object Iterator
 

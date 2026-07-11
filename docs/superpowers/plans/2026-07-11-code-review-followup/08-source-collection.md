@@ -13,7 +13,7 @@ Consumes:
 - [Plan 03 ML_AB parser](03-mlab-parser-digest.md)
 - [Plan 07 OUTCAR ingestion](07-outcar-ingestion.md)
 
-Unlocks: Plan 10
+Unlocks: Plans 08A and 10
 
 ## Goal and Done State
 
@@ -33,6 +33,8 @@ Done means:
 - restart growth in current `md/ML_AB` does not change the initial skip count;
 - legacy seed evidence comes only from a complete `init_mlff/ML_ABN`;
 - selected OUTCAR path/pattern/order and per-file sampling are preserved;
+- accepted ML_ABN sources retain a parsed scientific payload until aggregation,
+  so Plan 08A can deduplicate before ASE conversion;
 - an in-memory collection candidate reports counts exactly matching its frames.
 
 ## Non-goals
@@ -41,6 +43,10 @@ Done means:
 - Do not choose the final aggregate CLI exit code.
 - Do not create a stage manifest when it is missing.
 - Do not perform fuzzy deduplication across sources.
+- Do not implement full ML_ABN collection or exact cross-source deduplication;
+  Plan 08A owns that optional path.
+- Do not scan a missing-manifest directory tree; Plan 08A owns the explicit
+  full-dedup exception.
 - Do not collect multiple historical ML_ABN files by OUTCAR-style patterns.
 
 ## Files
@@ -68,12 +74,19 @@ Modify:
 
 - declared relative source path and source kind;
 - status enum;
-- accepted frames/configurations owned by this result until aggregation;
+- accepted frames or parsed ML_ABN configurations owned by this result until
+  aggregation;
 - complete/accepted count;
 - discarded configuration/frame and block/location for partial input;
 - reason and error location for skipped/failed input;
 - OUTCAR selection pattern index/order when applicable;
 - seed verification identity when applicable.
+
+ML_ABN payloads remain structured parsed configurations until a finalized source
+is accepted by an aggregate fold. The shared ML_ABN-to-ASE adapter is public to
+the collection layer but independent of source classification. OUTCAR results
+may continue to own already parsed ASE frames. A failed result exposes neither
+payload form.
 
 `CollectionCandidate` carries:
 
@@ -93,7 +106,9 @@ Add tests:
 
 - `test_source_status_values_are_stable()`;
 - `test_source_result_owns_frames_until_accepted()`;
+- `test_mlab_source_result_owns_parsed_payload_until_accepted()`;
 - `test_failed_source_result_cannot_expose_accepted_frames()`;
+- `test_failed_source_result_cannot_expose_parsed_payload()`;
 - `test_collection_candidate_frame_count_equals_source_sum()`;
 - `test_collection_candidate_preserves_declared_source_order()`;
 - `test_source_diagnostics_use_workdir_relative_paths()`.
@@ -112,9 +127,11 @@ shared Dataset inside their parse loops.
 Implementation requirements:
 
 1. Use enums, not free-form status strings inside core code.
-2. Make invalid combinations such as failed-with-frames impossible or validated.
+2. Make invalid combinations such as failed-with-frames/payload impossible or
+   validated.
 3. Keep diagnostics YAML-safe and deterministic.
-4. Convert to the shared Dataset only when accepting a complete/partial result.
+4. Keep parsed ML_ABN configurations in the finalized source result; convert
+   through one shared adapter only when an aggregate fold accepts them.
 
 Run the focused command to green.
 
@@ -135,7 +152,8 @@ Implementation:
 
 1. Consume the Plan 03 parse result.
 2. Hold parsed configurations locally until status is known.
-3. Convert complete and permitted partial configurations to ASE frames.
+3. Return accepted parsed configurations in the SourceResult and expose one
+   shared conversion adapter; do not convert eagerly inside source parsing.
 4. Convert parser failures into structured failed results with zero frames.
 5. Preserve partial block/configuration details.
 6. Do not catch programming or manifest invariant errors as ordinary source
@@ -166,6 +184,15 @@ Add failing tests:
 
 Use synthetic Manifest v2 input matching the Plan 06 producer contract, so this
 consumer can be tested before real Stage1 integration.
+
+The local `example-test/0-walltime_restart` tree is corroborating evidence, not
+the identity oracle for these tests. Its first supplied `md/0_0` OUTCAR segment
+records a fresh on-the-fly start and the later segment records restart mode; the
+current directory also contains a grown ML_AB and larger final ML_ABN. The
+exact copy-time provenance of the retained ML_AB is not required to prove the
+defect: current ML_AB must never replace immutable Manifest v2 initial identity.
+Never substitute the supplied `init_mlff/ML_ABN` for that identity merely because
+it is in the same calculation tree.
 
 Implementation requirements:
 
@@ -207,6 +234,12 @@ Implementation requirements:
 5. Emit one explicit legacy evidence warning.
 6. Never fall back to possibly grown `md/ML_AB`.
 
+The user confirmed that the supplied walltime calculation did not use its
+`init_mlff/ML_ABN`/`ML_FFN` as the MD starting database. Its observed count and
+maximum system size also differ from the current `md/0_0/ML_AB`. Treat this as
+negative evidence against directory-name inference, not as a positive legacy
+seed fixture. This does not relax the authoritative legacy algorithm above.
+
 Focused command:
 
 ```powershell
@@ -233,6 +266,12 @@ Create the minimum truncated/corrupt variants needed and add their provenance
 records. Prefer deterministic cropping from the Plan 07 fixture; do not introduce
 a full calculation OUTCAR.
 
+When available, use `example-test/0-walltime_restart/README.md` to choose a
+natural walltime-tail source segment and record the exact relative source and
+crop boundary. Keep the committed variant minimal and sanitized. Parser
+location plus the cropped bytes must prove the tail condition; a missing VASP
+timing footer alone is not sufficient to classify a source as partial.
+
 Implementation requirements:
 
 1. Consume frames inside the Plan 07 context manager.
@@ -253,7 +292,7 @@ $env:PIP_NO_CACHE_DIR = '1'
 
 Checkpoint: OUTCAR source classification.
 
-## Task 6: Build a Deterministic In-memory Collection Candidate
+## Task 6: Build the Default Seed-aware In-memory Collection Candidate
 
 Add failing tests:
 
@@ -275,6 +314,8 @@ Implementation:
 5. Compute all summary counts from results rather than independently incremented
    counters.
 6. Return an in-memory candidate and diagnostics without publication.
+7. Use `seed-aware` semantics only; exact full-dedup and missing-manifest scan
+   remain absent until Plan 08A.
 
 Focused command:
 
@@ -304,11 +345,12 @@ git status --short
 | OUTCAR tail versus internal corruption | Task 5 |
 | deterministic selected order | Tasks 5 and 6 |
 | source counts equal candidate frames | Tasks 1 and 6 |
-| no fuzzy deduplication | Task 6 |
+| no fuzzy or implicit exact deduplication | Task 6; optional exact path deferred to 08A |
 | no output/manifest write | Task 6 |
 
 ## Plan Checkpoint
 
-Plan 08 is complete when ML_ABN, seed, OUTCAR, candidate, affected collect, and
-full suites pass. The resulting candidate is not safely published and has no CLI
-status until Plans 09 and 10.
+Plan 08 is complete when ML_ABN, seed-aware, OUTCAR, candidate, affected collect,
+and full suites pass. The resulting candidate is not safely published and has no
+CLI status until Plans 09 and 10. Optional full-dedup and legacy/missing inventory
+remain open for Plan 08A.

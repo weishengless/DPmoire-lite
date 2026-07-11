@@ -18,6 +18,9 @@ docs/superpowers/plans/2026-07-11-code-review-followup/README.md
 拆分设计：
 docs/superpowers/specs/2026-07-11-code-review-followup-decomposition-design.md
 
+MLFF full-dedup/旧目录兼容设计：
+docs/superpowers/specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md
+
 恢复状态文件：
 docs/superpowers/plans/2026-07-11-code-review-followup/IMPLEMENTATION-STATUS.local.md
 
@@ -25,7 +28,9 @@ docs/superpowers/plans/2026-07-11-code-review-followup/IMPLEMENTATION-STATUS.loc
 - branch: codex/code-review-followup
 - Plan 00 和 Plan 01 已完成
 - Plan 02 已在 2026-07-12 修订为 4 个自包含 Task
-- 修订前 HEAD 为 56f94c0；实际 HEAD 可能包含后续计划文档修订，必须以 git 为准
+- full-dedup 设计 checkpoint 为 54e9886，authoritative P2-1/P2-6 amendment 为 d69a15b
+- 路线图包含独立 Plan 08A，避免扩张默认 Plan 08
+- 实际 HEAD 可能包含后续计划文档修订，必须以 git 为准
 - 当前可能存在未提交的 atomic I/O 文件和修订前 Manifest v2 RED 测试
 
 本提示词授权你：
@@ -113,6 +118,28 @@ execution unit 定义：
 9. Task 2 开始前，将 test_manifest_v2.py 限定为 Task 2 的五个 strict reader/schema tests；两个 path tests 到 Task 3 才加入。
 
 这是唯一预先批准的 future RED ignore 例外。后续 Task 不得复制此例外。
+
+## 三-A、冻结的 MLFF 双模式边界
+
+只有 active plan 是 Plan 03、08、08A、09 或 10 时，才读取 full-dedup 设计；
+只有 active execution unit 明确拥有相关行为时才修改代码。
+
+冻结规则：
+
+1. `seed-aware` 是默认模式，保持正常 workflow 的 Manifest v2 initial seed
+   prefix 验证和跳过语义。
+2. `full-dedup` 只能显式选择；全量读取每个选中目录的最终 ML_ABN，并用
+   `mlab-config-v1` 删除 canonical 科学内容完全相同的帧。
+3. exact dedup 单遍 hash，禁止 RMSD、容差、近邻、对称性和帧间两两比较。
+4. 不从 `ML_ISTART`、`ML_MODE`、OUTCAR 或当前 `md/ML_AB` 推断 collection
+   mode/initial seed。
+5. 不收集 ML_AB、ML_ABN0、ML_ABN1 或 backup 中间文件。
+6. missing manifest 只在 explicit full-dedup 中允许 bounded direct-child
+   scan；invalid/unsupported/escaping manifest 永远 fatal，不得 fallback。
+7. legacy/missing 兼容结果写 `work_dir/MD_data.collect.yaml`，不得覆盖旧
+   stage manifest；安全发布仍由 Plan 09/10 负责。
+8. Plan 03 只提供 parser 和 identity；Plan 08 只提供默认 source/seed-aware
+   candidate；Plan 08A 才实现 full-dedup/inventory；Plan 10 才接 CLI。
 
 ## 四、Python 与依赖
 
@@ -281,21 +308,33 @@ commit 后：
 
 ## 八、测试材料规则
 
-当前忽略的 example-test 中已有候选真实格式材料：
-- 一份约 0.8 MB、110 configurations 的完整 ML_ABN；
-- 一份约 6.8 MB、约 532 ionic force blocks 的 OUTCAR。
+当前忽略的 `example-test/0-walltime_restart` 中已有 walltime/restart 候选材料。进入 Plan 03、07、08 或 08A 前，如果下列文件存在，必须先完整读取：
 
-Plan 03 和 Plan 07 可以从这些文件裁剪最小、可再分发 fixture，并构造明确的尾部截断/内部损坏变体。
+`example-test/0-walltime_restart/README.md`
+
+已确认的材料边界：
+- 该部分下载目录约 544 MB，包含 POTCAR，只能作为本地证据；
+- 多个 MD OUTCAR 是自然 walltime 结束：有数百个完整 force/free-energy blocks、无正常 timing footer，并结束在后续 electronic output 中；
+- `md/0_0/OUTCAR0` 记录 fresh on-the-fly start，后续 `OUTCAR` 记录 restart；`md/0_1/OUTCAR` 记录 fresh start；
+- 用户已确认这些 MD 没有使用所提供的 `init_mlff/ML_ABN`/`ML_FFN` 作为 starting database；
+- 当前 `md/0_0/ML_AB` 比 final ML_ABN 小，但其 exact copy-time provenance 未证明，也不需要作为测试前提；
+- 新 walltime 样本是 VASP 6.5.1，另有 ignored VASP 6.4.1 ML_ABN/OUTCAR 证据；
+- 当前提供的所有 ML_AB/ML_ABN 都以完整 stress block 结束，不是天然尾部截断 ML_ABN。
+
+Plan 03/08 的 position、force、stress 尾部截断 ML_ABN fixture 必须从完整文件做确定性裁剪，并明确标为“constructed crop”。Plan 03 必须裁剪最小 VASP 6.4.1/6.5.1 portable format fixtures。Plan 07/08 可以从自然 walltime OUTCAR 裁剪最小 fixture，但必须由实际 parser 行为确认 frame/error 边界，不能只凭 block 数或缺少 footer 判定 partial。Plan 08A 的 fresh-start/restart 回归必须使用 portable synthetic/cropped data，不能直接依赖 raw tree。
 
 要求：
 - 原始 example-test 文件永远不提交；
 - fixture 必须删除用户路径、账号、hostname、集群信息和无关输出；
 - fixture 不得包含 POTCAR 或势函数内容；
 - tests/data README 必须记录来源、裁剪目的和再分发确认；
+- 正向 seed-prefix 测试使用 synthetic Manifest v2 identity 或另一个 provenance 已证明的 seed pair；
+- 该样本是 confirmed zero-external-seed case，不得把 `init_mlff/ML_ABN` 当作 `md/0_0` 的 original seed；
+- 不需要为了证明 full-dedup 规则下载更多大文件或证明当前 ML_AB 的 exact copy-time identity；
 - 只有现有材料无法表达 authoritative spec 的格式边界时才阻塞请求用户材料；
 - 请求时必须明确说明所需文件类型、完整/截断状态和需要保留的区块。
 
-真实 walltime 中断 ML_ABN、真实尾部中断 OUTCAR、多次 MD restart 的 final ML_ABN + original seed 属于增强证据，不是当前 Plan 02 的前置条件。
+自然 walltime OUTCAR、fresh-start/restart 和 VASP 6.4.1/6.5.1 格式已有增强证据。自然尾部截断 ML_ABN 仍属可选增强证据，不是当前 Plan 02 或可由受控 fixture 覆盖之 parser/full-dedup 工作的前置条件。
 
 ## 九、范围控制
 
@@ -308,7 +347,7 @@ Plan 03 和 Plan 07 可以从这些文件裁剪最小、可再分发 fixture，�
 - 不提交 POTCAR。
 - 不解除 P1-2 safety gate。
 - 不声称 Plan 完成，除非该 Plan checkpoint 全绿。
-- 不声称 follow-up 完成，除非 Plan 00–10 和 final integration gate 全部通过。
+- 不声称 follow-up 完成，除非 Plan 00–10（包括 Plan 08A）和 final integration gate 全部通过。
 
 ## 十、本次运行结束输出
 
