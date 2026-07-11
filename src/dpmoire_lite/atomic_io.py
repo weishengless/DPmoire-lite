@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO, TextIO
+
+
+@dataclass(frozen=True)
+class AtomicPublishResult:
+    destination: Path
+    sha256: str | None
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_text_publish(
+    destination: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    compute_sha256: bool = False,
+) -> AtomicPublishResult:
+    destination = Path(destination)
+    candidate = _new_candidate(destination)
+    replace_started = False
+    try:
+        with candidate.open("w", encoding=encoding, newline="") as handle:
+            handle.write(text)
+            _fsync_file(handle)
+        digest = sha256_file(candidate) if compute_sha256 else None
+        replace_started = True
+        os.replace(candidate, destination)
+        _fsync_directory(destination.parent)
+        return AtomicPublishResult(destination=destination, sha256=digest)
+    except BaseException:
+        if not replace_started:
+            candidate.unlink(missing_ok=True)
+        raise
+
+
+def atomic_bytes_publish(
+    destination: Path,
+    payload: bytes,
+    *,
+    compute_sha256: bool = False,
+) -> AtomicPublishResult:
+    destination = Path(destination)
+    candidate = _new_candidate(destination)
+    replace_started = False
+    try:
+        with candidate.open("wb") as handle:
+            handle.write(payload)
+            _fsync_file(handle)
+        digest = sha256_file(candidate) if compute_sha256 else None
+        replace_started = True
+        os.replace(candidate, destination)
+        _fsync_directory(destination.parent)
+        return AtomicPublishResult(destination=destination, sha256=digest)
+    except BaseException:
+        if not replace_started:
+            candidate.unlink(missing_ok=True)
+        raise
+
+
+def _new_candidate(destination: Path) -> Path:
+    descriptor, name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".candidate",
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def _fsync_file(handle: BinaryIO | TextIO) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _fsync_directory(directory: Path) -> bool:
+    if os.name == "nt":
+        return False
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return True
