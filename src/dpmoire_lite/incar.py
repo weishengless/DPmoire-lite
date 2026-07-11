@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass
 
 
+CONTROLLED_TAGS = frozenset({"ENCUT", "ML_RCUT1", "ML_RCUT2"})
+SUPPORTED_TRUE_SPELLINGS = frozenset({"T", ".TRUE.", ".T.", "TRUE"})
+
+
 @dataclass(frozen=True)
 class SourceLocation:
     line: int
@@ -17,6 +21,10 @@ class IncarParseError(ValueError):
         super().__init__(
             f"{source_name}: {message} at line {location.line}, column {location.column}"
         )
+
+
+class IncarValueConflictError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -35,6 +43,67 @@ class IncarStatement:
     end: int
     location: SourceLocation
     assignment: IncarAssignment | None
+
+
+@dataclass(frozen=True)
+class IncarDuplicateDiagnostic:
+    tag: str
+    assignments: tuple[IncarAssignment, ...]
+    repairable: bool
+    blocking: bool
+
+
+@dataclass(frozen=True)
+class IncarAnalysis:
+    document: IncarDocument
+    duplicate_diagnostics: tuple[IncarDuplicateDiagnostic, ...]
+
+    @property
+    def repairable_warnings(self) -> tuple[IncarDuplicateDiagnostic, ...]:
+        return tuple(item for item in self.duplicate_diagnostics if item.repairable)
+
+    @property
+    def blocking_conflicts(self) -> tuple[IncarDuplicateDiagnostic, ...]:
+        return tuple(item for item in self.duplicate_diagnostics if item.blocking)
+
+    def effective_value(self, tag: str) -> str | None:
+        normalized_tag = tag.upper()
+        assignments = self.document.assignments_for(normalized_tag)
+        if not assignments:
+            return None
+
+        conflict = next(
+            (
+                item
+                for item in self.blocking_conflicts
+                if item.tag == normalized_tag
+            ),
+            None,
+        )
+        if conflict is not None:
+            definitions = ", ".join(
+                f"line {item.location.line}: {item.value}"
+                for item in conflict.assignments
+            )
+            raise IncarValueConflictError(
+                f"{self.document.source_name} contains conflicting definitions "
+                f"for {normalized_tag}: {definitions}"
+            )
+        return assignments[0].value
+
+    def is_effectively_true(self, tag: str) -> bool:
+        value = self.effective_value(tag)
+        return value is not None and value.upper() in SUPPORTED_TRUE_SPELLINGS
+
+    @property
+    def missing_ml_rcut_tags(self) -> tuple[str, ...]:
+        if not self.is_effectively_true("ML_LMLFF"):
+            return ()
+        return tuple(
+            tag
+            for tag in ("ML_RCUT1", "ML_RCUT2")
+            if not self.document.assignments_for(tag)
+        )
 
 
 @dataclass(frozen=True)
@@ -58,6 +127,34 @@ class IncarDocument:
             for assignment in self.assignments
             if assignment.normalized_tag == normalized_tag
         ]
+
+    def analyze(self) -> IncarAnalysis:
+        assignments_by_tag: dict[str, list[IncarAssignment]] = {}
+        for assignment in self.assignments:
+            assignments_by_tag.setdefault(assignment.normalized_tag, []).append(
+                assignment
+            )
+
+        diagnostics = []
+        for tag, assignments in assignments_by_tag.items():
+            if len(assignments) < 2:
+                continue
+            controlled = tag in CONTROLLED_TAGS
+            equal_user_values = len({item.value for item in assignments}) == 1
+            repairable = controlled or equal_user_values
+            diagnostics.append(
+                IncarDuplicateDiagnostic(
+                    tag=tag,
+                    assignments=tuple(assignments),
+                    repairable=repairable,
+                    blocking=not repairable,
+                )
+            )
+
+        return IncarAnalysis(
+            document=self,
+            duplicate_diagnostics=tuple(diagnostics),
+        )
 
 
 def parse_incar(source_text: str, *, source_name: str = "<memory>") -> IncarDocument:

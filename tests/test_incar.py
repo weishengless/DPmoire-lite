@@ -74,3 +74,74 @@ def test_parse_incar_reports_unsafe_unclosed_quote_with_location():
     assert "input/INCAR" in str(error)
     assert "unclosed quote" in str(error).lower()
     assert "line 2" in str(error).lower()
+
+
+def test_controlled_duplicates_are_repairable_even_when_values_differ():
+    analysis = parse_incar("ENCUT=400\nencut = 520\n").analyze()
+
+    duplicate = analysis.duplicate_diagnostics[0]
+    assert duplicate.tag == "ENCUT"
+    assert duplicate.repairable is True
+    assert duplicate.blocking is False
+    assert [item.value for item in duplicate.assignments] == ["400", "520"]
+
+
+def test_user_duplicates_with_equal_normalized_text_are_repairable():
+    analysis = parse_incar("ISMEAR=-1\nismear = -1  \n").analyze()
+
+    duplicate = analysis.duplicate_diagnostics[0]
+    assert duplicate.tag == "ISMEAR"
+    assert duplicate.repairable is True
+    assert duplicate.blocking is False
+
+
+def test_user_duplicates_with_different_text_are_blocking():
+    analysis = parse_incar("SIGMA=0\nsigma = 0.0\n").analyze()
+
+    conflict = analysis.blocking_conflicts[0]
+    assert conflict.tag == "SIGMA"
+    assert conflict.repairable is False
+    assert [item.location.line for item in conflict.assignments] == [1, 2]
+
+
+def test_comment_text_is_not_a_duplicate_definition():
+    analysis = parse_incar("ENCUT=400 # ENCUT=520\n! ENCUT=600\n").analyze()
+
+    assert analysis.duplicate_diagnostics == ()
+    assert analysis.effective_value("ENCUT") == "400"
+
+
+def test_duplicate_detection_spans_semicolon_statements():
+    analysis = parse_incar("ENCUT=400; ISMEAR=-1; encut=520\n").analyze()
+
+    duplicate = analysis.duplicate_diagnostics[0]
+    assert duplicate.tag == "ENCUT"
+    assert [item.location.column for item in duplicate.assignments] == [1, 23]
+    assert analysis.effective_value("ISMEAR") == "-1"
+
+
+@pytest.mark.parametrize("spelling", ["T", ".TRUE.", ".T.", "TRUE"])
+def test_effective_luse_vdw_accepts_supported_true_spellings(spelling):
+    analysis = parse_incar(f"luse_vdw = {spelling}\n").analyze()
+
+    assert analysis.is_effectively_true("LUSE_VDW") is True
+
+
+def test_conflicting_luse_vdw_is_blocking():
+    analysis = parse_incar("LUSE_VDW=T\nluse_vdw = F\n").analyze()
+
+    assert [item.tag for item in analysis.blocking_conflicts] == ["LUSE_VDW"]
+    with pytest.raises(ValueError, match="LUSE_VDW"):
+        analysis.effective_value("LUSE_VDW")
+
+
+@pytest.mark.parametrize(
+    ("ml_lmlff", "expected_missing"),
+    [("T", ("ML_RCUT1", "ML_RCUT2")), ("F", ())],
+)
+def test_ml_lmlff_effective_value_controls_missing_rcut_policy(
+    ml_lmlff, expected_missing
+):
+    analysis = parse_incar(f"ML_LMLFF={ml_lmlff}\n").analyze()
+
+    assert analysis.missing_ml_rcut_tags == expected_missing
