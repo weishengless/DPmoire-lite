@@ -179,7 +179,7 @@ def test_initial_seed_requires_header_count_equal_complete_count(tmp_path):
         "     The number of configurations\n--------------------------------------------------\n         3\n**************************************************",
     )
 
-    with pytest.raises(MlabParseError, match="configuration count"):
+    with pytest.raises(MlabParseError, match="declared count"):
         parse_mlab(path)
 
 
@@ -223,3 +223,101 @@ def test_vasp_651_fixture_parses_canonical_fields():
         )
     )
     assert configuration.stress_kbar == pytest.approx((1.0, 2.0, 3.0, 4.0, 5.0, 6.0))
+
+
+def test_tail_position_truncation_accepts_complete_prefix():
+    result = parse_mlab(FIXTURE_ROOT / "tail_position_crop.mlab")
+
+    assert result.status == "partial"
+    assert result.declared_count == 2
+    assert len(result.configurations) == 1
+    assert result.configurations[0].source_configuration_number == 1
+
+
+def test_tail_force_truncation_accepts_complete_prefix():
+    result = parse_mlab(FIXTURE_ROOT / "tail_force_crop.mlab")
+
+    assert result.status == "partial"
+    assert len(result.configurations) == 1
+    assert result.discarded_configuration_number == 2
+    assert result.discarded_block == "forces"
+
+
+def test_tail_stress_truncation_accepts_complete_prefix():
+    result = parse_mlab(FIXTURE_ROOT / "tail_stress_crop.mlab")
+
+    assert result.status == "partial"
+    assert len(result.configurations) == 1
+    assert result.discarded_configuration_number == 2
+    assert result.discarded_block == "stress"
+
+
+def test_partial_records_discarded_configuration_and_missing_block():
+    result = parse_mlab(FIXTURE_ROOT / "tail_position_crop.mlab")
+
+    assert result.discarded_configuration_number == 2
+    assert result.discarded_block == "positions"
+    assert result.discarded_reason
+    assert "end of file" in result.discarded_reason
+
+
+def test_first_configuration_incomplete_is_failure():
+    with pytest.raises(MlabParseError) as caught:
+        parse_mlab(FIXTURE_ROOT / "first_incomplete.mlab")
+
+    error = caught.value
+    assert error.configuration_number == 1
+    assert error.block == "positions"
+    assert "first configuration" in error.reason
+
+
+def test_internal_corruption_does_not_salvage_prefix():
+    with pytest.raises(MlabParseError) as caught:
+        parse_mlab(FIXTURE_ROOT / "internal_corruption.mlab")
+
+    error = caught.value
+    assert error.configuration_number == 2
+    assert error.block == "positions"
+    assert "internal corruption" in error.reason
+
+
+def test_declared_count_greater_than_complete_plus_one_fails(tmp_path):
+    path = _write_variant(
+        tmp_path,
+        "complete_multi.mlab",
+        "     The number of configurations\n--------------------------------------------------\n         2\n**************************************************",
+        "     The number of configurations\n--------------------------------------------------\n         4\n**************************************************",
+    )
+
+    with pytest.raises(MlabParseError) as caught:
+        parse_mlab(path)
+
+    assert "declared count" in caught.value.reason
+
+
+def test_declared_equals_complete_with_incomplete_tail_fails(tmp_path):
+    path = _write_variant(
+        tmp_path,
+        "tail_position_crop.mlab",
+        "     The number of configurations\n--------------------------------------------------\n         2\n**************************************************",
+        "     The number of configurations\n--------------------------------------------------\n         1\n**************************************************",
+    )
+
+    with pytest.raises(MlabParseError) as caught:
+        parse_mlab(path)
+
+    assert "incomplete tail" in caught.value.reason
+
+
+def test_declared_less_than_complete_fails(tmp_path):
+    path = _write_variant(
+        tmp_path,
+        "complete_multi.mlab",
+        "     The number of configurations\n--------------------------------------------------\n         2\n**************************************************",
+        "     The number of configurations\n--------------------------------------------------\n         1\n**************************************************",
+    )
+
+    with pytest.raises(MlabParseError) as caught:
+        parse_mlab(path)
+
+    assert "declared count" in caught.value.reason

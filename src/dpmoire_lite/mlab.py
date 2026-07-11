@@ -82,6 +82,9 @@ class MlabParseResult:
     status: str
     declared_count: int
     configurations: tuple[MlabConfiguration, ...]
+    discarded_configuration_number: int | None = None
+    discarded_block: str | None = None
+    discarded_reason: str | None = None
 
     @property
     def complete_count(self) -> int:
@@ -451,6 +454,33 @@ def _parse_configuration(
     return configuration, index
 
 
+def _error_reaches_eof(error: MlabParseError, lines: Sequence[str]) -> bool:
+    if error.line_number is None:
+        return True
+    return _next_content(lines, error.line_number) >= len(lines)
+
+
+def _is_tail_partial_error(error: MlabParseError, lines: Sequence[str]) -> bool:
+    if not _error_reaches_eof(error, lines):
+        return False
+    if "unexpected end of file" in error.reason or error.reason.startswith("missing "):
+        return True
+    if not error.reason.startswith("shape mismatch:"):
+        return False
+    match = re.search(r"expected (\d+) values, got (\d+)", error.reason)
+    return match is not None and int(match.group(2)) < int(match.group(1))
+
+
+def _reclassified_error(error: MlabParseError, reason: str) -> MlabParseError:
+    return MlabParseError(
+        error.path,
+        configuration_number=error.configuration_number,
+        block=error.block,
+        reason=reason,
+        line_number=error.line_number,
+    )
+
+
 def parse_mlab(path: str | Path) -> MlabParseResult:
     """Parse and validate a complete ML_AB/ML_ABN source."""
 
@@ -466,44 +496,80 @@ def parse_mlab(path: str | Path) -> MlabParseResult:
         ) from exc
 
     lines = text.splitlines()
-    first_configuration = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if _configuration_number(line) is not None
-        ),
-        None,
-    )
-    if first_configuration is None:
+    configuration_markers = [
+        index
+        for index, line in enumerate(lines)
+        if _configuration_number(line) is not None
+    ]
+    if not configuration_markers:
         _raise(source_path, None, "header", "no configuration marker", None)
 
-    declared_count = _parse_header(lines, source_path, first_configuration)
+    declared_count = _parse_header(lines, source_path, configuration_markers[0])
     configurations: list[MlabConfiguration] = []
-    index = first_configuration
-    while True:
-        index = _next_content(lines, index)
-        if index >= len(lines):
-            break
-        if _configuration_number(lines[index]) is None:
-            _raise(
-                source_path,
-                configurations[-1].source_configuration_number if configurations else None,
-                "configuration",
-                f"unexpected content {lines[index].strip()!r}",
-                index,
+    for marker_position, marker_index in enumerate(configuration_markers):
+        try:
+            configuration, end_index = _parse_configuration(
+                lines, marker_index, source_path
             )
-        configuration, index = _parse_configuration(lines, index, source_path)
+        except MlabParseError as error:
+            is_final_marker = marker_position == len(configuration_markers) - 1
+            if is_final_marker and _is_tail_partial_error(error, lines):
+                if not configurations:
+                    raise _reclassified_error(
+                        error,
+                        f"first configuration incomplete: {error.reason}",
+                    ) from error
+                if declared_count == len(configurations) + 1:
+                    return MlabParseResult(
+                        source_path=source_path,
+                        status="partial",
+                        declared_count=declared_count,
+                        configurations=tuple(configurations),
+                        discarded_configuration_number=error.configuration_number,
+                        discarded_block=error.block,
+                        discarded_reason=error.reason,
+                    )
+                if declared_count == len(configurations):
+                    raise _reclassified_error(
+                        error,
+                        f"incomplete tail with declared count {declared_count} "
+                        f"equal to complete count {len(configurations)}",
+                    ) from error
+                raise MlabParseError(
+                    source_path,
+                    configuration_number=None,
+                    block="header",
+                    reason=(
+                        f"declared count {declared_count} does not equal "
+                        f"complete count plus one {len(configurations) + 1}"
+                    ),
+                ) from error
+            if marker_position < len(configuration_markers) - 1:
+                raise _reclassified_error(
+                    error,
+                    f"internal corruption: {error.reason}",
+                ) from error
+            raise
+
         configurations.append(configuration)
-        index = _next_content(lines, index)
-        if index >= len(lines):
-            break
-        if _configuration_number(lines[index]) is None:
+        next_content = _next_content(lines, end_index)
+        if marker_position + 1 < len(configuration_markers):
+            expected_next = configuration_markers[marker_position + 1]
+            if next_content != expected_next:
+                _raise(
+                    source_path,
+                    configuration.source_configuration_number,
+                    "configuration",
+                    "internal corruption: unexpected content before next configuration",
+                    next_content,
+                )
+        elif next_content < len(lines):
             _raise(
                 source_path,
                 configuration.source_configuration_number,
                 "configuration",
-                f"unexpected content {lines[index].strip()!r}",
-                index,
+                f"unexpected content {lines[next_content].strip()!r}",
+                next_content,
             )
 
     if len(configurations) != declared_count:
@@ -511,7 +577,8 @@ def parse_mlab(path: str | Path) -> MlabParseResult:
             source_path,
             None,
             "header",
-            f"configuration count {declared_count} does not equal complete count {len(configurations)}",
+            f"declared count {declared_count} does not equal complete count "
+            f"{len(configurations)}",
             None,
         )
 
