@@ -2,7 +2,10 @@
 
 - 状态：讨论已完成
 - 决定日期：2026-07-11
+- legacy full-dedup 补充决定日期：2026-07-12
 - 优先级：P2
+- 补充设计：
+  [`MLFF Full-dedup and Legacy Collection Design`](../superpowers/specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 - 关联位置：
   - `src/dpmoire_lite/collect.py`
   - `src/dpmoire_lite/cli.py`
@@ -18,7 +21,7 @@ collect 允许 skipped、partial、failed 和 no_data，但当前 CLI 没有稳�
 
 | Exit code | 状态 | 契约 |
 | ---: | --- | --- |
-| 0 | `complete` | 新候选包含至少一帧，全部预期来源完整成功，输出和 manifest transaction 已提交 |
+| 0 | `complete` | 新候选包含至少一帧，已知的全部预期来源完整成功，输出和 result-manifest transaction 已提交 |
 | 1 | `fatal` | 配置/provenance/manifest 不变量失败，pending transaction 无法恢复，或写出/备份/发布失败 |
 | 2 | `degraded` | 至少一帧已安全发布，但存在 partial、skipped、failed 或来源覆盖下降 |
 | 3 | `no_data` | 本次接受 0 帧，没有发布新输出；旧输出按 P2-3 保留或原本不存在 |
@@ -31,16 +34,18 @@ collect 允许 skipped、partial、failed 和 no_data，但当前 CLI 没有稳�
 ### complete
 
 - `frames > 0`；
-- 所有 manifest 预期来源均为 complete；
+- current/legacy manifest 声明的所有预期来源均为 complete；
 - 无 skipped、partial、failed；
-- candidate、backup、final、manifest 和 journal 全部按 P2-3 提交；
+- candidate、backup、final、result manifest 和 journal 全部按 P2-3 提交；
 - exit 0。
 
 ### degraded
 
 - `frames > 0` 且输出已安全发布；
 - 任一来源为 partial、skipped 或 failed，或相比上一事务来源覆盖下降；
-- manifest 精确记录未贡献/部分贡献来源；
+- 显式 `full-dedup` 在 stage manifest 缺失时执行了 bounded legacy scan，因而
+  无法证明 expected-source coverage；
+- result manifest 精确记录未贡献/部分贡献来源及 inventory evidence；
 - exit 2。
 
 单个 seed-prefix digest mismatch 可以使该来源 failed；如果其他来源仍产生
@@ -67,21 +72,34 @@ collect 允许 skipped、partial、failed 和 no_data，但当前 CLI 没有稳�
 - final `os.replace` 或 manifest transaction 提交失败；
 - 无法保证正式输出与 manifest 的一致性。
 
-这些情况 exit 1。若 P2-3 journal 能确定性完成一个已开始的事务，应先恢复；
+第一条有且仅有一个显式例外：`--stage md --mlff-collect-mode full-dedup`
+且 `vasp_ml: true` 时，可在 stage manifest 缺失的旧目录中扫描
+`work_dir/md/` 的直接子目录，只选择含精确文件名 `ML_ABN` 的目录。该扫描
+必须记录 `directory_discovery: legacy-scan`，有帧时 aggregate 至多为
+`degraded`；它不能用于 `seed-aware`，也不能在 manifest 存在但无效、版本
+不支持或目录越界时作为 fallback。
+
+其余情况 exit 1。若 P2-3 journal 能确定性完成一个已开始的事务，应先恢复；
 恢复完成后按恢复事务的 complete/degraded 状态返回，否则 exit 1。
 
 ## API 契约
 
 - collect 核心返回结构化结果 enum/dataclass，不通过解析日志决定退出码；
 - CLI 是唯一把状态映射为整数退出码的边界；
-- 当现有 manifest 可安全读取且事务允许原子写入时，manifest
+- 当 current Manifest v2 可安全读取且事务允许原子写入时，stage manifest
   `collect.status` 与 CLI 状态名称一致；
-- stderr 输出简洁摘要，manifest 保留完整 per-source 诊断；
+- legacy 或 missing manifest 兼容收集不得覆盖/伪造 build provenance；它将
+  `work_dir/MD_data.collect.yaml` 作为 result manifest，与 extxyz 在同一
+  publication transaction 中提交；
+- compatibility result manifest 必须记录 input layout、declared/discovered
+  directories、collection mode、dedup schema/counts、per-source 诊断、output
+  hash 和 transaction ID；
+- stderr 输出简洁摘要，权威 result manifest 保留完整 per-source 诊断；
 - `no_data` 不通过抛出异常实现，以便先原子记录 manifest；
 - fatal config/provenance 错误若尚未开始 transaction，可以直接报错退出 1；
-- config 无效、stage manifest 完全缺失/不可读等 fatal 发生在安全 manifest
-  写入边界之前，不能为了记录状态而创建或覆盖 manifest；此时退出码 1 和
-  stderr 是权威结果。
+- config 无效、stage manifest 不可读/无效，或非例外模式下完全缺失等 fatal
+  发生在安全写入边界之前，不能为了记录状态而创建或覆盖 manifest；此时
+  退出码 1 和 stderr 是权威结果。
 
 ## 验收条件
 
@@ -90,7 +108,13 @@ collect 允许 skipped、partial、failed 和 no_data，但当前 CLI 没有稳�
 - 某些来源 failed、其他来源成功返回 2；
 - 全部来源 skipped/failed、0 帧返回 3；
 - 0 帧且旧输出保留返回 3；
-- manifest 缺失、publication 或 journal 恢复失败返回 1；
-- 仅当 manifest 可安全写入时，退出码与 `collect.status` 一致；
-- config 无效或 manifest 缺失的 fatal 返回 1，且不创建伪造 manifest；
+- seed-aware 下 manifest 缺失、任何模式下 manifest 无效、publication 或
+  journal 恢复失败返回 1；
+- full-dedup missing-manifest scan 有帧时返回 2，并写匹配 output hash 的
+  `MD_data.collect.yaml`；
+- legacy manifest 不被重写，兼容 result manifest 与输出原子配对；
+- duplicate removal 本身不导致 degraded；
+- 仅当权威 result manifest 可安全写入时，退出码与其中的
+  `collect.status` 一致；
+- config 无效或非例外 manifest 缺失的 fatal 返回 1，且不创建伪造 manifest；
 - CLI 测试直接断言整数，不只断言日志文本。

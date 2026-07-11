@@ -30,12 +30,12 @@ MD restart 自动化、CI matrix 和 lint/type-check 基础设施已单独暂缓
 | P1-4 | INCAR 安全改写 | 只控制 ENCUT/ML_RCUT；安全解析合法语法；重复冲突预检 | [P1-4](P1-4-incar-safe-rendering.md) |
 | P1-5 | Stage provenance | 新 manifest 严格校验；旧 manifest 以原子数和晶胞双判据兼容 | [P1-5](P1-5-stage-provenance.md) |
 | P1-6 | MD 初始速度 | Stage1 无条件删除输入速度；MD restart 另行设计 | [P1-6](P1-6-md-initial-velocities.md) |
-| P2-1 | 截断来源与 MLFF seed | 只抢救 EOF 前完整帧；canonical digest 复核 initial seed prefix | [P2-1](P2-1-partial-collection-and-mlff-seed.md) |
+| P2-1 | 截断来源与 MLFF seed | 默认 canonical digest 复核 seed prefix；可选 full-dedup 全量 exact 去重 | [P2-1](P2-1-partial-collection-and-mlff-seed.md) |
 | P2-2 | Stage rebuild | stage 一次性生成；任一目标已存在则整条 build 命令 fail-closed | [P2-2](P2-2-stage-rebuild-contract.md) |
 | P2-3 | 收集输出安全 | 旧正式文件原位，备份先提交；candidate/manifest 由 transaction journal 协调 | [P2-3](P2-3-collection-output-safety.md) |
 | P2-4 | OUTCAR patterns | 严格 YAML regex list；pattern priority + natural sort，禁用 mtime | [P2-4](P2-4-outcar-pattern-validation.md) |
 | P2-5 | OUTCAR 内存峰值 | 打开文件句柄生命周期内直接迭代专用 iterator，并验证首帧 lazy | [P2-5](P2-5-outcar-streaming.md) |
-| P2-6 | collect 退出码 | 0 complete、1 fatal、2 degraded、3 no_data | [P2-6](P2-6-collect-exit-codes.md) |
+| P2-6 | collect 退出码 | 0 complete、1 fatal、2 degraded、3 no_data；显式 legacy scan 至多 degraded | [P2-6](P2-6-collect-exit-codes.md) |
 
 ## 暂缓问题
 

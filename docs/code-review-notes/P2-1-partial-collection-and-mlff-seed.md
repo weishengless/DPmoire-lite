@@ -3,7 +3,10 @@
 - 状态：讨论已完成
 - 评审日期：2026-07-11
 - 结论日期：2026-07-11
+- full-dedup 补充决定日期：2026-07-12
 - 优先级：P2
+- 补充设计：
+  [`MLFF Full-dedup and Legacy Collection Design`](../superpowers/specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 - 关联位置：
   - `src/dpmoire_lite/dataset.py:17-22`
   - `src/dpmoire_lite/dataset.py:46-111`
@@ -87,9 +90,9 @@ steps；中间损坏不自动跳过。当前 `read_vasp_out(path, ":")` 会整�
 
 ## MLFF seed 前缀
 
-### 工作流契约
+### 默认工作流契约
 
-DPmoire-lite 支持的 MLFF 流程是：
+DPmoire-lite 默认支持的 MLFF 流程是：
 
 ```text
 init_mlff/ML_ABN
@@ -257,15 +260,52 @@ SHA-256 仍用于证明首次复制字节一致，两种 hash 不能互相替代
    `md/ML_AB` 静默推断。应要求用户恢复原始 seed 文件，或通过后续设计的
    明确 legacy migration 输入提供 count、schema 和 digest。
 
-### 不进行的去重
+### 显式 full-dedup 兼容收集
+
+旧计算或个人手工流程可能从空数据库启动 on-the-fly MLFF，随后执行一次或
+多次 restart。此时当前 `md/ML_AB` 是续算检查点，不是 Stage1 外部 initial
+seed；按它的当前 configuration 数量跳过前缀会丢失 restart 之前已经产生的
+新数据。VASP 不同版本又可能使用 `ML_ISTART` 或 `ML_MODE` 表达启动方式，
+collector 不应依赖这些标签猜测 seed。
+
+因此 `collect --stage md` 增加显式模式：
+
+```text
+--mlff-collect-mode seed-aware|full-dedup
+```
+
+- `seed-aware` 是默认值，严格执行上面的 seed-prefix 契约；
+- `full-dedup` 不读取、推断或跳过 initial seed；
+- `full-dedup` 只读取每个选中 MD 目录的最终 `ML_ABN`，不收集历史
+  `ML_ABN0`、`ML_ABN1` 或当前 `ML_AB`；
+- 每个 complete 或可接受 tail-partial 来源的完整 configurations 全量进入
+  exact identity fold；
+- 按 manifest/source 顺序和文件内 configuration 顺序保留第一次出现的
+  identity，后续完全相同者删除；
+- 多个目录共享 init seed 时，`MD_data.extxyz` 保留一份 seed；从空数据库
+  启动时，所有唯一的新 configuration 都保留；
+- failed 来源在最终分类前不得污染全局 identity 集合。
+
+`mlab-config-v1` 复用 `mlab-seed-v1` 的单 configuration canonical bytes，
+但不改变既有 seed sequence framing 或 digest 语义。单帧 identity 包含有序
+元素/计数、原子数、lattice、Cartesian positions、total energy、forces 和
+原始 kbar stress `[xx,yy,zz,xy,yz,zx]`。它忽略来源路径、configuration 编号、
+空白和数值文本格式；规范化 `-0.0`，拒绝 NaN/Inf，不做容差舍入。
+
+实现必须单遍计算 SHA-256，时间随总解析原子字段线性增长。禁止 RMSD、距离
+矩阵、对称性匹配或帧间两两比较。duplicate 本身不改变来源或 aggregate
+状态，但 manifest 必须记录 seen、unique、duplicates_removed 及逐来源计数。
+
+### 不进行的近似去重
 
 - 不在不同 MD 目录之间进行模糊几何去重；
 - 不因两个热构型位置接近而删除其中一个；
-- 不比较原始文本，但必须结构化验证 final ML_ABN 的 initial seed prefix；
+- `seed-aware` 仍必须结构化验证 final ML_ABN 的 initial seed prefix；
+- `full-dedup` 只删除 `mlab-config-v1` identity 完全相同的配置；
 - 不自动按结构相似度改变训练样本权重。
 
-如果未来确实需要全局去重，应作为独立数据策展功能设计，而不是混入基础
-collect 流程。
+如果未来需要容差、近邻或全局数据策展去重，应作为独立功能设计，不能静默
+扩展 `full-dedup` 的 exact identity 语义。
 
 ## manifest 记录
 
@@ -273,6 +313,7 @@ collect 流程。
 
 ```yaml
 collect:
+  collection_mode: seed-aware
   sources_attempted: 10
   sources_complete: 8
   sources_partial: 1
@@ -315,8 +356,15 @@ partial:
 - ML_ABN 短于 seed 前缀时不产生新帧；
 - 旧 manifest 优先从 `init_mlff/ML_ABN` 重建 count/digest 并给出警告；
 - 缺少旧 initial seed 证据时不从当前 MD/ML_AB 猜测；
-- 不执行模糊结构去重；
-- 最终 extxyz 帧数等于所有 complete 和 partial 来源的已接受帧之和；
+- 默认模式仍为 `seed-aware`，省略 CLI 选项与显式默认产生相同结果；
+- `full-dedup` 从最终 ML_ABN 全量读取，不用当前 ML_AB 数量跳过；
+- 相同 canonical 科学内容在同源/跨源只保留第一次出现，近似帧保留；
+- full-dedup 记录 `mlab-config-v1`、seen/unique/duplicate 逐来源及汇总计数；
+- duplicate 不造成 degraded，missing/partial/failed 仍按各自状态处理；
+- 去重实现为单遍 hash index，不执行模糊结构或帧间两两比较；
+- `seed-aware` 最终 extxyz 帧数等于所有 complete/partial 来源的已接受新帧
+  之和；`full-dedup` 最终帧数等于 unique retained 之和，且
+  `seen == unique + duplicates_removed`；
 - 测试覆盖完整文件、尾部截断、内部损坏、seed-only、短于 seed、多次
   restart、相同 count 不同 prefix、文本格式变化但 canonical 内容相同、旧
   init seed 回退和 initial seed 证据缺失。
