@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -93,6 +95,20 @@ class MlabParseResult:
     @property
     def accepted_count(self) -> int:
         return len(self.configurations)
+
+
+@dataclass(frozen=True)
+class MlabIdentity:
+    schema: str
+    sha256: str
+
+    @property
+    def schema_name(self) -> str:
+        return self.schema
+
+    @property
+    def digest(self) -> str:
+        return self.sha256
 
 
 ParseResult = MlabParseResult
@@ -479,6 +495,180 @@ def _reclassified_error(error: MlabParseError, reason: str) -> MlabParseError:
         reason=reason,
         line_number=error.line_number,
     )
+
+
+def _identity_error(configuration: MlabConfiguration | None, reason: str) -> None:
+    path = configuration.source_path if configuration is not None else Path("<memory>")
+    number = configuration.source_configuration_number if configuration is not None else None
+    raise MlabParseError(
+        path,
+        configuration_number=number,
+        block="identity",
+        reason=reason,
+    )
+
+
+def _uint64(value: int) -> bytes:
+    if not isinstance(value, int) or value < 0 or value > 2**64 - 1:
+        raise ValueError(f"integer outside unsigned 64-bit range: {value!r}")
+    return struct.pack(">Q", value)
+
+
+def _float64(value: float, configuration: MlabConfiguration) -> bytes:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        _identity_error(configuration, f"invalid float value {value!r}")
+        raise AssertionError("unreachable") from exc
+    if not math.isfinite(number):
+        _identity_error(configuration, f"non-finite float value {value!r}")
+    if number == 0.0:
+        number = 0.0
+    return struct.pack(">d", number)
+
+
+def _validated_configuration(configuration: MlabConfiguration) -> None:
+    if not isinstance(configuration.n_atoms, int) or configuration.n_atoms <= 0:
+        _identity_error(configuration, "atom count must be positive")
+    if len(configuration.elements) != len(configuration.counts):
+        _identity_error(configuration, "element/count shape mismatch")
+    if sum(configuration.counts) != configuration.n_atoms:
+        _identity_error(configuration, "element/count sum does not equal atom count")
+    for element, count in zip(configuration.elements, configuration.counts):
+        if not isinstance(element, str) or not element:
+            _identity_error(configuration, "element symbols must be non-empty strings")
+        if not isinstance(count, int) or count < 0:
+            _identity_error(configuration, "atom counts must be non-negative integers")
+
+    if len(configuration.lattice) != 3 or any(len(row) != 3 for row in configuration.lattice):
+        _identity_error(configuration, "lattice shape mismatch")
+    if len(configuration.positions) != configuration.n_atoms or any(
+        len(row) != 3 for row in configuration.positions
+    ):
+        _identity_error(configuration, "positions shape mismatch")
+    if len(configuration.forces) != configuration.n_atoms or any(
+        len(row) != 3 for row in configuration.forces
+    ):
+        _identity_error(configuration, "forces shape mismatch")
+    if len(configuration.stress_kbar) != 6:
+        _identity_error(configuration, "stress shape mismatch")
+
+    _float64(configuration.energy, configuration)
+    for rows in (configuration.lattice, configuration.positions, configuration.forces):
+        for row in rows:
+            for value in row:
+                _float64(value, configuration)
+    for value in configuration.stress_kbar:
+        _float64(value, configuration)
+
+
+def _canonical_chunks(configuration: MlabConfiguration):
+    _validated_configuration(configuration)
+
+    yield _uint64(len(configuration.elements))
+    for element, count in zip(configuration.elements, configuration.counts):
+        encoded = element.encode("utf-8")
+        yield _uint64(len(encoded))
+        yield encoded
+        yield _uint64(count)
+
+    yield _uint64(configuration.n_atoms)
+
+    yield _uint64(len(configuration.lattice))
+    yield _uint64(3)
+    for row in configuration.lattice:
+        for value in row:
+            yield _float64(value, configuration)
+
+    yield _uint64(len(configuration.positions))
+    yield _uint64(3)
+    for row in configuration.positions:
+        for value in row:
+            yield _float64(value, configuration)
+
+    yield _float64(configuration.energy, configuration)
+
+    yield _uint64(len(configuration.forces))
+    yield _uint64(3)
+    for row in configuration.forces:
+        for value in row:
+            yield _float64(value, configuration)
+
+    yield _uint64(len(configuration.stress_kbar))
+    for value in configuration.stress_kbar:
+        yield _float64(value, configuration)
+
+
+def canonical_configuration_bytes(configuration: MlabConfiguration) -> bytes:
+    """Return the v1 canonical scientific byte stream for one configuration."""
+
+    return b"".join(_canonical_chunks(configuration))
+
+
+def update_canonical_configuration(digest, configuration: MlabConfiguration) -> None:
+    """Feed one configuration's canonical fields into an existing hash object."""
+
+    for chunk in _canonical_chunks(configuration):
+        digest.update(chunk)
+
+
+def _configurations_for_identity(
+    source: MlabParseResult | Sequence[MlabConfiguration] | str | Path,
+) -> tuple[tuple[MlabConfiguration, ...], Path | None]:
+    if isinstance(source, (str, Path)):
+        result = parse_mlab(source)
+        return result.configurations, result.source_path
+    if isinstance(source, MlabParseResult):
+        return source.configurations, source.source_path
+    return tuple(source), None
+
+
+def config_identity(configuration: MlabConfiguration) -> MlabIdentity:
+    digest = hashlib.sha256()
+    update_canonical_configuration(digest, configuration)
+    return MlabIdentity(schema="mlab-config-v1", sha256=digest.hexdigest())
+
+
+def seed_prefix_identity(
+    source: MlabParseResult | Sequence[MlabConfiguration] | str | Path,
+    *,
+    n_configurations: int | None = None,
+) -> MlabIdentity:
+    configurations, source_path = _configurations_for_identity(source)
+    count = len(configurations) if n_configurations is None else n_configurations
+    if not isinstance(count, int) or count < 0:
+        raise MlabParseError(
+            source_path or Path("<memory>"),
+            configuration_number=None,
+            block="identity",
+            reason="invalid prefix count",
+        )
+    if count > len(configurations):
+        raise MlabParseError(
+            source_path or Path("<memory>"),
+            configuration_number=None,
+            block="identity",
+            reason=(
+                f"short source: requested {count} configurations, "
+                f"only {len(configurations)} complete configurations available"
+            ),
+        )
+
+    digest = hashlib.sha256()
+    for configuration in configurations[:count]:
+        update_canonical_configuration(digest, configuration)
+    return MlabIdentity(schema="mlab-seed-v1", sha256=digest.hexdigest())
+
+
+configuration_identity = config_identity
+
+
+def seed_prefix_digest(
+    source: MlabParseResult | Sequence[MlabConfiguration] | str | Path,
+    *,
+    n_configurations: int | None = None,
+) -> str:
+    return seed_prefix_identity(source, n_configurations=n_configurations).sha256
 
 
 def parse_mlab(path: str | Path) -> MlabParseResult:

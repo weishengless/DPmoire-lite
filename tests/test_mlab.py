@@ -1,4 +1,6 @@
 from pathlib import Path
+import hashlib
+import struct
 
 import pytest
 
@@ -11,6 +13,12 @@ except ImportError:
 
     def parse_mlab(_path):
         raise MlabParseError("structured parser is not implemented")
+
+
+try:
+    from dpmoire_lite import mlab as mlab_module
+except ImportError:
+    mlab_module = None
 
 
 FIXTURE_ROOT = Path(__file__).parent / "data" / "mlab"
@@ -81,12 +89,206 @@ def _write_variant(tmp_path: Path, source_name: str, old: str, new: str) -> Path
     return target
 
 
+def _missing_identity(*_args, **_kwargs):
+    raise MlabParseError(
+        Path("<unimplemented>"),
+        configuration_number=None,
+        block="identity",
+        reason="canonical identity is not implemented",
+    )
+
+
+def _identity_api(name: str):
+    if mlab_module is None:
+        return _missing_identity
+    return getattr(mlab_module, name, _missing_identity)
+
+
+def _canonical_bytes(configuration):
+    return _identity_api("canonical_configuration_bytes")(configuration)
+
+
+def _update_canonical(digest, configuration):
+    return _identity_api("update_canonical_configuration")(digest, configuration)
+
+
+def _seed_identity(result, n_configurations=None):
+    function = _identity_api("seed_prefix_identity")
+    if n_configurations is None:
+        return function(result)
+    return function(result, n_configurations=n_configurations)
+
+
+def _config_identity(configuration):
+    return _identity_api("config_identity")(configuration)
+
+
 def test_parse_complete_mlab_returns_declared_configurations():
     result = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab")
 
     assert result.status == "complete"
     assert result.declared_count == 2
     assert len(result.configurations) == 2
+
+
+def test_canonical_digest_is_stable_across_text_formatting():
+    result_a = parse_mlab(FIXTURE_ROOT / "format_variant_a.mlab")
+    result_b = parse_mlab(FIXTURE_ROOT / "format_variant_b.mlab")
+
+    assert _config_identity(result_a.configurations[0]) == _config_identity(
+        result_b.configurations[0]
+    )
+
+
+def test_canonical_digest_normalizes_negative_zero(tmp_path):
+    negative_zero_path = _write_variant(
+        tmp_path,
+        "complete_vasp_651.mlab",
+        "   0.000000000000000E+000  0.000000000000000E+000  1.000000000000000E+000",
+        "  -0.000000000000000E+000  0.000000000000000E+000  1.000000000000000E+000",
+    )
+    original = parse_mlab(FIXTURE_ROOT / "complete_vasp_651.mlab")
+    negative_zero = parse_mlab(negative_zero_path)
+
+    assert _config_identity(original.configurations[0]) == _config_identity(
+        negative_zero.configurations[0]
+    )
+
+
+def test_canonical_digest_uses_big_endian_float64_and_lengths():
+    configuration = parse_mlab(FIXTURE_ROOT / "complete_vasp_641.mlab").configurations[0]
+    payload = _canonical_bytes(configuration)
+
+    expected_prefix = (
+        struct.pack(">Q", 1)
+        + struct.pack(">Q", 1)
+        + b"C"
+        + struct.pack(">Q", 1)
+        + struct.pack(">Q", 1)
+        + struct.pack(">Q", 3)
+        + struct.pack(">Q", 3)
+        + struct.pack(">d", 4.0)
+    )
+    assert payload.startswith(expected_prefix)
+    assert struct.pack(">d", 4.0) in payload
+    assert struct.pack("<d", 4.0) not in payload
+
+
+def test_canonical_digest_uses_raw_kbar_stress_without_ase_conversion():
+    configuration = parse_mlab(FIXTURE_ROOT / "complete_vasp_651.mlab").configurations[0]
+    payload = _canonical_bytes(configuration)
+
+    assert payload[-48:] == struct.pack(">6d", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+
+
+def test_canonical_digest_changes_for_lattice_position_energy_force_or_stress(tmp_path):
+    source = "complete_vasp_651.mlab"
+    baseline = parse_mlab(FIXTURE_ROOT / source).configurations[0]
+    baseline_digest = _config_identity(baseline).sha256
+    variants = (
+        (
+            "   4.000000000000000E+000  0.000000000000000E+000  0.000000000000000E+000",
+            "   4.100000000000000E+000  0.000000000000000E+000  0.000000000000000E+000",
+        ),
+        (
+            "   0.000000000000000E+000  0.000000000000000E+000  1.000000000000000E+000",
+            "   0.000000000000000E+000  0.000000000000000E+000  1.100000000000000E+000",
+        ),
+        (
+            "  -1.250000000000000E+000",
+            "  -1.150000000000000E+000",
+        ),
+        (
+            "   1.000000000000000E-001  0.000000000000000E+000  0.000000000000000E+000",
+            "   2.000000000000000E-001  0.000000000000000E+000  0.000000000000000E+000",
+        ),
+        (
+            "   1.000000000000000E+000  2.000000000000000E+000  3.000000000000000E+000",
+            "   1.100000000000000E+000  2.000000000000000E+000  3.000000000000000E+000",
+        ),
+    )
+
+    for index, (old, new) in enumerate(variants):
+        variant_dir = tmp_path / str(index)
+        variant_dir.mkdir()
+        path = _write_variant(variant_dir, source, old, new)
+        changed = parse_mlab(path).configurations[0]
+        assert _config_identity(changed).sha256 != baseline_digest
+
+
+def test_prefix_digest_hashes_exactly_first_n_configurations():
+    result = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab")
+    first, second = result.configurations
+    first_bytes = _canonical_bytes(first)
+    second_bytes = _canonical_bytes(second)
+
+    first_identity = _seed_identity(result, n_configurations=1)
+    both_identity = _seed_identity(result, n_configurations=2)
+
+    assert first_identity.sha256 == hashlib.sha256(first_bytes).hexdigest()
+    assert both_identity.sha256 == hashlib.sha256(first_bytes + second_bytes).hexdigest()
+
+
+def test_prefix_digest_rejects_short_source():
+    result = parse_mlab(FIXTURE_ROOT / "tail_position_crop.mlab")
+
+    with pytest.raises(MlabParseError, match="short"):
+        _seed_identity(result, n_configurations=2)
+
+
+def test_digest_schema_name_is_mlab_seed_v1():
+    result = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab")
+    identity = _seed_identity(result, n_configurations=2)
+
+    assert identity.schema == "mlab-seed-v1"
+    assert len(identity.sha256) == 64
+
+
+def test_config_identity_schema_name_is_mlab_config_v1():
+    configuration = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab").configurations[0]
+    identity = _config_identity(configuration)
+
+    assert identity.schema == "mlab-config-v1"
+    assert len(identity.sha256) == 64
+
+
+def test_config_identity_hashes_exactly_one_configuration():
+    configuration = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab").configurations[0]
+    identity = _config_identity(configuration)
+
+    assert identity.sha256 == hashlib.sha256(_canonical_bytes(configuration)).hexdigest()
+
+
+def test_config_identity_reuses_seed_configuration_bytes():
+    result = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab")
+    configuration = result.configurations[0]
+
+    assert _config_identity(configuration).sha256 == _seed_identity(
+        result, n_configurations=1
+    ).sha256
+
+
+def test_adding_config_identity_does_not_change_seed_digest():
+    result = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab")
+    before = _seed_identity(result, n_configurations=1).sha256
+
+    _config_identity(result.configurations[1])
+
+    assert _seed_identity(result, n_configurations=1).sha256 == before
+
+
+def test_config_identity_can_hash_incrementally_without_file_sized_buffer(monkeypatch):
+    configuration = parse_mlab(FIXTURE_ROOT / "complete_multi.mlab").configurations[0]
+    expected = _config_identity(configuration).sha256
+
+    def fail_if_materialized(_configuration):
+        raise AssertionError("incremental identity must not materialize canonical bytes")
+
+    monkeypatch.setattr(mlab_module, "canonical_configuration_bytes", fail_if_materialized)
+    digest = hashlib.sha256()
+    _update_canonical(digest, configuration)
+
+    assert digest.hexdigest() == expected
 
 
 def test_parse_mlab_preserves_element_and_atom_order():
