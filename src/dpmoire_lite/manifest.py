@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -5,6 +8,28 @@ from typing import Any
 import yaml
 
 from dpmoire_lite.paths import manifest_path
+
+
+MANIFEST_SCHEMA_VERSION = 2
+
+_MANIFEST_FIELDS = {
+    "stage",
+    "generated_at",
+    "config_summary",
+    "directories",
+    "backups",
+    "jobs",
+    "collect",
+    "skipped",
+    "failed",
+    "stackings",
+    "angles",
+    "schema_version",
+    "structure_provenance",
+    "grid_shift_anchors",
+    "mlff_seed",
+    "partial",
+}
 
 
 @dataclass
@@ -20,18 +45,144 @@ class Manifest:
     failed: list[dict[str, str]] = field(default_factory=list)
     stackings: list[list[int]] = field(default_factory=list)
     angles: list[str] = field(default_factory=list)
+    schema_version: int = MANIFEST_SCHEMA_VERSION
+    structure_provenance: dict[str, Any] = field(default_factory=dict)
+    grid_shift_anchors: dict[str, Any] = field(default_factory=dict)
+    mlff_seed: dict[str, Any] = field(default_factory=dict)
+    partial: list[dict[str, Any]] = field(default_factory=list)
 
 
-def write_manifest(work_dir: Path, manifest: Manifest) -> None:
+@dataclass
+class ManifestReadResult:
+    kind: str
+    manifest: Manifest | None = None
+    raw_data: dict[str, Any] | None = None
+
+    def __bool__(self) -> bool:
+        return self.manifest is not None
+
+    def __getattr__(self, name: str) -> Any:
+        manifest = self.manifest
+        if manifest is not None:
+            return getattr(manifest, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"kind", "manifest", "raw_data"} or "manifest" not in self.__dict__:
+            object.__setattr__(self, name, value)
+            return
+        manifest = self.__dict__["manifest"]
+        if manifest is not None and hasattr(manifest, name):
+            setattr(manifest, name, value)
+            return
+        object.__setattr__(self, name, value)
+
+
+def write_manifest(work_dir: Path, manifest: Manifest | ManifestReadResult) -> None:
+    if isinstance(manifest, ManifestReadResult):
+        if manifest.manifest is None:
+            raise ValueError("Cannot write a manifest read as missing or legacy")
+        manifest = manifest.manifest
+
     path = manifest_path(work_dir, manifest.stage)
+    data = asdict(manifest)
+    _validate_v2_data(data, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(asdict(manifest), sort_keys=False), encoding="utf-8")
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def read_manifest(work_dir: Path, stage: str) -> Manifest | None:
+def read_manifest(work_dir: Path, stage: str) -> ManifestReadResult:
     path = manifest_path(work_dir, stage)
     if not path.exists():
-        return None
+        return ManifestReadResult(kind="missing")
 
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return Manifest(**data)
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Could not read manifest {path}: {exc}") from exc
+
+    if data is None:
+        data = {}
+    if not isinstance(data, Mapping):
+        raise ValueError(f"Invalid manifest {path}: top-level data must be a mapping")
+    data = dict(data)
+
+    if "schema_version" not in data:
+        return ManifestReadResult(kind="legacy", raw_data=data)
+
+    _validate_v2_data(data, path)
+    try:
+        manifest = Manifest(**data)
+    except TypeError as exc:
+        raise ValueError(f"Invalid Manifest v2 field in {path}: {exc}") from exc
+    return ManifestReadResult(kind="current", manifest=manifest, raw_data=data)
+
+
+def _validate_v2_data(data: Mapping[str, Any], path: Path) -> None:
+    _expect_mapping(data, path, "top-level data")
+
+    version = data.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"Invalid manifest {path}: unsupported schema_version {version!r}; "
+            f"expected {MANIFEST_SCHEMA_VERSION}"
+        )
+
+    unknown = sorted(set(data) - _MANIFEST_FIELDS)
+    if unknown:
+        raise ValueError(f"Invalid Manifest v2 field in {path}: unknown top-level field(s) {unknown}")
+
+    _require_str(data, path, "stage")
+    _require_str(data, path, "generated_at")
+    _require_list_of_str(data, path, "directories")
+    _require_list_of_str(data, path, "backups")
+    _require_list_of_str(data, path, "angles")
+    _require_mapping_field(data, path, "config_summary")
+    _require_mapping_field(data, path, "collect")
+    _require_mapping_field(data, path, "structure_provenance")
+    _require_mapping_field(data, path, "grid_shift_anchors")
+    _require_mapping_field(data, path, "mlff_seed")
+    _require_record_list(data, path, "jobs")
+    _require_record_list(data, path, "skipped")
+    _require_record_list(data, path, "failed")
+    _require_record_list(data, path, "partial")
+    _require_stackings(data, path)
+
+
+def _expect_mapping(data: Any, path: Path, field_name: str) -> None:
+    if not isinstance(data, Mapping):
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a mapping")
+
+
+def _require_str(data: Mapping[str, Any], path: Path, field_name: str) -> None:
+    value = data.get(field_name)
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a string")
+
+
+def _require_list_of_str(data: Mapping[str, Any], path: Path, field_name: str) -> None:
+    value = data.get(field_name)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a list of strings")
+
+
+def _require_mapping_field(data: Mapping[str, Any], path: Path, field_name: str) -> None:
+    value = data.get(field_name)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a mapping")
+
+
+def _require_record_list(data: Mapping[str, Any], path: Path, field_name: str) -> None:
+    value = data.get(field_name)
+    if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a list of mappings")
+
+
+def _require_stackings(data: Mapping[str, Any], path: Path) -> None:
+    value = data.get("stackings")
+    if not isinstance(value, list) or any(
+        not isinstance(item, list)
+        or any(isinstance(index, bool) or not isinstance(index, int) for index in item)
+        for item in value
+    ):
+        raise ValueError(f"Invalid manifest {path}: stackings must be a list of integer lists")
