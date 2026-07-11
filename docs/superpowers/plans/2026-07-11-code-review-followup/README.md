@@ -8,6 +8,9 @@ production implementation has not started
 Approved design:
 [`2026-07-11-code-review-followup-decomposition-design.md`](../../specs/2026-07-11-code-review-followup-decomposition-design.md)
 
+Reusable low-reasoning execution prompt:
+[`LOW-REASONING-EXECUTION-PROMPT.md`](LOW-REASONING-EXECUTION-PROMPT.md)
+
 Authoritative requirement index:
 [`docs/code-review-notes/README.md`](../../../code-review-notes/README.md)
 
@@ -48,8 +51,9 @@ follow-up.
    update the spec with user approval. Do not silently choose a new scientific or
    recovery rule inside production code.
 9. Do not start a dependent plan while its predecessor acceptance tests are red.
-10. Run the focused suite after each task and the full suite at each leaf-plan
-    checkpoint. The current baseline is 93 passed and 5 skipped.
+10. Run the focused/affected suites after each execution unit. Run the full suite
+    before every checkpoint commit and every leaf-plan checkpoint. The current
+    baseline is 93 passed and 5 skipped.
 
 ## Pre-implementation Repository Gate
 
@@ -63,6 +67,22 @@ production work begins, intentionally review and version only the approved scope
 
 Do not include `example-test/`, POTCARs, generated build output, or unrelated user
 changes in that commit.
+
+## Test-material Availability
+
+The ignored local sample currently provides candidate source material for later
+parser plans:
+
+- one complete-format ML_ABN of about 0.8 MB with 110 configuration markers;
+- one OUTCAR of about 6.8 MB with roughly 532 ionic force blocks.
+
+Plans 03 and 07 may crop minimum redistributable fixtures and construct controlled
+tail-truncation/internal-corruption variants from these files. Raw sample files
+remain ignored and must never be staged. A natural walltime-truncated ML_ABN,
+tail-truncated OUTCAR, or multi-restart final ML_ABN plus original seed would
+strengthen validation but is not a prerequisite for Plan 02 or for beginning the
+parser plans. Request additional material only when the existing source cannot
+represent an authoritative format boundary.
 
 ## Plan Index
 
@@ -245,7 +265,17 @@ and ask that same session to publish it.
 
 ## Per-Task TDD Contract
 
-Each task in a leaf plan uses this sequence:
+The checkpoint boundary is a TDD execution unit:
+
+- normally one task that contains both RED and GREEN;
+- or one adjacent pair where the first task only adds failing tests and the next
+  task implements exactly those tests.
+
+Do not execute more than one unit per model run. Do not jump over an unrelated
+task to reach the implementation for an earlier RED test. A task must not add
+tests assigned to a later, nonadjacent task.
+
+Each execution unit uses this sequence:
 
 1. Name exact test files and test functions.
 2. Add the smallest fixture required by those tests.
@@ -254,8 +284,14 @@ Each task in a leaf plan uses this sequence:
 4. Implement only that behavior.
 5. Run the focused command to green.
 6. Run the affected subsystem tests.
-7. Run the full suite before the leaf-plan checkpoint.
+7. Run the full suite before the checkpoint commit and leaf-plan checkpoint.
 8. Inspect `git diff --check` and `git status --short`.
+
+All tests included in a commit must pass. Future-task RED tests must remain absent
+from default discovery and must never be staged. A temporary untracked RED file
+may be excluded only by an explicit, recorded migration amendment; the regression
+command must then use `--ignore=<exact-untracked-file>`, and the staged tree must
+contain no failing test.
 
 Standard commands:
 

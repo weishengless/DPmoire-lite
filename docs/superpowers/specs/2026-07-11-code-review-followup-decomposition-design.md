@@ -433,9 +433,15 @@ blocks of final production code. Complex state tables and canonical schemas shou
 link to their authoritative note rather than be rewritten with subtly different
 wording.
 
-### Test-driven tasks
+### Test-driven execution units
 
-Each task follows one red/green/refactor cycle:
+Each checkpointed execution unit follows one red/green/refactor cycle. An
+execution unit is normally one self-contained task. If a leaf plan explicitly
+uses one task only to add failing tests and the immediately following task only to
+implement those exact tests, that adjacent pair is one execution unit and one
+checkpoint. A RED task must never remain active across an unrelated task.
+
+Each execution unit follows this sequence:
 
 1. add specifically named failing tests and minimal fixtures;
 2. run an exact focused command and record the expected reason for failure;
@@ -446,8 +452,9 @@ Each task follows one red/green/refactor cycle:
 7. end at a clear review and rollback checkpoint.
 
 A leaf plan should normally contain four to seven tasks and no more than one new
-complex state machine. If a draft exceeds that boundary or introduces two
-independent algorithms, it must be split before implementation.
+complex state machine. If a draft exceeds that boundary, introduces two
+independent algorithms, or carries future-task RED tests across an unrelated
+task, it must be split or reordered before implementation.
 
 ### Acceptance traceability
 

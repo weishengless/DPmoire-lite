@@ -77,32 +77,30 @@ The reader must provide a stable distinction among:
 Exception names or result-wrapper names may be refined during implementation,
 but callers cannot receive `None` for all three failure categories.
 
-## Task 1: Add Failing Strict-reader and Schema Tests
+## Amendment for the Pre-2026-07-12 Worktree
 
-Add tests:
+The earlier plan added seven Manifest v2 RED tests before an unrelated atomic-I/O
+task. That made a per-task full-green checkpoint impossible. No Plan 02 files had
+been committed, so this plan is reordered without rewriting history:
 
-- `test_read_manifest_reports_missing_separately()`;
-- `test_read_manifest_detects_legacy_without_mutating_it()`;
-- `test_read_manifest_rejects_invalid_v2_schema()`;
-- `test_manifest_v2_round_trip_preserves_extension_sections()`;
-- `test_manifest_v2_rejects_stage_path_escape()`;
-- `test_manifest_v2_rejects_absolute_directory_outside_workdir()`;
-- `test_read_manifest_never_creates_a_file()`.
+- former Task 2 becomes amended Task 1;
+- the five strict-reader/schema tests belong to amended Task 2;
+- the two path-escape tests belong to amended Task 3;
+- former Task 5 becomes amended Task 4.
 
-Use synthetic YAML under `tmp_path`; do not depend on existing work directories.
-
-Red command:
+If the pre-amendment untracked `tests/test_manifest_v2.py` is present during
+amended Task 1, it is test inventory only and must not be staged. Run the
+committed-scope regression once with:
 
 ```powershell
-$python = 'C:\Users\Nice_Try\anaconda3\envs\vdwID\python.exe'
-$env:PIP_NO_CACHE_DIR = '1'
-& $python -m pytest tests/test_manifest_v2.py -q -p no:cacheprovider
+& $python -m pytest --ignore=tests/test_manifest_v2.py -q -p no:cacheprovider
 ```
 
-Expected failure: the current reader returns `None` only for missing and has no
-schema/legacy classification or nested contract.
+Before amended Task 2 starts, keep only its five tests in that file. Add the path
+tests only when amended Task 3 starts. Do not mark tests xfail/skip to hide this
+ordering issue.
 
-## Task 2: Implement and Test Reusable Atomic I/O Primitives
+## Task 1: Implement and Test Reusable Atomic I/O Primitives
 
 Add failing tests:
 
@@ -137,9 +135,38 @@ $env:PIP_NO_CACHE_DIR = '1'
 & $python -m pytest tests/test_atomic_io.py -q -p no:cacheprovider
 ```
 
+Checkpoint requirements:
+
+1. Atomic focused tests pass.
+2. The one-time committed-scope regression above passes.
+3. Stage only `src/dpmoire_lite/atomic_io.py` and
+   `tests/test_atomic_io.py`.
+4. Confirm `tests/test_manifest_v2.py` and the local status file are not staged.
+
 Checkpoint: atomic primitives only.
 
-## Task 3: Implement Manifest v2 and Strict Classification
+## Task 2: Implement Manifest v2 and Strict Classification
+
+At the start of this task, add/retain only these five tests:
+
+- `test_read_manifest_reports_missing_separately()`;
+- `test_read_manifest_detects_legacy_without_mutating_it()`;
+- `test_read_manifest_rejects_invalid_v2_schema()`;
+- `test_manifest_v2_round_trip_preserves_extension_sections()`;
+- `test_read_manifest_never_creates_a_file()`.
+
+Use synthetic YAML under `tmp_path`; do not depend on existing work directories.
+
+Red command:
+
+```powershell
+$python = 'C:\Users\Nice_Try\anaconda3\envs\vdwID\python.exe'
+$env:PIP_NO_CACHE_DIR = '1'
+& $python -m pytest tests/test_manifest_v2.py -q -p no:cacheprovider
+```
+
+Expected failure: the current reader returns `None` only for missing and has no
+schema/legacy classification or nested contract.
 
 Implementation requirements:
 
@@ -160,12 +187,16 @@ $env:PIP_NO_CACHE_DIR = '1'
 & $python -m pytest tests/test_manifest_v2.py tests/test_paths_manifest.py -q -p no:cacheprovider
 ```
 
+Run the full suite; it must be green before this task is committed.
+
 Checkpoint: schema/reader implementation.
 
-## Task 4: Enforce Work-dir Path Boundaries
+## Task 3: Enforce Work-dir Path Boundaries
 
-Add tests:
+Add the path tests only now:
 
+- `test_manifest_v2_rejects_stage_path_escape()`;
+- `test_manifest_v2_rejects_absolute_directory_outside_workdir()`;
 - `test_manifest_directory_accepts_normalized_relative_path()`;
 - `test_manifest_directory_rejects_parent_traversal()`;
 - `test_manifest_directory_rejects_symlink_escape_when_resolvable()`;
@@ -189,9 +220,11 @@ $env:PIP_NO_CACHE_DIR = '1'
 & $python -m pytest tests/test_manifest_v2.py tests/test_paths_manifest.py -q -p no:cacheprovider -k "path or directory or stage"
 ```
 
+Run the full suite; it must be green before this task is committed.
+
 Checkpoint: strict path-boundary support.
 
-## Task 5: Make Manifest Writes Atomic Without Changing Domain Semantics
+## Task 4: Make Manifest Writes Atomic Without Changing Domain Semantics
 
 Add/adjust tests:
 
@@ -228,12 +261,12 @@ git status --short
 
 | Shared requirement | Evidence |
 | --- | --- |
-| explicit schema/version | v2 round-trip and unsupported-version tests |
-| missing is not legacy | strict classification tests |
+| explicit schema/version | Task 2 v2 round-trip and unsupported-version tests |
+| missing is not legacy | Task 2 strict classification tests |
 | read never creates manifest | read-only test |
 | invalid v2 fails strictly | schema-context tests |
-| paths stay in work_dir | Task 4 tests |
-| manifest write is atomic | atomic ordering/failure tests |
+| paths stay in work_dir | Task 3 tests |
+| manifest write is atomic | Tasks 1 and 4 atomic ordering/failure tests |
 | old bytes survive failed write | failure-injection tests |
 | extension points exist once | v2 round-trip test |
 | legacy source not rewritten | legacy immutability test |
