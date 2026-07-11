@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+import posixpath
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 import yaml
@@ -11,6 +13,12 @@ from dpmoire_lite.paths import manifest_path
 
 
 MANIFEST_SCHEMA_VERSION = 2
+
+_COLLECT_OUTPUTS = {
+    "rlx": "rlx_data.extxyz",
+    "md": "MD_data.extxyz",
+    "validation": "valid.extxyz",
+}
 
 _MANIFEST_FIELDS = {
     "stage",
@@ -86,7 +94,7 @@ def write_manifest(work_dir: Path, manifest: Manifest | ManifestReadResult) -> N
 
     path = manifest_path(work_dir, manifest.stage)
     data = asdict(manifest)
-    _validate_v2_data(data, path)
+    _validate_v2_data(data, path, work_dir=Path(work_dir), expected_stage=manifest.stage)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
@@ -108,9 +116,10 @@ def read_manifest(work_dir: Path, stage: str) -> ManifestReadResult:
     data = dict(data)
 
     if "schema_version" not in data:
+        _validate_legacy_data(data, path, work_dir=Path(work_dir), expected_stage=stage)
         return ManifestReadResult(kind="legacy", raw_data=data)
 
-    _validate_v2_data(data, path)
+    _validate_v2_data(data, path, work_dir=Path(work_dir), expected_stage=stage)
     try:
         manifest = Manifest(**data)
     except TypeError as exc:
@@ -118,7 +127,13 @@ def read_manifest(work_dir: Path, stage: str) -> ManifestReadResult:
     return ManifestReadResult(kind="current", manifest=manifest, raw_data=data)
 
 
-def _validate_v2_data(data: Mapping[str, Any], path: Path) -> None:
+def _validate_v2_data(
+    data: Mapping[str, Any],
+    path: Path,
+    *,
+    work_dir: Path | None = None,
+    expected_stage: str | None = None,
+) -> None:
     _expect_mapping(data, path, "top-level data")
 
     version = data.get("schema_version")
@@ -133,6 +148,11 @@ def _validate_v2_data(data: Mapping[str, Any], path: Path) -> None:
         raise ValueError(f"Invalid Manifest v2 field in {path}: unknown top-level field(s) {unknown}")
 
     _require_str(data, path, "stage")
+    if expected_stage is not None and data["stage"] != expected_stage:
+        raise ValueError(
+            f"Invalid manifest {path}: stage {data['stage']!r} does not match "
+            f"manifest location for {expected_stage!r}"
+        )
     _require_str(data, path, "generated_at")
     _require_list_of_str(data, path, "directories")
     _require_list_of_str(data, path, "backups")
@@ -147,6 +167,104 @@ def _validate_v2_data(data: Mapping[str, Any], path: Path) -> None:
     _require_record_list(data, path, "failed")
     _require_record_list(data, path, "partial")
     _require_stackings(data, path)
+
+    if work_dir is not None:
+        _normalize_manifest_paths(data, path, work_dir, data["stage"])
+
+
+def _validate_legacy_data(
+    data: dict[str, Any],
+    path: Path,
+    *,
+    work_dir: Path,
+    expected_stage: str,
+) -> None:
+    if "stage" in data:
+        if not isinstance(data["stage"], str):
+            raise ValueError(f"Invalid legacy manifest {path}: stage must be a string")
+        if data["stage"] != expected_stage:
+            raise ValueError(
+                f"Invalid legacy manifest {path}: stage {data['stage']!r} does not match "
+                f"manifest location for {expected_stage!r}"
+            )
+
+    if "directories" in data:
+        _require_list_of_str(data, path, "directories")
+        data["directories"] = [
+            _normalize_relative_path(value, work_dir, path, "directories")
+            for value in data["directories"]
+        ]
+    if "backups" in data:
+        _require_list_of_str(data, path, "backups")
+        data["backups"] = [
+            _normalize_relative_path(value, work_dir, path, "backups")
+            for value in data["backups"]
+        ]
+
+
+def _normalize_manifest_paths(
+    data: Mapping[str, Any], path: Path, work_dir: Path, stage: str
+) -> None:
+    data["directories"] = [
+        _normalize_relative_path(value, work_dir, path, "directories")
+        for value in data["directories"]
+    ]
+    data["backups"] = [
+        _normalize_relative_path(value, work_dir, path, "backups")
+        for value in data["backups"]
+    ]
+
+    collect = data["collect"]
+    output = collect.get("output")
+    if output is not None:
+        if not isinstance(output, str):
+            raise ValueError(f"Invalid manifest {path}: collect.output must be a string")
+        normalized_output = _normalize_relative_path(output, work_dir, path, "collect.output")
+        expected_output = _COLLECT_OUTPUTS.get(stage)
+        if expected_output is None or normalized_output != expected_output:
+            raise ValueError(
+                f"Invalid manifest {path}: collect.output {normalized_output!r} "
+                f"does not match the stage contract for {stage!r}"
+            )
+        collect["output"] = normalized_output
+
+    backup = collect.get("backup")
+    if isinstance(backup, str):
+        collect["backup"] = _normalize_relative_path(backup, work_dir, path, "collect.backup")
+    elif backup is not None:
+        raise ValueError(f"Invalid manifest {path}: collect.backup must be a relative path")
+
+
+def _normalize_relative_path(value: str, work_dir: Path, manifest: Path, field_name: str) -> str:
+    raw = value.replace("\\", "/")
+    windows_path = PureWindowsPath(raw)
+    posix_path = PurePosixPath(raw)
+    if (
+        not raw
+        or posix_path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or ".." in posix_path.parts
+    ):
+        raise ValueError(
+            f"Invalid manifest {manifest}: {field_name} must be a safe relative path; got {value!r}"
+        )
+
+    normalized = posixpath.normpath(raw)
+    if normalized in {"", "."}:
+        raise ValueError(
+            f"Invalid manifest {manifest}: {field_name} must not be an empty path"
+        )
+
+    resolved_work_dir = Path(work_dir).resolve()
+    resolved_path = (resolved_work_dir / normalized).resolve()
+    try:
+        resolved_path.relative_to(resolved_work_dir)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid manifest {manifest}: {field_name} escapes work_dir; got {value!r}"
+        ) from exc
+    return normalized
 
 
 def _expect_mapping(data: Any, path: Path, field_name: str) -> None:

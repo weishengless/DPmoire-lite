@@ -92,3 +92,128 @@ def test_read_manifest_never_creates_a_file(tmp_path):
 
     assert result.kind == "missing"
     assert not path.exists()
+
+
+def test_manifest_v2_rejects_stage_path_escape(tmp_path):
+    work_dir = tmp_path / "work"
+
+    with pytest.raises(ValueError, match="directories|work_dir"):
+        write_manifest(
+            work_dir,
+            Manifest(
+                stage="rlx",
+                generated_at="2026-07-11T12:00:00",
+                directories=["rlx/../../outside"],
+            ),
+        )
+
+
+def test_manifest_v2_rejects_absolute_directory_outside_workdir(tmp_path):
+    work_dir = tmp_path / "work"
+    outside = (tmp_path / "outside" / "0_0").resolve()
+
+    with pytest.raises(ValueError, match="directories|work_dir"):
+        write_manifest(
+            work_dir,
+            Manifest(
+                stage="rlx",
+                generated_at="2026-07-11T12:00:00",
+                directories=[str(outside)],
+            ),
+        )
+
+
+def test_manifest_directory_accepts_normalized_relative_path(tmp_path):
+    work_dir = tmp_path / "work"
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="rlx",
+            generated_at="2026-07-11T12:00:00",
+            directories=[r"rlx\0_0"],
+        ),
+    )
+
+    raw = yaml.safe_load(manifest_path(work_dir, "rlx").read_text(encoding="utf-8"))
+    result = read_manifest(work_dir, "rlx")
+
+    assert raw["directories"] == ["rlx/0_0"]
+    assert result.manifest is not None
+    assert result.manifest.directories == ["rlx/0_0"]
+
+
+def test_manifest_directory_rejects_parent_traversal(tmp_path):
+    work_dir = tmp_path / "work"
+
+    with pytest.raises(ValueError, match="directories"):
+        write_manifest(
+            work_dir,
+            Manifest(
+                stage="rlx",
+                generated_at="2026-07-11T12:00:00",
+                directories=["rlx/../rlx/0_0"],
+            ),
+        )
+
+
+def test_manifest_directory_rejects_symlink_escape_when_resolvable(tmp_path):
+    work_dir = tmp_path / "work"
+    outside = tmp_path / "outside"
+    work_dir.mkdir()
+    outside.mkdir()
+    link = work_dir / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="directories|work_dir"):
+        write_manifest(
+            work_dir,
+            Manifest(
+                stage="rlx",
+                generated_at="2026-07-11T12:00:00",
+                directories=["link/0_0"],
+            ),
+        )
+
+
+def test_manifest_output_path_must_match_stage_contract(tmp_path):
+    with pytest.raises(ValueError, match="output|stage"):
+        write_manifest(
+            tmp_path / "work",
+            Manifest(
+                stage="md",
+                generated_at="2026-07-11T12:00:00",
+                collect={"output": "rlx_data.extxyz"},
+            ),
+        )
+
+
+def test_manifest_stage_must_match_manifest_location(tmp_path):
+    work_dir = tmp_path / "work"
+    _write_yaml(
+        work_dir,
+        "rlx",
+        {
+            "schema_version": 2,
+            "stage": "md",
+            "generated_at": "2026-07-11T12:00:00",
+            "directories": [],
+            "backups": [],
+            "jobs": [],
+            "collect": {},
+            "skipped": [],
+            "failed": [],
+            "stackings": [],
+            "angles": [],
+            "config_summary": {},
+            "structure_provenance": {},
+            "grid_shift_anchors": {},
+            "mlff_seed": {},
+            "partial": [],
+        },
+    )
+
+    with pytest.raises(ValueError, match="stage|manifest"):
+        read_manifest(work_dir, "rlx")
