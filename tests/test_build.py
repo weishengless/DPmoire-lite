@@ -348,6 +348,7 @@ def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     poscar_text = (md_dir / "POSCAR").read_text(encoding="utf-8")
     assert "9.0 9.0 9.0" not in poscar_text
     manifest = yaml.safe_load((work / "md" / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
     assert manifest["stage"] == "md"
     assert manifest["directories"] == ["md/0_0"]
     assert manifest["stackings"] == [[0, 0]]

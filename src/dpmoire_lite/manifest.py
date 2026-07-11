@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from . import atomic_io
 from dpmoire_lite.paths import manifest_path
 
 
@@ -96,7 +97,8 @@ def write_manifest(work_dir: Path, manifest: Manifest | ManifestReadResult) -> N
     data = asdict(manifest)
     _validate_v2_data(data, path, work_dir=Path(work_dir), expected_stage=manifest.stage)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    serialized = yaml.safe_dump(data, sort_keys=False)
+    atomic_io.atomic_text_publish(path, serialized, encoding="utf-8")
 
 
 def read_manifest(work_dir: Path, stage: str) -> ManifestReadResult:

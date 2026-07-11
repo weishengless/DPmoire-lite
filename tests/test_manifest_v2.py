@@ -3,6 +3,7 @@ from dataclasses import asdict
 import pytest
 import yaml
 
+import dpmoire_lite.atomic_io as atomic_io
 from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
 from dpmoire_lite.paths import manifest_path
 
@@ -24,7 +25,7 @@ def test_read_manifest_reports_missing_separately(tmp_path):
     assert result.raw_data is None
 
 
-def test_read_manifest_detects_legacy_without_mutating_it(tmp_path):
+def test_legacy_read_does_not_rewrite_source_manifest(tmp_path):
     work_dir = tmp_path / "work"
     legacy = {
         "stage": "rlx",
@@ -92,6 +93,49 @@ def test_read_manifest_never_creates_a_file(tmp_path):
 
     assert result.kind == "missing"
     assert not path.exists()
+
+
+def test_write_manifest_uses_atomic_publisher(tmp_path, monkeypatch):
+    observed = {}
+
+    def fake_publish(destination, text, **kwargs):
+        observed["destination"] = destination
+        observed["text"] = text
+        observed["kwargs"] = kwargs
+        return atomic_io.AtomicPublishResult(destination=destination, sha256=None)
+
+    monkeypatch.setattr(atomic_io, "atomic_text_publish", fake_publish)
+
+    work_dir = tmp_path / "work"
+    write_manifest(
+        work_dir,
+        Manifest(stage="rlx", generated_at="2026-07-11T12:00:00"),
+    )
+
+    assert observed["destination"] == manifest_path(work_dir, "rlx")
+    assert "schema_version: 2" in observed["text"]
+    assert observed["kwargs"]["encoding"] == "utf-8"
+
+
+def test_write_manifest_failure_preserves_previous_manifest(tmp_path, monkeypatch):
+    work_dir = tmp_path / "work"
+    destination = manifest_path(work_dir, "rlx")
+    destination.parent.mkdir(parents=True)
+    previous = b"previous manifest bytes\n"
+    destination.write_bytes(previous)
+
+    def fail_publish(*_args, **_kwargs):
+        raise OSError("manifest candidate publication failed")
+
+    monkeypatch.setattr(atomic_io, "atomic_text_publish", fail_publish)
+
+    with pytest.raises(OSError, match="manifest candidate publication failed"):
+        write_manifest(
+            work_dir,
+            Manifest(stage="rlx", generated_at="2026-07-11T12:00:00"),
+        )
+
+    assert destination.read_bytes() == previous
 
 
 def test_manifest_v2_rejects_stage_path_escape(tmp_path):

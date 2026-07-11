@@ -89,6 +89,7 @@ def test_collect_ml_md_writes_extxyz_and_manifest_counts(tmp_path, sample_dir):
 
     assert (work / "MD_data.extxyz").is_file()
     manifest = read_manifest(work, "md")
+    assert manifest.schema_version == 2
     assert manifest.collect["frames"] > 0
     assert manifest.collect["output"] == "MD_data.extxyz"
 
