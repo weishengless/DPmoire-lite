@@ -1,8 +1,13 @@
+from dataclasses import replace
 from pathlib import Path
 import hashlib
 import struct
 
 import pytest
+from ase.units import GPa
+
+import dpmoire_lite.dataset as dataset_module
+from dpmoire_lite.dataset import Dataset, count_ml_ab_configs
 
 
 try:
@@ -523,3 +528,73 @@ def test_declared_less_than_complete_fails(tmp_path):
         parse_mlab(path)
 
     assert "declared count" in caught.value.reason
+
+
+def test_dataset_adds_complete_parsed_configurations(monkeypatch):
+    source = FIXTURE_ROOT / "complete_multi.mlab"
+    calls = []
+    real_parse = parse_mlab
+
+    def parse_spy(path):
+        calls.append(Path(path))
+        return real_parse(path)
+
+    monkeypatch.setattr(dataset_module, "parse_mlab", parse_spy, raising=False)
+    dataset = Dataset()
+    dataset.load_ml_ab(source)
+
+    assert calls == [source]
+    assert dataset.n_configs == 2
+    assert len(dataset.data) == 2
+
+
+def test_dataset_load_mlab_does_not_mutate_on_invalid_source():
+    dataset = Dataset()
+    dataset.load_ml_ab(FIXTURE_ROOT / "complete_vasp_641.mlab")
+
+    with pytest.raises(Exception):
+        dataset.load_ml_ab(FIXTURE_ROOT / "internal_corruption.mlab")
+
+    assert dataset.n_configs == 1
+    assert len(dataset.data) == 1
+    assert dataset.data[0].get_potential_energy() == pytest.approx(-1.0)
+
+
+def test_dataset_ase_conversion_uses_expected_energy_forces_and_stress(monkeypatch):
+    source = FIXTURE_ROOT / "complete_vasp_651.mlab"
+    parsed = parse_mlab(source)
+    configuration = replace(
+        parsed.configurations[0],
+        energy=-7.5,
+        forces=((0.2, 0.0, 0.0), (-0.2, 0.0, 0.0)),
+        stress_kbar=(10.0, 20.0, 30.0, 40.0, 50.0, 60.0),
+    )
+    parsed = replace(parsed, configurations=(configuration,))
+    monkeypatch.setattr(dataset_module, "parse_mlab", lambda _path: parsed, raising=False)
+
+    dataset = Dataset()
+    dataset.load_ml_ab(source)
+    atoms = dataset[0]
+
+    assert atoms.get_chemical_symbols() == ["O", "Pt"]
+    assert atoms.get_potential_energy() == pytest.approx(-7.5)
+    assert atoms.get_forces()[0] == pytest.approx((0.2, 0.0, 0.0))
+    assert atoms.get_forces()[1] == pytest.approx((-0.2, 0.0, 0.0))
+    assert atoms.get_stress().tolist() == pytest.approx(
+        [-0.1 * value * GPa for value in (10.0, 20.0, 30.0, 50.0, 60.0, 40.0)]
+    )
+
+
+def test_count_ml_ab_configs_does_not_replace_full_initial_seed_validation(tmp_path):
+    source = tmp_path / "ML_AB"
+    source.write_text(
+        "1.0 Version\n"
+        "**************************************************\n"
+        "The number of configurations\n"
+        "--------------------------------------------------\n"
+        "1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MlabParseError, match="configuration marker"):
+        count_ml_ab_configs(source)

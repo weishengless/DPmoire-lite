@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import re
 from pathlib import Path
 
 import numpy as np
@@ -11,15 +10,21 @@ from ase.io import read as ase_read
 from ase.io import write as ase_write
 from ase.units import GPa
 
+from .mlab import MlabConfiguration, MlabParseError, parse_mlab
 from .outcar import read_outcar_frames
 
 
 def count_ml_ab_configs(path: Path) -> int:
-    with Path(path).open(encoding="utf-8") as infile:
-        for line_number, line in enumerate(infile):
-            if line_number == 4:
-                return int(line.split()[0])
-    raise ValueError(f"Could not read ML_AB configuration count from {path}")
+    source_path = Path(path)
+    result = parse_mlab(source_path)
+    if result.status != "complete":
+        raise MlabParseError(
+            source_path,
+            configuration_number=None,
+            block="header",
+            reason="ML_AB configuration count requires a complete source",
+        )
+    return result.declared_count
 
 
 class Dataset:
@@ -44,71 +49,35 @@ class Dataset:
         return str(list(self))
 
     def load_ml_ab(self, path: Path, skip_configs: int = 0) -> None:
-        with Path(path).open(encoding="utf-8") as infile:
-            for line_number, _line in enumerate(infile):
-                if line_number == 4:
-                    break
-            dataset = infile.read()
+        source_path = Path(path)
+        if skip_configs < 0:
+            raise ValueError("skip_configs must be non-negative")
 
-        structures = re.split(r"\n+\s*Configuration num.\s*\d+\n", dataset)
-        structures.pop(0)
-
-        for structure in structures[skip_configs:]:
-            parts = re.split(r"=+\n", structure)
-            n_type = int(parts[2].split("\n")[2])
-            n_atom = int(parts[3].split("\n")[2])
-
-            elems = []
-            n_elem = []
-            for line in parts[3].split("\n")[6 : 6 + n_type]:
-                fields = line.split()
-                elems.append(fields[0])
-                n_elem.append(int(fields[1]))
-
-            lattice_vectors = []
-            for line in parts[5].split("\n")[2:5]:
-                lattice_vectors.append([float(value) for value in line.split()])
-
-            positions = []
-            symbols = []
-            elem_index = 0
-            for line in parts[6].split("\n")[2 : 2 + n_atom]:
-                positions.append([float(value) for value in line.split()])
-                if n_elem[elem_index] > 0:
-                    n_elem[elem_index] -= 1
-                else:
-                    elem_index += 1
-                    n_elem[elem_index] -= 1
-                symbols.append(elems[elem_index])
-
-            energy = float(parts[7].split("\n")[2])
-
-            forces = []
-            for line in parts[8].split("\n")[2 : 2 + n_atom]:
-                forces.append([float(value) for value in line.split()])
-
-            stress_lines = parts[9].split("\n")
-            xx_yy_zz = stress_lines[4].split()
-            xy_yz_zx = stress_lines[8].split()
-
-            kbar = 0.1 * GPa
-            stress_tensor = -np.array(
-                [
-                    [float(xx_yy_zz[0]), float(xy_yz_zx[0]), float(xy_yz_zx[2])],
-                    [float(xy_yz_zx[0]), float(xx_yy_zz[1]), float(xy_yz_zx[1])],
-                    [float(xy_yz_zx[2]), float(xy_yz_zx[1]), float(xx_yy_zz[2])],
-                ]
-            ) * kbar
-
-            atoms = Atoms(symbols=symbols, cell=lattice_vectors, positions=positions, pbc=True)
-            atoms.calc = SinglePointCalculator(
-                atoms,
-                energy=energy,
-                forces=forces,
-                stress=stress_tensor,
+        result = parse_mlab(source_path)
+        if result.status != "complete":
+            raise MlabParseError(
+                source_path,
+                configuration_number=result.discarded_configuration_number,
+                block=result.discarded_block or "configuration",
+                reason="Dataset compatibility loader rejects partial ML_AB sources",
             )
-            self.data.append(atoms)
-            self.n_configs += 1
+        if skip_configs > len(result.configurations):
+            raise MlabParseError(
+                source_path,
+                configuration_number=None,
+                block="dataset",
+                reason=(
+                    f"skip_configs {skip_configs} exceeds complete configuration count "
+                    f"{len(result.configurations)}"
+                ),
+            )
+
+        converted = [
+            _atoms_from_mlab_configuration(configuration)
+            for configuration in result.configurations[skip_configs:]
+        ]
+        self.data.extend(converted)
+        self.n_configs += len(converted)
 
     def load_outcar(self, path: Path, freq: int) -> None:
         if freq <= 0:
@@ -143,3 +112,33 @@ class Dataset:
 
     def save_extxyz(self, path: Path) -> None:
         ase_write(Path(path), self.data, format="extxyz")
+
+
+def _atoms_from_mlab_configuration(configuration: MlabConfiguration) -> Atoms:
+    symbols = [
+        element
+        for element, count in zip(configuration.elements, configuration.counts)
+        for _ in range(count)
+    ]
+    xx, yy, zz, xy, yz, zx = configuration.stress_kbar
+    stress_tensor = -np.array(
+        [
+            [xx, xy, zx],
+            [xy, yy, yz],
+            [zx, yz, zz],
+        ]
+    ) * (0.1 * GPa)
+
+    atoms = Atoms(
+        symbols=symbols,
+        cell=configuration.lattice,
+        positions=configuration.positions,
+        pbc=True,
+    )
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=configuration.energy,
+        forces=configuration.forces,
+        stress=stress_tensor,
+    )
+    return atoms
