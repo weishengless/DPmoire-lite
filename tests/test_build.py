@@ -365,7 +365,7 @@ def test_stage1_fails_for_unconverged_relaxation(tmp_path):
         run_build(config, wait=False)
 
 
-def test_stage1_preflight_reports_all_failures_without_mutating_existing_md(tmp_path):
+def test_stage1_preflight_reports_all_failures_without_creating_md(tmp_path):
     config = write_build_config(
         tmp_path,
         stage=1,
@@ -381,11 +381,6 @@ def test_stage1_preflight_reports_all_failures_without_mutating_existing_md(tmp_
     unconverged.mkdir(parents=True, exist_ok=True)
     write_vasp(unconverged / "CONTCAR", atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
     (unconverged / "OUTCAR").write_text("not there yet\n", encoding="utf-8")
-    existing_md = work / "md" / "0_0"
-    existing_md.mkdir(parents=True, exist_ok=True)
-    marker = existing_md / "marker.txt"
-    marker.write_text("keep me here", encoding="utf-8")
-
     with pytest.raises(RuntimeError) as exc_info:
         run_build(config, wait=False)
 
@@ -394,9 +389,7 @@ def test_stage1_preflight_reports_all_failures_without_mutating_existing_md(tmp_
     assert "rlx/1_0: Relaxation did not converge" in message
     assert "init_mlff/ML_ABN: missing required MLFF file" in message
     assert "init_mlff/ML_FFN: missing required MLFF file" in message
-    assert existing_md.is_dir()
-    assert marker.read_text(encoding="utf-8") == "keep me here"
-    assert not any(path.name.startswith("0_0.") for path in (work / "md").iterdir())
+    assert not (work / "md").exists()
 
 
 def test_stage1_expands_primitive_relaxation_when_sc_rlx_is_false(tmp_path):

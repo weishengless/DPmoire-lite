@@ -31,6 +31,39 @@ from .structures import StructureHandler, generate_stackings, rewrite_contcar_as
 VASP_RELAXATION_CONVERGED_PHRASE = "reached required accuracy - stopping structural energy minimisation"
 
 
+def _stage0_target_stages(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
+    targets = []
+    if config.init_mlff:
+        targets.append(("init_mlff", stage_dir(config.work_dir, "init_mlff")))
+    if config.do_relaxation:
+        targets.append(("rlx", stage_dir(config.work_dir, "rlx")))
+    if config.twist_val:
+        targets.append(("validation", stage_dir(config.work_dir, "validation")))
+    return targets
+
+
+def _stage1_target_stages(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
+    return [("md", stage_dir(config.work_dir, "md"))]
+
+
+def _check_target_stages_absent(config: DPmoireLiteConfig, targets: list[tuple[str, Path]]) -> None:
+    conflicts = [(stage, path) for stage, path in targets if path.exists()]
+    if not conflicts:
+        return
+
+    details = "\n".join(
+        f"- {stage} ({relative_to_workdir(config.work_dir, path)}) already exists"
+        for stage, path in conflicts
+    )
+    raise RuntimeError(
+        "Build target conflict(s):\n"
+        f"{details}\n"
+        "DPmoire-lite does not rebuild stages in place. "
+        "Delete the listed stage directories and rerun the build. "
+        "No files were modified."
+    )
+
+
 def run_build(config_path: Path, wait: bool = False) -> None:
     config = load_config(config_path)
     config.validate_build_mode(wait)
@@ -44,6 +77,7 @@ def run_build(config_path: Path, wait: bool = False) -> None:
 
 def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     config.validate_build_mode(wait)
+    _check_target_stages_absent(config, _stage0_target_stages(config))
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -73,6 +107,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
 
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
     config.validate_build_mode(wait)
+    _check_target_stages_absent(config, _stage1_target_stages(config))
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +127,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
     targets = [md_dir / f"{i}_{j}" for i, j in stackings]
     if config.include_monolayer_md:
         targets.extend([md_dir / "top_layer", md_dir / "bot_layer"])
-    backups = _backup_targets(config.work_dir, "md", targets, timestamp)
+    backups = []
 
     directories = []
     init_mlff_dir = config.work_dir / "init_mlff"
@@ -239,7 +274,7 @@ def _build_init_mlff(
     wait: bool,
 ) -> None:
     init_dir = stage_dir(config.work_dir, "init_mlff")
-    backups = _backup_targets(config.work_dir, "init_mlff", [init_dir], timestamp)
+    backups = []
     init_dir.mkdir(parents=True, exist_ok=True)
     write_supercell_poscar(config.input_dir / "bot_layer.poscar", init_dir / "POSCAR", config.sc)
     atoms = structures.read_atoms(init_dir / "POSCAR")
@@ -273,7 +308,7 @@ def _build_relaxations(
 ) -> None:
     rlx_dir = stage_dir(config.work_dir, "rlx")
     targets = [rlx_dir / f"{i}_{j}" for i, j in stackings]
-    backups = _backup_targets(config.work_dir, "rlx", targets, timestamp)
+    backups = []
     directories = []
     for i, j in stackings:
         target = rlx_dir / f"{i}_{j}"
@@ -313,7 +348,7 @@ def _build_validation(
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     directories = [validation_dir / angle for angle in angles]
-    backups = _backup_targets(config.work_dir, "validation", directories, timestamp)
+    backups = []
     for angle, atoms in zip(angles, atoms_list, strict=True):
         target = validation_dir / angle
         target.mkdir(parents=True, exist_ok=True)
