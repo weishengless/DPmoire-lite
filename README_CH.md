@@ -68,7 +68,7 @@ python -m pip install .
 
 `stage: 1` 在 `md/` 下生成 MD 目录。它会在写入任何 MD 目录前检查弛豫输出是否完整并收敛。当 `vasp_ml: true` 时，它还会要求 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN` 存在，并把它们作为 `ML_AB` 和 `ML_FF` 分发到每个 MD 目录中。
 
-`stage: all` 是自动提交并等待的工作流。它要求同时设置 `submit: true` 并使用 `DPmoireLite build config.yaml --wait`，因为 stage1 依赖已经完成的 stage0 输出。在 `stage: all` 中，DPmoire-lite 会等待 init MLFF 和弛豫这条主依赖链、启用时的 validation 作业，以及最终 MD 作业。这些提交都会走同一个 DPmoire-lite 轮询循环。
+`stage: all` 当前暂时不可用，因为 Slurm 终态校验和失败传播尚不可靠。请分别使用 `submit: false` 生成 Stage0 和 Stage1，手动提交，并在生成下一阶段前检查上一阶段的输出。
 
 validation 输出独立于 MD 时间线：stage1 不会使用 validation 结果，validation 数据也只会在用户显式运行以下命令时收集：
 
@@ -78,16 +78,16 @@ DPmoireLite collect config.yaml --stage validation
 
 ## 提交语义
 
-`submit: false` 只生成计算目录。
+`submit: false` 只生成计算目录，也是当前推荐的工作流。请手动提交生成的目录、检查输出，然后再生成下一阶段。
 
-`submit: true` 但不加 `--wait` 时，会生成目录、提交当前 stage 请求的所有作业，然后退出。在这个模式下，进程不会持续轮询 Slurm，因此无法执行 `n_nodes` 节流和 `auto_resub` 重提逻辑。
+`submit: true` 但不加 `--wait` 时，会生成目录、提交当前 stage 请求的作业，然后退出。这个 fire-and-forget 模式只保证 `sbatch` 调用成功，不保证作业最终成功，也不会自动推进依赖阶段。进程不会持续轮询 Slurm，因此无法执行 `n_nodes` 节流或 `auto_resub`。
 
-`stage: all`、`submit: true` 并加上 `--wait` 时，DPmoire-lite 会运行完整的自动数据集流程，并在轮询循环中最多保持 `n_nodes` 个活跃 Slurm 作业。这个节流覆盖 init MLFF、弛豫、validation 和最终 MD 提交。活跃作业包括 pending、running、suspended 以及 held/requeue hold 状态，因此被 hold 的作业会继续占用一个槽位，直到 Slurm 报告终止状态。如果 `auto_resub: true`，失败作业会按计算目录最多重提一次。
+Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`stage: all` 在所有模式下都不可用。因此，在 submitted wait 关闭期间，`auto_resub` 不应被视为可用于生产。
 
 初始 MLFF 流程是显式设计的：
 
 - 手动模式：stage0 会创建第一步 `init_mlff` 作业；如果 `submit: true` 但不加 `--wait`，只会提交这第一步 init 作业。stage0 仍会继续生成并可选提交已经启用的弛豫或 validation 目录。用户完成 `ML_ABN` 和 `ML_FFN` 准备后，stage1 再使用这些文件。
-- 自动模式：`stage: all`、`submit: true` 和 `--wait` 会在生成 stage1 前跑完两步 init MLFF 依赖链。
+- 当前必须在检查前一阶段输出后，手动完成第二步 init MLFF 和 Stage0 到 Stage1 的切换。
 
 ## 数据收集语义
 
@@ -120,10 +120,10 @@ DPmoireLite collect config.yaml --stage validation
 | `script_dir` | 路径 | 存放提交脚本的目录。 |
 | `input_dir` | 路径 | 存放单层 POSCAR、INCAR 模板和可选 `vdw_kernel.bindat` 的目录。 |
 | `work_dir` | 路径 | 生成 stage、manifest、备份目录和数据集文件的根目录。 |
-| `n_nodes` | 正整数 | DPmoire-lite `--wait` 轮询模式中最多保持的活跃 Slurm 作业数。`stage: all`、`submit: true` 和 `--wait` 会把它用于 init MLFF、弛豫、validation 和最终 MD 提交。非等待模式会提交所有请求的作业后退出。 |
-| `stage` | `0`、`1` 或 `all` | 构建阶段。`0` 生成 init、rlx 和 validation 目录；`1` 从完成的弛豫输出生成 MD 目录；`all` 运行自动依赖链。 |
+| `n_nodes` | 正整数 | 为 DPmoire-lite 等待模式节流预留。submitted `--wait` 当前关闭；非等待模式提交请求的作业后退出，不执行节流。 |
+| `stage` | `0`、`1` 或 `all` | 构建阶段。`0` 生成 init、rlx 和 validation 目录；`1` 从完成的弛豫输出生成 MD 目录；`all` 当前暂时不可用。 |
 | `submit` | 布尔值 | `false` 只生成目录；`true` 会用 Slurm 提交生成的目录。 |
-| `auto_resub` | 布尔值 | 在 `--wait` 模式下，对失败 Slurm 作业按计算目录最多重提一次。非等待模式忽略。 |
+| `auto_resub` | 布尔值 | 为 submitted wait 工作流预留；在该工作流关闭期间不具备生产可用性。非等待模式忽略。 |
 | `vasp_ml` | 布尔值 | 是否使用 VASP MLFF 工作流。stage1 会分发 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN`；MD 收集会读取 `ML_ABN` 而不是 OUTCAR。 |
 | `outcar_collect_freq` | 正整数 | 弛豫和非 ML MD 的 OUTCAR 采样间隔。validation 始终使用 1。VASP-ML MD 收集读取 `ML_ABN`，不受此项影响。 |
 | `do_relaxation` | 布尔值 | stage0 是否生成 `rlx/` 下的弛豫目录。 |
@@ -153,7 +153,6 @@ DPmoireLite collect config.yaml --stage validation
 ```bash
 DPmoireLite init-example my_case
 DPmoireLite build config.yaml
-DPmoireLite build config.yaml --wait
 DPmoireLite collect config.yaml --stage rlx
 DPmoireLite collect config.yaml --stage md
 DPmoireLite collect config.yaml --stage validation

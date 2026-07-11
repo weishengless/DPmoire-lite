@@ -6,8 +6,10 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import yaml
 
 from dpmoire_lite.cli import main
+from dpmoire_lite.config import ConfigError
 
 
 @contextmanager
@@ -43,6 +45,34 @@ def test_collect_requires_stage(capsys):
         assert exc.code != 0
     captured = capsys.readouterr()
     assert "--stage" in captured.err
+
+
+def test_build_help_marks_wait_temporarily_disabled_for_submitted_workflows(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["build", "--help"])
+
+    assert exc_info.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.lower().split())
+    assert "temporarily disabled" in help_text
+    assert "submit: true" in help_text
+    assert "stage: all is unavailable" in help_text
+
+
+def test_build_error_recommends_manual_submission(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    example_config = repo_root / "src" / "dpmoire_lite" / "example" / "config.yaml"
+    data = yaml.safe_load(example_config.read_text(encoding="utf-8"))
+    data["stage"] = 0
+    data["submit"] = True
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc_info:
+        main(["build", str(config_path), "--wait"])
+
+    message = str(exc_info.value)
+    assert "submit: false" in message
+    assert "manually" in message
 
 
 def test_init_example_copies_bundled_template():

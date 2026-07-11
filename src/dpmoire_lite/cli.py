@@ -32,7 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = subparsers.add_parser("build", help="Generate and optionally submit calculation folders")
     build.add_argument("config", help="Path to config.yaml")
-    build.add_argument("--wait", action="store_true", help="Wait for submitted Slurm jobs to finish")
+    build.add_argument(
+        "--wait",
+        action="store_true",
+        help="Temporarily disabled with submit: true; stage: all is unavailable",
+    )
 
     collect = subparsers.add_parser("collect", help="Collect a dataset from completed calculations")
     collect.add_argument("config", help="Path to config.yaml")

@@ -74,13 +74,7 @@ DPmoireLite build config.yaml
 
 当 `submit: true` 但不加 `--wait` 时，对于 init MLFF 流程只会提交第一步 init 作业。第二步 init MLFF 留给用户手动处理。stage0 仍会继续生成，并在启用时提交同一个配置中的弛豫和 validation 目录。
 
-等待路径：
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-当 `submit: true` 且加 `--wait` 时，DPmoire-lite 会等待第一步 init MLFF 完成，将 `ML_ABN` 重命名为 `ML_AB`、`ML_FFN` 重命名为 `ML_FF`，再用 top-layer 超胞替换 `POSCAR`，提交第二步 init MLFF，并等待第二步完成。
+submitted `--wait` 当前暂时关闭。第一步 init 作业完成后，请检查输出，手动准备并提交第二步 init MLFF，并在进入 Stage1 前确认 `ML_ABN` 和 `ML_FFN`。
 
 ## 4. 弛豫网格
 
@@ -114,19 +108,7 @@ sc: [3, 2]  # 矩形超胞
 DPmoireLite build config.yaml
 ```
 
-在这个模式下，进程不会继续轮询 Slurm，因此无法执行 `n_nodes` 节流，也无法执行 `auto_resub`。
-
-加 `--wait` 时，DPmoire-lite 会轮询 Slurm：
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-在这个模式下：
-
-- DPmoire-lite 轮询循环中最多保持 `n_nodes` 个活跃作业；
-- `auto_resub: true` 会对失败作业按计算目录最多重提一次；
-- stage0 会等待它提交的 init、rlx 和 validation 作业。
+这个 fire-and-forget 路径只保证 `sbatch` 调用成功，不保证作业最终成功，也不会自动推进依赖阶段。进程不会继续轮询 Slurm，因此无法执行 `n_nodes` 节流或 `auto_resub`。submitted `--wait` 当前暂时关闭，所以 `auto_resub` 不具备生产可用性。
 
 ## 6. Stage1：生成 MD 计算
 
@@ -162,34 +144,11 @@ stage1 是严格检查的。在写入 MD 目录之前，它会检查所有必需
 - `md/top_layer`
 - `md/bot_layer`
 
-## 7. 自动 `stage: all`
+## 7. 已关闭的 `stage: all`
 
-`stage: all` 会自动运行依赖链。它要求：
+由于 Slurm 终态校验和失败传播尚不可靠，`stage: all` 在所有 submit/wait 组合下都暂时不可用，也没有隐藏绕过方式。
 
-```yaml
-stage: all
-submit: true
-```
-
-并且必须使用：
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-工作流顺序是：
-
-1. 生成并提交 `init_mlff/`；
-2. 等待第一步 init MLFF 完成；
-3. 准备、提交并等待第二步 init MLFF；
-4. 生成并提交弛豫目录；
-5. 等待弛豫目录完成；
-6. 如果 `twist_val: true`，生成、提交并等待 validation 目录；
-7. 生成、提交并等待 MD 目录。
-
-在 `stage: all` 中，`n_nodes` 节流和 `auto_resub` 重提会覆盖自动链条里的每个等待提交：init MLFF、弛豫、validation 和最终 MD。validation 输出不是 stage1 的输入，但当 `twist_val: true` 时，validation 作业仍会被等待和节流。
-
-只有当同一台机器和同一个调度系统能连续运行整个依赖链时，才建议使用 `stage: all`。对于多集群或手动分段计算，建议分别使用 `stage: 0` 和 `stage: 1`。
+请使用 `stage: 0` 和 `submit: false` 生成目录，手动分发和提交，并检查 init MLFF、弛豫以及可选 validation 输出。只有检查通过后，才使用 `stage: 1` 和 `submit: false` 生成 MD 目录，再手动提交并检查 MD 输出。
 
 ## 8. Validation 时间线
 

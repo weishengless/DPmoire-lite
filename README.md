@@ -84,11 +84,10 @@ before writing any MD folder. When `vasp_ml: true`, it also requires
 `init_mlff/ML_ABN` and `init_mlff/ML_FFN`, then distributes them as `ML_AB` and
 `ML_FF` into each MD folder.
 
-`stage: all` is an automated submit-and-wait workflow. It requires both
-`submit: true` and `DPmoireLite build config.yaml --wait`, because stage1 needs
-completed stage0 outputs. In `stage: all`, DPmoire-lite waits for the init MLFF
-and relaxation dependency chain, validation jobs when enabled, and final MD jobs.
-Those submissions all use the same DPmoire-lite polling loop.
+`stage: all` is temporarily unavailable because Slurm terminal-state validation
+and failure propagation are not yet reliable. Generate Stage0 and Stage1
+separately with `submit: false`, submit them manually, and inspect their outputs
+before generating the next stage.
 
 Validation outputs are independent of the MD timeline: stage1 does not consume
 validation results, and validation data is collected only when the user
@@ -100,19 +99,19 @@ DPmoireLite collect config.yaml --stage validation
 
 ## Submission Semantics
 
-`submit: false` only generates folders.
+`submit: false` only generates folders and is the recommended workflow. Submit
+the generated folders manually, inspect their outputs, and only then generate
+the next stage.
 
 `submit: true` without `--wait` generates folders, submits all jobs requested by
-the current stage, and exits. In this mode `n_nodes` and `auto_resub` cannot be
-enforced because the process does not keep polling Slurm.
+the current stage, and exits. This fire-and-forget mode guarantees only that the
+`sbatch` invocation succeeded; it does not guarantee final job success or advance
+dependent stages. `n_nodes` throttling and `auto_resub` are unavailable because
+the process does not keep polling Slurm.
 
-`stage: all`, `submit: true`, and `--wait` run the full automatic dataset
-workflow with DPmoire-lite-side throttling. The polling loop keeps at most
-`n_nodes` active Slurm jobs across init MLFF, relaxation, validation, and final
-MD submissions. Active jobs include pending, running, suspended, and held/requeue
-hold states, so a held job continues to occupy a slot until Slurm reports a
-terminal state. If `auto_resub: true`, failed Slurm jobs are resubmitted at most
-once per calculation directory.
+`submit: true` with `--wait` is temporarily disabled for Stage0 and Stage1, and
+`stage: all` is unavailable in every mode. Consequently, `auto_resub` is not a
+production-ready feature while submitted wait remains disabled.
 
 The initial MLFF workflow is intentionally explicit:
 
@@ -121,8 +120,8 @@ The initial MLFF workflow is intentionally explicit:
   generate and optionally submit any enabled relaxation or validation folders.
   After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use those
   files.
-- Automated mode: `stage: all`, `submit: true`, and `--wait` run the two-step
-  init MLFF dependency chain before generating stage1.
+- The second init MLFF step and the Stage0-to-Stage1 transition must currently be
+  completed manually after inspecting the preceding outputs.
 
 ## Collection Semantics
 
@@ -162,10 +161,10 @@ rejected.
 | `script_dir` | path | Directory containing prepared submit scripts. |
 | `input_dir` | path | Directory containing layer POSCAR files, INCAR templates, and optional `vdw_kernel.bindat`. |
 | `work_dir` | path | Root output directory for generated stages, manifests, backups, and collected datasets. |
-| `n_nodes` | positive int | Maximum number of active Slurm jobs in DPmoire-lite `--wait` polling mode. `stage: all`, `submit: true`, and `--wait` apply it across init MLFF, relaxation, validation, and final MD submissions. Non-wait mode submits all requested jobs and exits. |
-| `stage` | `0`, `1`, or `all` | Build stage. `0` generates init, relaxation, and validation folders. `1` generates MD folders from completed relaxation outputs. `all` runs the automated dependency chain. |
+| `n_nodes` | positive int | Reserved for DPmoire-lite wait-mode throttling. Submitted `--wait` is temporarily disabled; non-wait mode submits requested jobs and exits without throttling. |
+| `stage` | `0`, `1`, or `all` | Build stage. `0` generates init, relaxation, and validation folders. `1` generates MD folders from completed relaxation outputs. `all` is temporarily unavailable. |
 | `submit` | bool | If `false`, only generate folders. If `true`, submit generated folders with Slurm. |
-| `auto_resub` | bool | In `--wait` mode, resubmit failed Slurm jobs once per calculation directory. Ignored in non-wait mode. |
+| `auto_resub` | bool | Reserved for submitted wait workflows and not production-ready while those workflows are disabled. Ignored in non-wait mode. |
 | `vasp_ml` | bool | Use VASP MLFF workflow for MD. Stage1 distributes `init_mlff/ML_ABN` and `init_mlff/ML_FFN`; MD collection reads `ML_ABN` instead of OUTCAR. |
 | `outcar_collect_freq` | positive int | OUTCAR sampling stride for relaxation and non-ML MD collection. Validation always uses stride 1. VASP-ML MD collection reads `ML_ABN`, so this tag does not affect that path. |
 | `do_relaxation` | bool | In stage0, generate relaxation folders under `rlx/`. |
@@ -197,7 +196,6 @@ the stage child being regenerated, not to the whole `work_dir`.
 ```bash
 DPmoireLite init-example my_case
 DPmoireLite build config.yaml
-DPmoireLite build config.yaml --wait
 DPmoireLite collect config.yaml --stage rlx
 DPmoireLite collect config.yaml --stage md
 DPmoireLite collect config.yaml --stage validation

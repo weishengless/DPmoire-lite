@@ -88,15 +88,9 @@ The second init MLFF step is left to the user. Stage0 still continues to
 generate and, when enabled, submit relaxation and validation folders from the
 same configuration.
 
-Wait path:
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-with `submit: true` waits for the first init MLFF job, renames `ML_ABN` to
-`ML_AB` and `ML_FFN` to `ML_FF`, replaces `POSCAR` with the top-layer supercell,
-submits the second init MLFF job, and waits for that second job to finish.
+Submitted `--wait` is temporarily disabled. After the first init job, inspect
+its outputs, prepare the second init MLFF step manually, submit it manually, and
+confirm `ML_ABN` and `ML_FFN` before proceeding to Stage1.
 
 ## 4. Relaxation Grid
 
@@ -135,20 +129,11 @@ stage and exits:
 DPmoireLite build config.yaml
 ```
 
-In this mode, `n_nodes` and `auto_resub` cannot be enforced because the process
-does not keep polling Slurm.
-
-With `--wait`, DPmoire-lite keeps polling Slurm:
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-In this mode:
-
-- at most `n_nodes` jobs are active in the DPmoire-lite polling loop;
-- `auto_resub: true` resubmits failed jobs once per calculation directory;
-- stage0 waits for init, relaxation, and validation jobs that it submits.
+This fire-and-forget path guarantees only a successful `sbatch` invocation. It
+does not guarantee final job success or advance dependent stages. `n_nodes`
+throttling and `auto_resub` are unavailable because the process does not keep
+polling Slurm. Submitted `--wait` is temporarily disabled, so `auto_resub` is not
+production-ready.
 
 ## 6. Stage1: Generate MD Calculations
 
@@ -190,39 +175,16 @@ If `include_monolayer_md: true`, stage1 also generates:
 - `md/top_layer`
 - `md/bot_layer`
 
-## 7. Automated `stage: all`
+## 7. Disabled `stage: all`
 
-`stage: all` runs the dependency chain automatically. It requires:
+`stage: all` is temporarily unavailable in every submit/wait combination because
+Slurm terminal-state validation and failure propagation are not yet reliable.
+There is no hidden bypass.
 
-```yaml
-stage: all
-submit: true
-```
-
-and must be launched with:
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-The workflow is:
-
-1. generate and submit `init_mlff/`;
-2. wait for the first init MLFF step;
-3. prepare, submit, and wait for the second init MLFF step;
-4. generate and submit relaxation folders;
-5. wait for relaxation folders to finish;
-6. generate, submit, and wait for validation folders if `twist_val: true`;
-7. generate, submit, and wait for MD folders.
-
-In `stage: all`, `n_nodes` throttling and `auto_resub` apply to every waited
-submission in the automatic chain: init MLFF, relaxation, validation, and final
-MD. Validation outputs are not inputs to stage1, but validation jobs are still
-waited and throttled when `twist_val: true`.
-
-Use `stage: all` only when the same machine and scheduler can run the dependency
-chain continuously. For multi-cluster or manually staged workflows, use
-`stage: 0` and `stage: 1` separately.
+Use `stage: 0` with `submit: false`, distribute and submit the generated folders
+manually, and inspect the init MLFF, relaxation, and optional validation outputs.
+Only after those checks should you use `stage: 1` with `submit: false`, submit the
+MD folders manually, and inspect their outputs.
 
 ## 8. Validation Timeline
 
