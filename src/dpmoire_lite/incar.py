@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 CONTROLLED_TAGS = frozenset({"ENCUT", "ML_RCUT1", "ML_RCUT2"})
 SUPPORTED_TRUE_SPELLINGS = frozenset({"T", ".TRUE.", ".T.", "TRUE"})
+_SEMICOLON_CLEANUP_MARKER = "\0DPmoire-lite-clean-semicolons\0"
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,19 @@ class IncarAnalysis:
 
 
 @dataclass(frozen=True)
+class IncarRenderDiagnostic:
+    tag: str
+    kind: str
+    locations: tuple[SourceLocation, ...]
+
+
+@dataclass(frozen=True)
+class IncarRenderResult:
+    text: str
+    diagnostics: tuple[IncarRenderDiagnostic, ...]
+
+
+@dataclass(frozen=True)
 class IncarDocument:
     source_text: str
     source_name: str
@@ -155,6 +169,128 @@ class IncarDocument:
             document=self,
             duplicate_diagnostics=tuple(diagnostics),
         )
+
+    def render(self, controlled_values: dict[str, object]) -> IncarRenderResult:
+        analysis = self.analyze()
+        if analysis.blocking_conflicts:
+            analysis.effective_value(analysis.blocking_conflicts[0].tag)
+
+        values = {
+            tag.upper(): str(value)
+            for tag, value in controlled_values.items()
+            if tag.upper() in CONTROLLED_TAGS
+        }
+        statements_by_assignment = {
+            id(statement.assignment): statement
+            for statement in self.statements
+            if statement.assignment is not None
+        }
+        edits: list[tuple[int, int, str]] = []
+        comments_by_line_start: dict[int, list[str]] = {}
+        semicolon_cleanup_line_starts: set[int] = set()
+        diagnostics: list[IncarRenderDiagnostic] = []
+
+        for duplicate in analysis.repairable_warnings:
+            kind = (
+                "controlled_duplicate"
+                if duplicate.tag in CONTROLLED_TAGS
+                else "equal_user_duplicate"
+            )
+            diagnostics.append(
+                IncarRenderDiagnostic(
+                    tag=duplicate.tag,
+                    kind=kind,
+                    locations=tuple(
+                        assignment.location for assignment in duplicate.assignments
+                    ),
+                )
+            )
+
+            assignments_to_disable = duplicate.assignments
+            if duplicate.tag not in CONTROLLED_TAGS:
+                assignments_to_disable = duplicate.assignments[1:]
+
+            for assignment in assignments_to_disable:
+                statement = statements_by_assignment[id(assignment)]
+                line_start = self.source_text.rfind("\n", 0, statement.start) + 1
+                comments_by_line_start.setdefault(line_start, []).append(
+                    "# DPmoire-lite disabled duplicate: "
+                    f"{assignment.raw.strip()}\n"
+                )
+                line_end = self.source_text.find("\n", line_start)
+                if line_end == -1:
+                    line_end = len(self.source_text)
+                if ";" in self.source_text[line_start:line_end]:
+                    semicolon_cleanup_line_starts.add(line_start)
+                replacement = ""
+                if (
+                    duplicate.tag in CONTROLLED_TAGS
+                    and assignment is duplicate.assignments[-1]
+                    and duplicate.tag in values
+                ):
+                    replacement = (
+                        f"{duplicate.tag} = {values[duplicate.tag]}  "
+                        "# DPmoire-lite generated value"
+                    )
+                edits.append((statement.start, statement.end, replacement))
+
+        duplicate_tags = {item.tag for item in analysis.duplicate_diagnostics}
+        for tag, value in values.items():
+            assignments = self.assignments_for(tag)
+            if len(assignments) == 1 and tag not in duplicate_tags:
+                statement = statements_by_assignment[id(assignments[0])]
+                replacement = f"{tag} = {value}"
+                if (
+                    statement.end < len(self.source_text)
+                    and self.source_text[statement.end] in {"#", "!"}
+                ):
+                    replacement += " "
+                edits.append((statement.start, statement.end, replacement))
+
+        missing_tags = []
+        if "ENCUT" in values and not self.assignments_for("ENCUT"):
+            missing_tags.append("ENCUT")
+        missing_tags.extend(
+            tag
+            for tag in analysis.missing_ml_rcut_tags
+            if tag in values
+        )
+
+        for tag in missing_tags:
+            diagnostics.append(
+                IncarRenderDiagnostic(
+                    tag=tag,
+                    kind="missing_controlled_tag",
+                    locations=(),
+                )
+            )
+
+        insertion_edits = [
+            (
+                line_start,
+                line_start,
+                "".join(comments)
+                + (
+                    _SEMICOLON_CLEANUP_MARKER
+                    if line_start in semicolon_cleanup_line_starts
+                    else ""
+                ),
+            )
+            for line_start, comments in comments_by_line_start.items()
+        ]
+        rendered = _apply_edits(self.source_text, insertion_edits + edits)
+        rendered = _clean_empty_semicolon_segments(rendered)
+
+        if missing_tags:
+            if rendered and not rendered.endswith(("\n", "\r")):
+                rendered += "\n"
+            for tag in missing_tags:
+                rendered += (
+                    f"{tag} = {values[tag]}  "
+                    "# DPmoire-lite generated; missing from source template\n"
+                )
+
+        return IncarRenderResult(text=rendered, diagnostics=tuple(diagnostics))
 
 
 def parse_incar(source_text: str, *, source_name: str = "<memory>") -> IncarDocument:
@@ -288,3 +424,30 @@ def _location(source_text: str, offset: int) -> SourceLocation:
     line = source_text.count("\n", 0, offset) + 1
     last_newline = source_text.rfind("\n", 0, offset)
     return SourceLocation(line=line, column=offset - last_newline)
+
+
+def _apply_edits(source_text: str, edits: list[tuple[int, int, str]]) -> str:
+    output = []
+    cursor = 0
+    for start, end, replacement in sorted(
+        edits, key=lambda item: (item[0], item[1] != item[0])
+    ):
+        output.append(source_text[cursor:start])
+        output.append(replacement)
+        cursor = max(cursor, end)
+    output.append(source_text[cursor:])
+    return "".join(output)
+
+
+def _clean_empty_semicolon_segments(text: str) -> str:
+    cleaned_lines = []
+    for line in text.splitlines(keepends=True):
+        if _SEMICOLON_CLEANUP_MARKER not in line:
+            cleaned_lines.append(line)
+            continue
+        line = line.replace(_SEMICOLON_CLEANUP_MARKER, "", 1)
+        line = re.sub(r"^([ \t]*);[ \t]*", r"\1", line)
+        line = re.sub(r";[ \t]*;", ";", line)
+        line = re.sub(r";[ \t]*(?=([#!]|\r?$))", " ", line)
+        cleaned_lines.append(line)
+    return "".join(cleaned_lines)

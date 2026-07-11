@@ -145,3 +145,103 @@ def test_ml_lmlff_effective_value_controls_missing_rcut_policy(
     analysis = parse_incar(f"ML_LMLFF={ml_lmlff}\n").analyze()
 
     assert analysis.missing_ml_rcut_tags == expected_missing
+
+
+def test_render_updates_no_space_and_lowercase_controlled_tags():
+    document = parse_incar("encut=400\nml_rcut1 = 6\nML_RCUT2=6\n")
+
+    result = document.render({"ENCUT": "600", "ML_RCUT1": "7.2", "ML_RCUT2": "7.2"})
+
+    assert result.text == "ENCUT = 600\nML_RCUT1 = 7.2\nML_RCUT2 = 7.2\n"
+
+
+def test_render_preserves_unrelated_semicolon_statements():
+    document = parse_incar("ENCUT=400; ISMEAR=-1; SIGMA=0.2;\n")
+
+    result = document.render({"ENCUT": "600"})
+
+    assert result.text == "ENCUT = 600; ISMEAR=-1; SIGMA=0.2;\n"
+
+
+def test_render_disables_all_controlled_duplicates_and_emits_one_value():
+    document = parse_incar("ENCUT=400  # old\nPREC=Accurate\nencut=520  # newer\n")
+
+    result = document.render({"ENCUT": "600"})
+
+    rendered = parse_incar(result.text)
+    assert [item.value for item in rendered.assignments_for("ENCUT")] == ["600"]
+    assert "# DPmoire-lite disabled duplicate: ENCUT=400" in result.text
+    assert "# DPmoire-lite disabled duplicate: encut=520" in result.text
+    assert "ENCUT = 600  # DPmoire-lite generated value" in result.text
+    assert [item.tag for item in result.diagnostics] == ["ENCUT"]
+
+
+def test_render_disables_later_equal_user_duplicates():
+    document = parse_incar("ISMEAR=-1\nISMEAR = -1\nENCUT=400\n")
+
+    result = document.render({"ENCUT": "600"})
+
+    rendered = parse_incar(result.text)
+    assert len(rendered.assignments_for("ISMEAR")) == 1
+    assert "# DPmoire-lite disabled duplicate: ISMEAR = -1" in result.text
+    assert [item.tag for item in result.diagnostics] == ["ISMEAR"]
+
+
+def test_render_refuses_conflicting_user_duplicates():
+    document = parse_incar("ISMEAR=-1\nISMEAR=0\nENCUT=400\n", source_name="input/INCAR")
+
+    with pytest.raises(ValueError, match="ISMEAR"):
+        document.render({"ENCUT": "600"})
+
+
+def test_render_adds_missing_encut_with_annotation():
+    result = parse_incar("PREC=Accurate\n").render({"ENCUT": "600"})
+
+    assert result.text == (
+        "PREC=Accurate\n"
+        "ENCUT = 600  # DPmoire-lite generated; missing from source template\n"
+    )
+    assert [(item.tag, item.kind) for item in result.diagnostics] == [
+        ("ENCUT", "missing_controlled_tag")
+    ]
+
+
+def test_render_adds_only_missing_rcut_when_mlff_is_enabled():
+    document = parse_incar("ML_LMLFF=T\nENCUT=400\nML_RCUT1=6\n")
+
+    result = document.render({"ENCUT": "600", "ML_RCUT1": "7.2", "ML_RCUT2": "7.2"})
+
+    rendered = parse_incar(result.text)
+    assert [item.value for item in rendered.assignments_for("ML_RCUT1")] == ["7.2"]
+    assert [item.value for item in rendered.assignments_for("ML_RCUT2")] == ["7.2"]
+    assert "ML_RCUT2 = 7.2  # DPmoire-lite generated; missing from source template" in result.text
+    assert "ML_RCUT1 = 7.2  # DPmoire-lite generated; missing" not in result.text
+
+
+def test_render_does_not_add_rcut_when_mlff_is_disabled():
+    document = parse_incar("ML_LMLFF=F\nENCUT=400\n")
+
+    result = document.render({"ENCUT": "600", "ML_RCUT1": "7.2", "ML_RCUT2": "7.2"})
+
+    assert "ML_RCUT1" not in result.text
+    assert "ML_RCUT2" not in result.text
+
+
+def test_render_never_rewrites_langevin_gamma():
+    document = parse_incar("LANGEVIN_GAMMA = 10 20 30\nENCUT=400\n")
+
+    result = document.render({"ENCUT": "600", "LANGEVIN_GAMMA": "1 1 1"})
+
+    assert "LANGEVIN_GAMMA = 10 20 30" in result.text
+    assert "LANGEVIN_GAMMA = 1 1 1" not in result.text
+
+
+def test_render_preserves_source_comments_and_statement_order():
+    source = "# header\nPREC=Accurate\nENCUT=400 # cutoff note\nISMEAR=-1\n"
+
+    result = parse_incar(source).render({"ENCUT": "600"})
+
+    assert "# header" in result.text
+    assert "# cutoff note" in result.text
+    assert result.text.index("PREC=Accurate") < result.text.index("ENCUT = 600")
+    assert result.text.index("ENCUT = 600") < result.text.index("ISMEAR=-1")
