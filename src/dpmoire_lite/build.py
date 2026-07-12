@@ -33,7 +33,7 @@ from .inputs import (
 from .manifest import Manifest, write_manifest
 from .mlab import seed_prefix_identity
 from .paths import backup_existing_directory, relative_to_workdir
-from .provenance import structure_identity
+from . import provenance as provenance_module
 from .slurm import SlurmJob, SlurmRunner
 from .structures import StructureHandler, supercell_matrix
 
@@ -193,14 +193,22 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
     directories = []
     md_anchor_records: dict[str, list[dict[str, object]]] = {}
     init_mlff_dir = config.work_dir / "init_mlff"
-    if preflight.trusted_sc_rlx is None:
+    provenance = preflight.provenance
+    if provenance is None or provenance.trusted_sc_rlx is None:
         md_sc = None if config.sc_rlx else config.sc
     else:
-        md_sc = None if preflight.trusted_sc_rlx else preflight.trusted_sc
-    for relaxation, target in zip(
-        preflight.relaxations,
-        relaxation_output_dirs,
-        strict=True,
+        md_sc = None if provenance.trusted_sc_rlx else provenance.trusted_sc
+    validated_anchor_indices = (
+        provenance.validated_anchor_indices
+        if config.preserve_grid_shift_md and provenance is not None
+        else ()
+    )
+    for relaxation_index, (relaxation, target) in enumerate(
+        zip(
+            preflight.relaxations,
+            relaxation_output_dirs,
+            strict=True,
+        )
     ):
         i, j = relaxation.stacking
         target.mkdir(parents=True, exist_ok=True)
@@ -209,6 +217,11 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             target / "POSCAR",
             md_sc,
             preserve_constraints=config.preserve_grid_shift_md,
+            validated_anchor_indices=(
+                validated_anchor_indices[relaxation_index]
+                if config.preserve_grid_shift_md
+                else None
+            ),
         )
         if anchor_records is not None:
             md_anchor_records[relative_to_workdir(config.work_dir, target)] = anchor_records
@@ -280,22 +293,13 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
             stackings=[[i, j] for i, j in stackings],
-            structure_provenance=_stage1_structure_provenance(preflight),
+            structure_provenance=provenance_module.stage1_structure_provenance(
+                preflight.provenance
+            ),
             grid_shift_anchors=md_anchor_records,
             mlff_seed=mlff_seed,
         ),
     )
-
-
-def _stage1_structure_provenance(preflight) -> dict[str, object]:
-    if preflight.provenance_kind is None:
-        return {}
-    return {
-        "mode": preflight.provenance_kind,
-        "sc_rlx": preflight.trusted_sc_rlx,
-        "sc": list(preflight.trusted_sc) if preflight.trusted_sc is not None else None,
-        "evidence": preflight.provenance_evidence,
-    }
 
 
 def _stage1_mlff_seed_identity(
@@ -482,11 +486,11 @@ def _build_relaxations(
         atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
         write_vasp(target / "POSCAR", atoms=atoms)
         relative_path = relative_to_workdir(config.work_dir, target / "POSCAR")
-        identity = _structure_identity_record(target / "POSCAR", relative_path)
+        identity = provenance_module.structure_identity_record(target / "POSCAR", relative_path)
         rlx_poscars[relative_path] = identity
         top_indexes, bot_indexes = structures.find_layer_idx(atoms)
         anchor_relative_path = relative_to_workdir(config.work_dir, target)
-        grid_shift_anchors[anchor_relative_path] = _grid_shift_anchor_record(
+        grid_shift_anchors[anchor_relative_path] = provenance_module.stage0_grid_shift_anchor_record(
             target / "POSCAR",
             identity,
             top_indexes,
@@ -503,7 +507,7 @@ def _build_relaxations(
         )
         directories.append(target)
     jobs = _submit_dirs(config, runner, directories, wait)
-    provenance = _stage0_structure_provenance(
+    provenance = provenance_module.stage0_structure_provenance(
         config,
         structures,
         stackings,
@@ -613,11 +617,15 @@ def _write_md_poscar(
     sc: tuple[int, int] | None,
     *,
     preserve_constraints: bool = False,
+    validated_anchor_indices: tuple[int, int] | None = None,
 ) -> tuple[Atoms, list[dict[str, object]] | None]:
     atoms = source_atoms.copy()
-    source_anchor_indices = (
-        _constraint_indices(atoms) if preserve_constraints else []
-    )
+    if preserve_constraints:
+        if validated_anchor_indices is None:
+            raise RuntimeError("Stage1 preservation requires validated provenance anchor indices")
+        source_anchor_indices = [int(index) for index in validated_anchor_indices]
+    else:
+        source_anchor_indices = []
     _normalize_stage1_structure(atoms, clear_constraints=not preserve_constraints)
     if sc is None:
         if not preserve_constraints:
@@ -695,14 +703,6 @@ def _write_md_poscar(
     return atoms_sc, anchor_records
 
 
-def _constraint_indices(atoms: Atoms) -> list[int]:
-    indices = []
-    for constraint in atoms.constraints:
-        values = np.asarray(getattr(constraint, "index", []), dtype=int).reshape(-1)
-        indices.extend(int(value) for value in values)
-    return sorted(set(indices))
-
-
 def _write_vasp_inputs(
     config: DPmoireLiteConfig,
     output_dir: Path,
@@ -771,109 +771,4 @@ def _config_summary(config: DPmoireLiteConfig) -> dict[str, object]:
         "k_mesh": config.k_mesh,
         "encut_factor": config.encut_factor,
         "r_cut": config.r_cut,
-    }
-
-
-def _structure_identity_record(
-    path: Path,
-    relative_path: str,
-    atoms: Atoms | None = None,
-) -> dict[str, object]:
-    identity = structure_identity(path, atoms)
-    return {
-        "path": relative_path,
-        "sha256": identity.sha256,
-        "atom_count": identity.atom_count,
-        "ordered_elements": list(identity.ordered_elements),
-        "composition": dict(identity.composition),
-        "cell": [list(row) for row in identity.cell],
-    }
-
-
-def _grid_shift_anchor_record(
-    path: Path,
-    identity: dict[str, object],
-    top_indexes: list[int],
-    bot_indexes: list[int],
-) -> dict[str, object]:
-    atoms = read_vasp(path)
-    entries: dict[int, list[bool]] = {}
-    for constraint in atoms.constraints:
-        indexes = np.asarray(getattr(constraint, "index", []), dtype=int).reshape(-1)
-        mask_value = getattr(constraint, "mask", None)
-        if indexes.size == 0 or mask_value is None:
-            raise RuntimeError(
-                f"Stage0 grid-shift constraints in {path} cannot be represented by fixed_masks"
-            )
-        mask = np.asarray(mask_value, dtype=bool).reshape(-1)
-        if mask.shape != (3,) or mask.tolist() != [True, True, False]:
-            raise RuntimeError(
-                f"Stage0 grid-shift constraints in {path} must use fixed mask [true, true, false]"
-            )
-        for index in indexes:
-            index = int(index)
-            if index < 0 or index >= len(atoms) or index in entries:
-                raise RuntimeError(
-                    f"Stage0 grid-shift constraints in {path} contain invalid or duplicate anchor indices"
-                )
-            entries[index] = mask.tolist()
-
-    top_anchors = sorted(set(top_indexes).intersection(entries))
-    bot_anchors = sorted(set(bot_indexes).intersection(entries))
-    if len(entries) != 2 or len(top_anchors) != 1 or len(bot_anchors) != 1:
-        raise RuntimeError(
-            f"Stage0 grid-shift constraints in {path} must contain exactly one top and one bottom anchor"
-        )
-
-    top_index = top_anchors[0]
-    bottom_index = bot_anchors[0]
-    return {
-        "atom_count": int(identity["atom_count"]),
-        "poscar_sha256": str(identity["sha256"]),
-        "top_index": top_index,
-        "bottom_index": bottom_index,
-        "fixed_masks": {
-            top_index: entries[top_index],
-            bottom_index: entries[bottom_index],
-        },
-    }
-
-
-def _stage0_structure_provenance(
-    config: DPmoireLiteConfig,
-    structures: StructureHandler,
-    stackings: list[tuple[int, int]],
-    rlx_poscars: dict[str, dict[str, object]],
-) -> dict[str, object]:
-    if structures.top_atoms is None or structures.bot_atoms is None:
-        raise RuntimeError("Stage0 structure provenance requires loaded top and bottom inputs")
-
-    summary = _config_summary(config)
-    input_paths = {
-        "input/top_layer.poscar": (config.input_dir / "top_layer.poscar", structures.top_atoms),
-        "input/bot_layer.poscar": (config.input_dir / "bot_layer.poscar", structures.bot_atoms),
-    }
-    inputs = {
-        relative_path: _structure_identity_record(path, relative_path, atoms)
-        for relative_path, (path, atoms) in input_paths.items()
-    }
-    stacking_values = [[int(i), int(j)] for i, j in stackings]
-    return {
-        "schema": "dpmoire-lite.structure-provenance.v1",
-        "stage": 0,
-        "sc_rlx": bool(config.sc_rlx),
-        "sc": list(config.sc),
-        "sc_semantics": (
-            "stage0_relaxation_supercell"
-            if config.sc_rlx
-            else "stage0_relaxation_primitive"
-        ),
-        "n_sectors": list(config.n_sectors),
-        "symm_reduce": bool(config.symm_reduce),
-        "d": config.d,
-        "d_mode": config.d_mode,
-        "d_reference": summary["d_reference"],
-        "stackings": stacking_values,
-        "inputs": inputs,
-        "rlx_poscars": rlx_poscars,
     }

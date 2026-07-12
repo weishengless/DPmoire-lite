@@ -1,5 +1,7 @@
 import hashlib
+from pathlib import Path
 import warnings
+from types import SimpleNamespace
 
 from ase import Atoms
 from ase.build import make_supercell
@@ -8,13 +10,17 @@ import numpy as np
 import pytest
 import yaml
 
+import dpmoire_lite.build_preflight as build_preflight_module
+import dpmoire_lite.provenance as provenance_module
 from dpmoire_lite.build import run_build
+from dpmoire_lite.config import load_config
 from dpmoire_lite.manifest import read_manifest
 from dpmoire_lite.provenance import (
     infer_inplane_supercell_relation,
     structure_identity,
     structure_identity_differences,
 )
+from dpmoire_lite.structures import StructureHandler
 
 from test_build import write_build_config
 
@@ -104,6 +110,35 @@ def prepare_legacy_case(tmp_path, *, stage0_overrides=None, stage1_overrides=Non
     stackings = read_rlx_manifest(work).stackings
     write_legacy_relaxation_manifest(work, stackings)
     return switch_to_stage1(config, **(stage1_overrides or {}))
+
+
+def _stage1_provenance_inputs(config_path):
+    config = load_config(config_path)
+    structures = StructureHandler(
+        config.input_dir,
+        config.work_dir,
+        config.n_sectors,
+        config.d,
+        config.d_mode,
+        config.d_reference,
+    )
+    manifest_result = read_manifest(config.work_dir, "rlx")
+    if manifest_result.manifest is not None:
+        raw_stackings = manifest_result.manifest.stackings
+    else:
+        assert manifest_result.raw_data is not None
+        raw_stackings = manifest_result.raw_data["stackings"]
+    stackings = tuple((int(i), int(j)) for i, j in raw_stackings)
+    relaxation_atoms = {
+        stacking: read_vasp(
+            config.work_dir
+            / "rlx"
+            / f"{stacking[0]}_{stacking[1]}"
+            / "CONTCAR"
+        )
+        for stacking in stackings
+    }
+    return config, manifest_result, stackings, structures, relaxation_atoms
 
 
 def rewrite_poscar_cell(path, cell):
@@ -659,3 +694,201 @@ def test_md_manifest_uses_relaxation_manifest_stackings_only(tmp_path):
     assert manifest.directories == ["md/0_0", "md/1_0"]
     assert manifest.structure_provenance["mode"] == "legacy_inference"
     assert manifest.structure_provenance["evidence"]["stackings"] == [[0, 0], [1, 0]]
+
+
+def test_provenance_module_builds_stage0_structure_and_anchor_records(tmp_path):
+    identity_builder = getattr(provenance_module, "structure_identity_record", None)
+    anchor_builder = getattr(
+        provenance_module, "stage0_grid_shift_anchor_record", None
+    )
+    provenance_builder = getattr(
+        provenance_module, "stage0_structure_provenance", None
+    )
+    assert callable(identity_builder)
+    assert callable(anchor_builder)
+    assert callable(provenance_builder)
+
+    config_path = make_stage0_config(tmp_path, n_sectors=[1, 1])
+    config = load_config(config_path)
+    structures = StructureHandler(
+        config.input_dir,
+        config.work_dir,
+        config.n_sectors,
+        config.d,
+        config.d_mode,
+        config.d_reference,
+    )
+    run_build(config_path, wait=False)
+
+    manifest = read_rlx_manifest(tmp_path / "work")
+    relative_path = "rlx/0_0/POSCAR"
+    poscar = tmp_path / "work" / relative_path
+    identity = identity_builder(poscar, relative_path)
+    assert identity == manifest.structure_provenance["rlx_poscars"][relative_path]
+
+    manifest_anchor = manifest.grid_shift_anchors["rlx/0_0"]
+    anchor = anchor_builder(
+        poscar,
+        identity,
+        [manifest_anchor["top_index"]],
+        [manifest_anchor["bottom_index"]],
+    )
+    assert anchor == manifest_anchor
+
+    provenance = provenance_builder(
+        config,
+        structures,
+        ((0, 0),),
+        {relative_path: identity},
+    )
+    assert provenance == manifest.structure_provenance
+
+
+def test_provenance_module_returns_strict_stage1_result_and_issues(tmp_path):
+    result_type = getattr(provenance_module, "Stage1ProvenanceResult", None)
+    validator = getattr(provenance_module, "validate_stage1_provenance", None)
+    assert result_type is not None
+    assert callable(validator)
+
+    config_path = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc_rlx": True, "sc": [1, 1]},
+        stage1_overrides={"preserve_grid_shift_md": True},
+    )
+    config, manifest_result, stackings, structures, relaxation_atoms = (
+        _stage1_provenance_inputs(config_path)
+    )
+    result = validator(
+        config,
+        manifest_result,
+        stackings,
+        structures,
+        relaxation_atoms,
+    )
+
+    assert isinstance(result, result_type)
+    assert result.kind == "strict"
+    assert result.trusted_sc_rlx is True
+    assert result.trusted_sc == (1, 1)
+    assert result.evidence == (
+        ("manifest", "rlx/manifest.yaml"),
+        ("schema", "dpmoire-lite.structure-provenance.v1"),
+        ("stackings", stackings),
+    )
+    assert result.issues == ()
+    record = manifest_result.manifest.grid_shift_anchors["rlx/0_0"]
+    assert result.validated_anchor_indices == (
+        (record["top_index"], record["bottom_index"]),
+    )
+
+
+def test_provenance_module_returns_legacy_stage1_result_and_issues(tmp_path):
+    result_type = getattr(provenance_module, "Stage1ProvenanceResult", None)
+    issue_type = getattr(provenance_module, "ProvenanceIssue", None)
+    validator = getattr(provenance_module, "validate_stage1_provenance", None)
+    assert result_type is not None
+    assert issue_type is not None
+    assert callable(validator)
+
+    config_path = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc_rlx": False, "sc": [1, 1]},
+    )
+    config, manifest_result, stackings, structures, relaxation_atoms = (
+        _stage1_provenance_inputs(config_path)
+    )
+    result = validator(
+        config,
+        manifest_result,
+        stackings,
+        structures,
+        relaxation_atoms,
+    )
+
+    assert isinstance(result, result_type)
+    assert result.kind == "legacy_inference"
+    assert result.trusted_sc_rlx is False
+    assert result.trusted_sc == (1, 1)
+    assert result.evidence == (
+        ("manifest", "rlx/manifest.yaml"),
+        ("method", "atom_count_composition_cell"),
+        ("stackings", stackings),
+    )
+    assert result.validated_anchor_indices == ()
+    assert len(result.issues) == 1
+    issue = result.issues[0]
+    assert isinstance(issue, issue_type)
+    assert issue.severity == "warning"
+    assert issue.path == Path("rlx") / "manifest.yaml"
+    assert issue.reason == (
+        "Legacy relaxation provenance was inferred from atom count, composition, "
+        "and in-plane cell; Stage1 is proceeding without strict Stage0 provenance."
+    )
+
+
+def test_build_preflight_delegates_stage1_provenance_validation(tmp_path, monkeypatch):
+    config_path = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc_rlx": False, "sc": [1, 1]},
+    )
+    config = load_config(config_path)
+    fake_result = SimpleNamespace(
+        kind="strict",
+        trusted_sc_rlx=False,
+        trusted_sc=(1, 1),
+        evidence=(),
+        validated_anchor_indices=(),
+        issues=(),
+    )
+    calls = []
+
+    def fake_validate(*args, **kwargs):
+        calls.append((args, kwargs))
+        return fake_result
+
+    monkeypatch.setattr(
+        provenance_module,
+        "validate_stage1_provenance",
+        fake_validate,
+        raising=False,
+    )
+
+    result = build_preflight_module.preflight_stage1(config)
+
+    assert len(calls) == 1
+    assert getattr(result, "provenance", None) is fake_result
+
+
+def test_build_uses_provenance_module_for_stage0_manifest_evidence(
+    tmp_path, monkeypatch
+):
+    builders = {
+        "structure_identity_record": getattr(
+            provenance_module, "structure_identity_record", None
+        ),
+        "stage0_grid_shift_anchor_record": getattr(
+            provenance_module, "stage0_grid_shift_anchor_record", None
+        ),
+        "stage0_structure_provenance": getattr(
+            provenance_module, "stage0_structure_provenance", None
+        ),
+    }
+    assert all(callable(builder) for builder in builders.values())
+
+    calls = {name: 0 for name in builders}
+    for name, builder in builders.items():
+        def spy(*args, _name=name, _builder=builder, **kwargs):
+            calls[_name] += 1
+            return _builder(*args, **kwargs)
+
+        monkeypatch.setattr(provenance_module, name, spy, raising=False)
+
+    config_path = make_stage0_config(tmp_path, n_sectors=[1, 1])
+    run_build(config_path, wait=False)
+
+    assert calls["structure_identity_record"] > 0
+    assert calls["stage0_grid_shift_anchor_record"] == 1
+    assert calls["stage0_structure_provenance"] == 1
+    manifest = read_rlx_manifest(tmp_path / "work")
+    assert manifest.structure_provenance["stackings"] == [[0, 0]]
+    assert manifest.grid_shift_anchors["rlx/0_0"]
