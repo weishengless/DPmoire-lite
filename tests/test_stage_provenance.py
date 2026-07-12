@@ -5,6 +5,7 @@ from ase.build import make_supercell
 from ase.io.vasp import read_vasp, write_vasp
 import numpy as np
 import pytest
+import yaml
 
 from dpmoire_lite.build import run_build
 from dpmoire_lite.manifest import read_manifest
@@ -43,6 +44,40 @@ def read_rlx_manifest(work):
     result = read_manifest(work, "rlx")
     assert result.manifest is not None
     return result.manifest
+
+
+def complete_stage0_relaxations(work):
+    for poscar in sorted((work / "rlx").glob("*/POSCAR")):
+        target = poscar.parent
+        (target / "CONTCAR").write_bytes(poscar.read_bytes())
+        (target / "OUTCAR").write_text(
+            "reached required accuracy - stopping structural energy minimisation\n",
+            encoding="utf-8",
+        )
+
+
+def switch_to_stage1(config_path, **overrides):
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    data.update(
+        {
+            "stage": 1,
+            "init_mlff": False,
+            "do_relaxation": True,
+            "twist_val": False,
+            "vasp_ml": False,
+            "include_monolayer_md": False,
+        }
+    )
+    data.update(overrides)
+    config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return config_path
+
+
+def prepare_stage1_case(tmp_path, *, stage0_overrides=None, stage1_overrides=None):
+    config = make_stage0_config(tmp_path, **(stage0_overrides or {}))
+    run_build(config, wait=False)
+    complete_stage0_relaxations(tmp_path / "work")
+    return switch_to_stage1(config, **(stage1_overrides or {}))
 
 
 def test_structure_identity_records_hash_count_composition_and_cell(tmp_path):
@@ -223,3 +258,120 @@ def test_stage0_manifest_records_sc_only_with_clear_stage0_semantics(tmp_path):
     assert provenance["sc"] == [2, 3]
     assert provenance["sc_rlx"] is True
     assert provenance["sc_semantics"] == "stage0_relaxation_supercell"
+
+
+def test_stage1_uses_manifest_sc_rlx_instead_of_current_config(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+        stage1_overrides={"sc_rlx": False},
+    )
+
+    with pytest.raises(RuntimeError, match="sc_rlx"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_rejects_sc_rlx_change_before_md_mutation(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc_rlx": False},
+        stage1_overrides={"sc_rlx": True},
+    )
+
+    with pytest.raises(RuntimeError, match="sc_rlx"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_rejects_sc_change_when_stage0_was_supercell(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+        stage1_overrides={"sc": [1, 1]},
+    )
+
+    with pytest.raises(RuntimeError, match="sc"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_allows_md_sc_change_when_stage0_was_primitive(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [1, 1], "sc_rlx": False},
+        stage1_overrides={"sc": [2, 3], "sc_rlx": False},
+    )
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert len(atoms) == 12
+
+
+@pytest.mark.parametrize("name", ["top_layer.poscar", "bot_layer.poscar"])
+def test_stage1_rejects_changed_top_or_bottom_input(tmp_path, name):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1]},
+    )
+    path = tmp_path / "input" / name
+    path.write_text(path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=name):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_rejects_changed_rlx_poscar(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1]},
+    )
+    path = tmp_path / "work" / "rlx" / "0_0" / "POSCAR"
+    path.write_bytes(path.read_bytes() + b"\n")
+
+    with pytest.raises(RuntimeError, match="rlx/0_0/POSCAR"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_rejects_contcar_atom_or_composition_mismatch(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1]},
+    )
+    write_vasp(
+        tmp_path / "work" / "rlx" / "0_0" / "CONTCAR",
+        atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True),
+        direct=True,
+    )
+
+    with pytest.raises(RuntimeError, match="CONTCAR"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_aggregates_provenance_failures_across_stackings(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [2, 1]},
+    )
+    input_path = tmp_path / "input" / "top_layer.poscar"
+    input_path.write_text(input_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    poscar = tmp_path / "work" / "rlx" / "1_0" / "POSCAR"
+    poscar.write_bytes(poscar.read_bytes() + b"\n")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value)
+    assert "input/top_layer.poscar" in message
+    assert "rlx/1_0/POSCAR" in message
+    assert not (tmp_path / "work" / "md").exists()
