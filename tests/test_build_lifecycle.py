@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 import dpmoire_lite.build as build_module
@@ -188,3 +190,183 @@ def test_target_conflict_does_not_construct_runner(monkeypatch, tmp_path):
 
     _assert_explicit_delete_message(exc_info.value, "rlx")
     assert runner_constructed is False
+
+
+def test_stage0_preflight_aggregates_incar_potcar_and_script_errors(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+    )
+    input_dir = tmp_path / "input"
+    (input_dir / "init_INCAR").write_text(
+        'ENCUT=400\nSYSTEM = "unfinished\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "potcars" / "H" / "POTCAR").unlink()
+    (tmp_path / "scripts" / "DFT_script.sh").unlink()
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value)
+    assert "init_INCAR" in message
+    assert "POTCAR" in message
+    assert "DFT_script.sh" in message
+    assert not (tmp_path / "work").exists()
+
+
+def test_stage0_preflight_aggregates_input_structure_and_vdw_errors(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+    )
+    input_dir = tmp_path / "input"
+    (input_dir / "init_INCAR").write_text(
+        "ENCUT=400\nLUSE_VDW=T\nML_RCUT1=6\nML_RCUT2=6\n",
+        encoding="utf-8",
+    )
+    (input_dir / "top_layer.poscar").write_text("not a POSCAR\n", encoding="utf-8")
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value)
+    assert "top_layer.poscar" in message
+    assert "vdw_kernel.bindat" in message
+    assert not (tmp_path / "work").exists()
+
+
+def test_stage1_preflight_aggregates_all_relaxation_failures(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[2, 1],
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work, name="0_0")
+    (work / "rlx" / "0_0" / "OUTCAR").unlink()
+    second = work / "rlx" / "1_0"
+    second.mkdir(parents=True)
+    (second / "CONTCAR").write_text("not a POSCAR\n", encoding="utf-8")
+    (second / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "input" / "MD_INCAR").unlink()
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value)
+    assert "rlx/0_0" in message
+    assert "Missing OUTCAR" in message
+    assert "rlx/1_0" in message
+    assert "CONTCAR" in message
+    assert "MD_INCAR" in message
+    assert not (work / "md").exists()
+
+
+def test_stage1_preflight_fully_parses_initial_seed(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        vasp_ml=True,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+    init_mlff = work / "init_mlff"
+    init_mlff.mkdir(parents=True)
+    (init_mlff / "ML_ABN").write_text(
+        "1.0 Version\n"
+        "**************************************************\n"
+        "The number of configurations\n"
+        "--------------------------------------------------\n"
+        "1\n",
+        encoding="utf-8",
+    )
+    (init_mlff / "ML_FFN").write_text("ffn", encoding="utf-8")
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value).lower()
+    assert "ml_abn" in message
+    assert "configuration marker" in message
+    assert not (work / "md").exists()
+
+
+def test_preflight_failure_does_not_create_workdir_when_absent(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+    )
+    (tmp_path / "potcars" / "H" / "POTCAR").unlink()
+    (tmp_path / "scripts" / "DFT_script.sh").unlink()
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value)
+    assert "POTCAR" in message
+    assert "DFT_script.sh" in message
+    assert not (tmp_path / "work").exists()
+
+
+def test_preflight_failure_does_not_write_normalized_input_sibling(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+    )
+    input_dir = tmp_path / "input"
+    top_layer = input_dir / "top_layer.poscar"
+    top_layer.write_text(
+        top_layer.read_text(encoding="utf-8").replace("\nH\n1\n", "\nI1\n1\n"),
+        encoding="utf-8",
+    )
+    (tmp_path / "scripts" / "DFT_script.sh").unlink()
+
+    with pytest.raises(Exception):
+        run_build(config, wait=False)
+
+    assert not any(path.name.endswith(".normalized") for path in input_dir.iterdir())
+    assert not (tmp_path / "work").exists()
+
+
+def test_preflight_warnings_are_deduplicated_per_template_and_tag(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        n_sectors=[2, 1],
+    )
+    (tmp_path / "input" / "rlx_INCAR").write_text(
+        "ENCUT=400\nENCUT=500\nML_RCUT1=6\nML_RCUT2=6\n",
+        encoding="utf-8",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run_build(config, wait=False)
+
+    matching = [
+        item
+        for item in caught
+        if "ENCUT" in str(item.message) and "rlx_INCAR" in str(item.message)
+    ]
+    assert len(matching) == 1
+    assert (tmp_path / "work" / "rlx" / "0_0").is_dir()
+    assert (tmp_path / "work" / "rlx" / "1_0").is_dir()
