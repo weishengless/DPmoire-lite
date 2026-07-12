@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from ase.build import make_supercell, sort
 from ase import Atoms
+from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
 from .build_preflight import preflight_stage0, preflight_stage1
@@ -134,6 +135,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
     backups = []
 
     directories = []
+    md_anchor_records: dict[str, list[dict[str, object]]] = {}
     init_mlff_dir = config.work_dir / "init_mlff"
     if preflight.trusted_sc_rlx is None:
         md_sc = None if config.sc_rlx else config.sc
@@ -143,12 +145,14 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         source_dir = config.work_dir / "rlx" / f"{i}_{j}"
         target = md_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
-        _write_md_poscar(
+        anchor_records = _write_md_poscar(
             source_dir / "CONTCAR",
             target / "POSCAR",
             md_sc,
             preserve_constraints=config.preserve_grid_shift_md,
         )
+        if anchor_records is not None:
+            md_anchor_records[relative_to_workdir(config.work_dir, target)] = anchor_records
         atoms = structures.read_atoms(target / "POSCAR")
         _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
         if config.vasp_ml:
@@ -192,6 +196,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             jobs=[job.as_dict() for job in jobs],
             stackings=[[i, j] for i, j in stackings],
             structure_provenance=_stage1_structure_provenance(preflight),
+            grid_shift_anchors=md_anchor_records,
         ),
     )
 
@@ -516,21 +521,94 @@ def _write_md_poscar(
     sc: tuple[int, int] | None,
     *,
     preserve_constraints: bool = False,
-) -> None:
+) -> list[dict[str, object]] | None:
     atoms = read_vasp(contcar)
+    source_anchor_indices = (
+        _constraint_indices(atoms) if preserve_constraints else []
+    )
     _normalize_stage1_structure(atoms, clear_constraints=not preserve_constraints)
     if sc is None:
         if not preserve_constraints:
             _assert_stage1_structure_cleared(atoms)
         poscar.parent.mkdir(parents=True, exist_ok=True)
         write_vasp(poscar, atoms=atoms, direct=True, sort=False)
-        return
+        if not preserve_constraints:
+            return None
+        return [
+            {
+                "index": index,
+                "source_index": index,
+                "image_translation": [0, 0, 0],
+            }
+            for index in source_anchor_indices
+        ]
 
-    atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(sc)))
+    source_atom_count = len(atoms)
+    atoms.set_array("source_index", np.arange(source_atom_count, dtype=int))
+    atoms_expanded = make_supercell(prim=atoms, P=supercell_matrix(sc))
+    translations = np.asarray(
+        [
+            [translation_x, translation_y, 0]
+            for translation_x in range(sc[0])
+            for translation_y in range(sc[1])
+        ],
+        dtype=int,
+    )
+    atoms_expanded.set_array(
+        "image_translation",
+        np.repeat(translations, source_atom_count, axis=0),
+    )
+    atoms_sc = sort(atoms_expanded)
     if not preserve_constraints:
         _assert_stage1_structure_cleared(atoms_sc)
+        del atoms_sc.arrays["source_index"]
+        del atoms_sc.arrays["image_translation"]
+        poscar.parent.mkdir(parents=True, exist_ok=True)
+        write_vasp(poscar, atoms=atoms_sc, direct=True, sort=False)
+        return None
+
+    source_indices = np.asarray(atoms_sc.arrays["source_index"], dtype=int)
+    image_translations = np.asarray(atoms_sc.arrays["image_translation"], dtype=int)
+    zero_translation = np.all(image_translations == [0, 0, 0], axis=1)
+    anchor_indices = []
+    anchor_records = []
+    for source_index in source_anchor_indices:
+        matches = np.flatnonzero((source_indices == source_index) & zero_translation)
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Stage1 expansion could not recover a unique zero-translation "
+                f"anchor for source index {source_index}"
+            )
+        final_index = int(matches[0])
+        anchor_indices.append(final_index)
+        anchor_records.append(
+            {
+                "index": final_index,
+                "source_index": int(source_index),
+                "image_translation": image_translations[final_index].tolist(),
+            }
+        )
+
+    atoms_sc.set_constraint(
+        FixedLine(
+            anchor_indices,
+            direction=atoms_sc.cell.array[2] / atoms_sc.cell.lengths()[2],
+        )
+    )
+    del atoms_sc.arrays["source_index"]
+    del atoms_sc.arrays["image_translation"]
     poscar.parent.mkdir(parents=True, exist_ok=True)
     write_vasp(poscar, atoms=atoms_sc, direct=True, sort=False)
+    anchor_records.sort(key=lambda record: int(record["index"]))
+    return anchor_records
+
+
+def _constraint_indices(atoms: Atoms) -> list[int]:
+    indices = []
+    for constraint in atoms.constraints:
+        values = np.asarray(getattr(constraint, "index", []), dtype=int).reshape(-1)
+        indices.extend(int(value) for value in values)
+    return sorted(set(indices))
 
 
 def _write_vasp_inputs(

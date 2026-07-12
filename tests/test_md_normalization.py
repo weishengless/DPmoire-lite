@@ -398,3 +398,197 @@ def test_preserve_validation_failure_leaves_md_absent(tmp_path):
         run_build(config, wait=False)
 
     assert not (tmp_path / "work" / "md").exists()
+
+
+def _prepare_preserve_expansion_stage1(
+    tmp_path,
+    *,
+    sc_rlx,
+    md_sc,
+    mixed_elements=False,
+):
+    stage0_sc = list(md_sc) if sc_rlx else [1, 1]
+    config = write_build_config(
+        tmp_path,
+        n_sectors=[1, 1],
+        sc_rlx=sc_rlx,
+        sc=stage0_sc,
+        include_monolayer_md=False,
+    )
+    if mixed_elements:
+        (tmp_path / "input" / "top_layer.poscar").write_text(
+            """He
+1.0
+  4.0 0.0 0.0
+  0.0 4.0 0.0
+  0.0 0.0 12.0
+He
+1
+Direct
+  0.0 0.0 0.25
+""",
+            encoding="utf-8",
+        )
+        (tmp_path / "potcars" / "He").mkdir()
+        (tmp_path / "potcars" / "He" / "POTCAR").write_text(
+            " ENMAX = 100; \n",
+            encoding="utf-8",
+        )
+
+    run_build(config, wait=False)
+    complete_stage0_relaxations(tmp_path / "work")
+    switch_to_stage1(
+        config,
+        preserve_grid_shift_md=True,
+        sc_rlx=sc_rlx,
+        sc=list(md_sc),
+    )
+    return config
+
+
+def _md_anchor_records(tmp_path):
+    manifest = read_manifest(tmp_path / "work", "md").manifest
+    assert manifest is not None
+    return manifest, manifest.grid_shift_anchors["md/0_0"]
+
+
+def _md_anchor_indices(atoms):
+    return {
+        int(index)
+        for constraint in atoms.constraints
+        for index in np.asarray(constraint.index, dtype=int).reshape(-1)
+    }
+
+
+def _assert_zero_translation_positions(tmp_path, sc, records):
+    source = read_vasp(tmp_path / "work" / "rlx" / "0_0" / "CONTCAR")
+    md = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    source_scaled = source.get_scaled_positions(wrap=True)
+    md_scaled = md.get_scaled_positions(wrap=True)
+    for record in records:
+        source_position = source_scaled[record["source_index"]]
+        expected = np.array(
+            [source_position[0] / sc[0], source_position[1] / sc[1], source_position[2]]
+        )
+        np.testing.assert_allclose(
+            md_scaled[record["index"]],
+            expected,
+            atol=1e-8,
+            rtol=1e-8,
+        )
+
+
+class TestPreserveExpansion:
+    def test_primitive_expansion_keeps_exactly_two_anchors(self, tmp_path):
+        config = _prepare_preserve_expansion_stage1(
+            tmp_path,
+            sc_rlx=False,
+            md_sc=(2, 3),
+        )
+
+        run_build(config, wait=False)
+
+        atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+        assert len(atoms) == 12
+        assert len(_md_anchor_indices(atoms)) == 2
+
+    @pytest.mark.parametrize("md_sc", [(2, 1), (1, 2), (2, 3)])
+    def test_anchor_count_is_independent_of_supercell_area(self, tmp_path, md_sc):
+        config = _prepare_preserve_expansion_stage1(
+            tmp_path,
+            sc_rlx=False,
+            md_sc=md_sc,
+        )
+
+        run_build(config, wait=False)
+
+        atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+        assert len(_md_anchor_indices(atoms)) == 2
+
+    def test_rectangular_expansion_selects_zero_translation_image(self, tmp_path):
+        sc = (1, 2)
+        config = _prepare_preserve_expansion_stage1(
+            tmp_path,
+            sc_rlx=False,
+            md_sc=sc,
+        )
+
+        run_build(config, wait=False)
+
+        _, records = _md_anchor_records(tmp_path)
+        assert {tuple(record["image_translation"]) for record in records} == {
+            (0, 0, 0)
+        }
+        _assert_zero_translation_positions(tmp_path, sc, records)
+
+    def test_source_index_alone_is_not_used_as_unique_identity(self, tmp_path):
+        sc = (2, 3)
+        config = _prepare_preserve_expansion_stage1(
+            tmp_path,
+            sc_rlx=False,
+            md_sc=sc,
+            mixed_elements=True,
+        )
+
+        run_build(config, wait=False)
+
+        _, records = _md_anchor_records(tmp_path)
+        assert len({(record["source_index"], tuple(record["image_translation"])) for record in records}) == 2
+        assert {tuple(record["image_translation"]) for record in records} == {
+            (0, 0, 0)
+        }
+        _assert_zero_translation_positions(tmp_path, sc, records)
+
+    def test_sort_recovers_anchor_by_source_and_translation(self, tmp_path):
+        sc = (2, 1)
+        config = _prepare_preserve_expansion_stage1(
+            tmp_path,
+            sc_rlx=False,
+            md_sc=sc,
+            mixed_elements=True,
+        )
+
+        run_build(config, wait=False)
+
+        manifest, records = _md_anchor_records(tmp_path)
+        atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+        assert {record["index"] for record in records} == _md_anchor_indices(atoms)
+        assert manifest.grid_shift_anchors["md/0_0"] == records
+        _assert_zero_translation_positions(tmp_path, sc, records)
+
+    def test_md_manifest_records_final_source_translation_identity(self, tmp_path):
+        config = _prepare_preserve_expansion_stage1(
+            tmp_path,
+            sc_rlx=False,
+            md_sc=(2, 3),
+        )
+
+        run_build(config, wait=False)
+
+        _, records = _md_anchor_records(tmp_path)
+        assert all(set(record) == {"index", "source_index", "image_translation"} for record in records)
+        assert all(record["image_translation"] == [0, 0, 0] for record in records)
+        assert {record["index"] for record in records} == _md_anchor_indices(
+            read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+        )
+
+    def test_sc_rlx_true_and_false_paths_have_same_anchor_count(self, tmp_path):
+        true_root = tmp_path / "sc-rlx-true"
+        false_root = tmp_path / "sc-rlx-false"
+        true_config = _prepare_preserve_expansion_stage1(
+            true_root,
+            sc_rlx=True,
+            md_sc=(2, 3),
+        )
+        false_config = _prepare_preserve_expansion_stage1(
+            false_root,
+            sc_rlx=False,
+            md_sc=(2, 3),
+        )
+
+        run_build(true_config, wait=False)
+        run_build(false_config, wait=False)
+
+        true_atoms = read_vasp(true_root / "work" / "md" / "0_0" / "POSCAR")
+        false_atoms = read_vasp(false_root / "work" / "md" / "0_0" / "POSCAR")
+        assert len(_md_anchor_indices(true_atoms)) == len(_md_anchor_indices(false_atoms)) == 2
