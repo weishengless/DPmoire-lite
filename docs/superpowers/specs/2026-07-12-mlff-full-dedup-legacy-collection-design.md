@@ -2,8 +2,7 @@
 
 Date: 2026-07-12
 
-Status: approved section by section in discussion; awaiting review of this written
-specification before implementation-plan changes
+Status: approved and incorporated into authoritative notes and plans.
 
 ## Purpose
 

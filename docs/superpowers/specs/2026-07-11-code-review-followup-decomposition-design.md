@@ -2,7 +2,7 @@
 
 Date: 2026-07-11
 
-Status: approved in discussion; implementation plans and production code are not yet written
+Status: approved; implementation is under way through the approved roadmap.
 
 ## Purpose
 

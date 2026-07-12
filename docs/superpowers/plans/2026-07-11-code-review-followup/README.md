@@ -11,8 +11,12 @@ Approved designs:
 - [`2026-07-12-mlff-full-dedup-legacy-collection-design.md`](../../specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 - [`2026-07-12-code-review-followup-route-correction-and-low-reasoning-execution-design.md`](../../specs/2026-07-12-code-review-followup-route-correction-and-low-reasoning-execution-design.md)
 
-Current legacy execution prompt, scheduled for replacement by Plan 06R Task 1:
-[`LOW-REASONING-EXECUTION-PROMPT.md`](LOW-REASONING-EXECUTION-PROMPT.md)
+Reusable execution prompts:
+
+- Sol planning, capsule, review, and commit:
+  [`ORCHESTRATOR-EXECUTION-PROMPT.md`](ORCHESTRATOR-EXECUTION-PROMPT.md)
+- Luna bounded TDD execution:
+  [`WORKER-EXECUTION-PROMPT.md`](WORKER-EXECUTION-PROMPT.md)
 
 Authoritative requirement index:
 [`docs/code-review-notes/README.md`](../../../code-review-notes/README.md)
@@ -61,11 +65,12 @@ follow-up.
     before every checkpoint commit and every leaf-plan checkpoint. The original
     pre-implementation baseline was 93 passed and 5 skipped; it is historical
     evidence, not the expected count for later runs.
-11. After Plan 06R Task 1, only the high-reasoning orchestrator may choose units,
-    stage, commit, or update active state. A worker returns unstaged changes and
-    evidence for review.
-12. Use one write-capable agent at a time. Parallel agents are limited to
-    independent read-only exploration, tests, or review.
+11. After Plan 06R Task 1, keep two persistent model-specific threads: Sol / Max /
+    Standard plans, issues capsules, reviews, stages, commits, and updates active
+    state; Luna / Max / Standard executes bounded TDD and returns unstaged changes.
+12. Use a serial handoff and one write-capable thread at a time in the shared
+    worktree. Parallel agents are limited to independent read-only exploration,
+    tests, or review.
 
 ## Historical Pre-implementation Repository Gate
 

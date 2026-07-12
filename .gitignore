@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-*/
+/pytest-of-*/
 .pytest_tmp*/
 .tmp_pytest*/
 pytest_tmp*/
@@ -19,3 +20,4 @@ dist/
 .venv/
 uv.lock
 /example-test/
+IMPLEMENTATION-*.local.md

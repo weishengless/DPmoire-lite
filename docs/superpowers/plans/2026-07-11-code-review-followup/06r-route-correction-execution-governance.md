@@ -27,10 +27,11 @@ Done means:
 
 - exactly four scoped `AGENTS.md` files define stable repository, plan,
   production, and test rules;
-- one project-scoped `plan_worker` configuration prefers Luna Max at Standard
-  speed and has an explicit Terra fallback procedure;
-- the worker prompt is no more than 80 physical lines and grants no plan,
-  staging, commit, push, or active-state authority;
+- two persistent threads use a serial handoff in the shared worktree: Sol Max
+  Standard owns planning/review/commit and Luna Max Standard owns bounded TDD;
+- the orchestrator prompt is no more than 120 physical lines and the worker
+  prompt is no more than 80; neither prompt claims it can select its own model;
+- the worker grants no plan, staging, commit, push, or active-state authority;
 - ignored runtime state is no more than 80 physical lines and names one exact
   execution unit and next action;
 - new Stage0 anchor records exist only in top-level `grid_shift_anchors`;
@@ -76,15 +77,17 @@ tests, and return an unstaged diff plus evidence.
 | Task | Execution profile | RED handoff | `standalone_eligible` |
 | --- | --- | --- | --- |
 | 1 Governance bootstrap | orchestrator-only | normal TDD inside root task | false |
-| 2 Manifest/warning contracts | `plan_worker` under orchestrator | mandatory split RED then GREEN | false |
+| 2 Manifest/warning contracts | Luna worker thread under Sol orchestrator | mandatory split RED then GREEN | false |
 | 3 Pure authoritative structure preflight | orchestrator-only | root observes RED | false |
 | 4 Prepared non-structure build inputs | orchestrator-only | root observes RED | false |
-| 5 Provenance ownership restoration | `plan_worker` under orchestrator | split RED then GREEN | false |
+| 5 Provenance ownership restoration | Luna worker thread under Sol orchestrator | split RED then GREEN | false |
 
-One write-capable agent may work in the shared worktree at a time. Read-only
+The normal topology is two persistent threads using a serial handoff in the
+shared worktree. One write-capable thread may work at a time. Model, reasoning,
+and speed are explicit UI selections, not prompt-controlled properties. Read-only
 review agents may run independently, but their output cannot authorize changes.
-The no-write configuration drill does not count toward direct-mode eligibility.
-Only successful Tasks 2 and 5 count; any scope, authority, or TDD-protocol
+The no-write contract drill does not count toward direct-mode eligibility. Only
+successful supervised Tasks 2 and 5 count; any scope, authority, or TDD-protocol
 violation leaves direct lower-cost mode closed.
 
 The orchestrator reads this leaf plan completely. A worker reads only the header
@@ -141,7 +144,7 @@ Create during Task 1:
 - `docs/superpowers/plans/2026-07-11-code-review-followup/AGENTS.md`
 - `src/dpmoire_lite/AGENTS.md`
 - `tests/AGENTS.md`
-- `.codex/agents/plan-worker.toml`
+- `docs/superpowers/plans/2026-07-11-code-review-followup/ORCHESTRATOR-EXECUTION-PROMPT.md`
 - `docs/superpowers/plans/2026-07-11-code-review-followup/WORKER-EXECUTION-PROMPT.md`
 - `tests/test_execution_governance.py`
 - ignored `IMPLEMENTATION-HISTORY.local.md`
@@ -180,12 +183,12 @@ Versioned allowed files:
 
 - `.gitignore`
 - the four `AGENTS.md` paths above
-- `.codex/agents/plan-worker.toml`
 - `tests/test_execution_governance.py`
 - `tests/test_repository_hygiene.py`
-- this roadmap README and the three approved design status headers
-- prompt rename from `LOW-REASONING-EXECUTION-PROMPT.md` to
-  `WORKER-EXECUTION-PROMPT.md`
+- this Plan 06R leaf plan, the roadmap README, the route-design governance body,
+  and the other two approved design status headers
+- remove `LOW-REASONING-EXECUTION-PROMPT.md` and create both
+  `ORCHESTRATOR-EXECUTION-PROMPT.md` and `WORKER-EXECUTION-PROMPT.md`
 
 Local-only allowed files, never staged:
 
@@ -196,15 +199,14 @@ Add failing governance tests:
 
 - `test_exactly_four_scoped_agents_files_exist()`;
 - `test_agents_files_respect_line_caps_and_contain_no_concrete_runtime_state()`;
+- `test_orchestrator_prompt_is_bounded_and_owns_capsule_review_and_commit()`;
 - `test_worker_prompt_is_short_and_denies_commit_and_state_advance()`;
+- `test_two_thread_prompts_define_a_serial_shared_worktree_handoff()`;
 - `test_legacy_low_reasoning_prompt_is_absent()`;
-- `test_plan_worker_uses_an_approved_lightweight_model_without_fast_service()`;
-- `test_plan_worker_instructions_deny_nested_delegation_and_git_authority()`;
+- `test_native_custom_agent_config_is_absent_until_runtime_support_is_proven()`;
+- `test_governance_authorities_define_two_persistent_threads()`;
 - `test_local_implementation_state_pattern_is_repository_ignored()`;
 - `test_versioned_status_headers_do_not_name_a_dynamic_active_plan()`.
-
-The TOML test must use bounded textual assertions compatible with Python 3.10;
-do not add `tomli` or skip the contract when `tomllib` is unavailable.
 
 RED command:
 
@@ -212,8 +214,9 @@ RED command:
 & $python -m pytest tests/test_execution_governance.py tests/test_repository_hygiene.py -q -p no:cacheprovider
 ```
 
-Expected failure: the scoped instructions, project agent, worker prompt, portable
-local-state ignore rule, and normalized status text do not exist.
+Expected failure: the scoped instructions, two reusable prompts, serial-handoff
+contract, portable local-state ignore rule, and normalized status text do not
+exist; the unverified native custom-agent configuration is still present.
 
 Implementation requirements:
 
@@ -228,15 +231,18 @@ Implementation requirements:
    provenance, private-data, platform skip, and external ASE rules.
 5. Each `AGENTS.md` is at most 120 physical lines. None contains a concrete HEAD,
    timestamp, active plan, or current test count.
-6. Rename and rewrite the prompt to at most 80 physical lines. It requires a
-   capsule, reads active state only for agreement, leaves changes unstaged, and
-   denies plan/spec/state edits, staging, commit, push, and nested delegation.
-7. Create `plan-worker.toml` with `name = "plan_worker"`, a narrow description,
-   `model = "gpt-5.6-luna"`, `model_reasoning_effort = "max"`, and explicit
-   worker instructions. Do not set `service_tier`.
-8. If a no-write Codex drill proves Luna unavailable, change only the model to
-   `gpt-5.6-terra`. If `max` is rejected, use the highest supported effort and
-   record the exact verified choice in ignored state. Do not silently fall back.
+6. Create an orchestrator prompt of at most 120 physical lines. It is reusable in
+   a persistent Sol thread and owns planning, copy-ready capsule issuance,
+   complete-diff review, final verification, exact staging, commit, and state
+   advance.
+7. Rewrite the worker prompt to at most 80 physical lines. It is reusable in a
+   persistent Luna thread, requires a capsule, follows RED-GREEN-REFACTOR, reads
+   active state only for agreement, leaves changes unstaged, and denies
+   plan/spec/state edits, staging, commit, push, and nested delegation.
+8. State the launch profiles as external UI choices: Sol / Max / Standard and
+   Luna / Max / Standard, with explicit Terra fallback if Luna is unavailable.
+   Prompt text must not claim to switch or prove a model. Keep native named-agent
+   loading out of the gate until a separate runtime-proven amendment is approved.
 9. Add a repository `.gitignore` rule for `IMPLEMENTATION-*.local.md`; do not rely
    on the current user's global ignore file.
 10. Preserve the existing 360-line status as `IMPLEMENTATION-HISTORY.local.md`.
@@ -248,11 +254,11 @@ Implementation requirements:
     implementation; the full-dedup design is approved and incorporated; this
     route design is approved. Mark `93 passed, 5 skipped` as historical wherever
     retained.
-12. Run a no-write `plan_worker` drill that reads the new bootstrap path, reports
-    Task 2 as the intended next unit, and changes no file. Compare git status and
-    diff before and after. If the current task cannot reload the new custom agent,
-    stop in Task 1 `verify`; a fresh high-reasoning root task resumes the same
-    unit, runs the drill, and only then commits.
+12. Run a no-write worker-contract drill that reads the new bootstrap path,
+    reports Task 2 and its role limits, and changes no file. Compare status,
+    tracked/cached diffs, and governed-file hashes before and after. This drill
+    validates the prompt contract, not the model identity. The first actual Luna
+    UI-selected execution is Task 2's split RED/GREEN calibration.
 
 Local audit commands:
 
@@ -280,7 +286,7 @@ allowed files, and stop.
 
 ## Task 2: Restore Top-level Anchors and the Legacy Warning
 
-Execution profile: `plan_worker` under orchestrator supervision.
+Execution profile: persistent Luna worker thread under Sol orchestrator.
 RED handoff: mandatory split. This is the first worker calibration unit.
 `standalone_eligible: false` because it changes schema and compatibility behavior.
 
@@ -545,7 +551,7 @@ and stop.
 
 ## Task 5: Restore Provenance Module Ownership and Close Plan 06R
 
-Execution profile: `plan_worker` under orchestrator supervision.
+Execution profile: persistent Luna worker thread under Sol orchestrator.
 RED handoff: split RED then GREEN.
 `standalone_eligible: false` because this changes a cross-module ownership API.
 
@@ -642,8 +648,8 @@ status to Plan 07 Task 1 `inspect`, then stop.
 | Plan 06R requirement | Evidence |
 | --- | --- |
 | four progressive `AGENTS.md` layers | Task 1 governance tests and line audit |
-| compact worker prompt and local state | Task 1 tests, ignore audit, no-write drill |
-| Luna/Terra worker model boundary | Task 1 config test and drill |
+| bounded Sol/Luna prompts and local state | Task 1 tests and ignore audit |
+| two-thread serial authority boundary | Task 1 tests and no-write contract drill |
 | top-level-only Stage0 anchors | Task 2 manifest/MD tests |
 | nested-only preservation fails closed | Task 2 MD tests |
 | legacy success warns exactly once | Task 2 provenance tests |
@@ -679,10 +685,11 @@ git ls-files "*IMPLEMENTATION-*.local.md"
 Manual structural audit:
 
 1. Exactly the four named `AGENTS.md` files are tracked, each at most 120 lines.
-2. Worker prompt and ignored active state are each at most 80 lines.
+2. Orchestrator prompt is at most 120 lines; worker prompt and ignored active
+   state are each at most 80 lines.
 3. No ignored status/history file is tracked or staged.
-4. `plan-worker.toml` has one verified approved lightweight model and no Fast
-   service setting.
+4. Both prompts define two persistent threads, external UI-selected Sol/Luna Max
+   Standard profiles, serial handoff, and one write-capable thread at a time.
 5. New relaxation manifests contain top-level anchors and no nested anchor
    collection.
 6. Both successful and failed preflight leave input/work trees unchanged until
