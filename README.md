@@ -170,6 +170,7 @@ rejected.
 | `do_relaxation` | bool | In stage0, generate relaxation folders under `rlx/`. |
 | `init_mlff` | bool | In stage0, generate the initial `init_mlff/` folder. |
 | `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |
+| `preserve_grid_shift_md` | bool | Stage1 defaults to clearing all constraints. If `true`, preserve only DPmoire-lite grid-shift anchors; `F F T` means fixed x/y and movable z. |
 | `n_sectors` | int or `[nx, ny]` | Stacking-shift grid. `9` means `[9, 9]`; `[9, 8]` creates a rectangular grid. |
 | `sc` | int or `[sx, sy]` | Supercell expansion used for MD and, when `sc_rlx: true`, relaxation. `2` means `[2, 2]`. |
 | `d` | number | Distance value interpreted according to `d_mode`. |

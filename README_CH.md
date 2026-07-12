@@ -129,6 +129,7 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 | `do_relaxation` | 布尔值 | stage0 是否生成 `rlx/` 下的弛豫目录。 |
 | `init_mlff` | 布尔值 | stage0 是否生成初始 `init_mlff/` 目录。 |
 | `sc_rlx` | 布尔值 | `true` 表示弛豫超胞堆垛结构；`false` 表示只弛豫 primitive glide structure，并在 stage1 根据 CONTCAR 扩胞。 |
+| `preserve_grid_shift_md` | 布尔值 | Stage1 默认清除全部约束。设为 `true` 时只保留 DPmoire-lite 的网格平移锚点；`F F T` 表示固定 x/y、允许 z 移动。 |
 | `n_sectors` | 整数或 `[nx, ny]` | 堆垛平移采样网格。`9` 等价于 `[9, 9]`，`[9, 8]` 表示矩形网格。 |
 | `sc` | 整数或 `[sx, sy]` | MD 使用的超胞扩展；当 `sc_rlx: true` 时也用于弛豫。`2` 等价于 `[2, 2]`。 |
 | `d` | 数值 | 距离数值，具体物理含义由 `d_mode` 决定。 |

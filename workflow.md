@@ -115,6 +115,10 @@ If `sc_rlx: true`, relaxation folders contain supercell stacking structures.
 If `sc_rlx: false`, relaxation folders contain primitive glide structures; the
 converged `CONTCAR` is expanded to `sc` during stage1.
 
+Stage1 clears MD constraints by default. Set `preserve_grid_shift_md: true` to
+preserve only DPmoire-lite grid-shift anchors; their `F F T` mask means fixed
+x/y and movable z. Arbitrary user constraints are not covered by this option.
+
 If `symm_reduce: true`, DPmoire-lite uses `pymatgen`/`spglib` to reduce
 symmetry-equivalent stackings and writes `sym_reduced_stackings.txt`.
 

@@ -168,6 +168,7 @@ class DPmoireLiteConfig:
     min_val_n: int
     max_val_n: int
     include_monolayer_md: bool
+    preserve_grid_shift_md: bool = False
     outcar_patterns: tuple[str, ...] = field(default_factory=lambda: DEFAULT_OUTCAR_PATTERNS)
 
     @property
@@ -314,5 +315,6 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         min_val_n=_int(_require(raw, "min_val_n"), "min_val_n"),
         max_val_n=_int(_require(raw, "max_val_n"), "max_val_n"),
         include_monolayer_md=_bool(_require(raw, "include_monolayer_md"), "include_monolayer_md"),
+        preserve_grid_shift_md=_bool(raw.get("preserve_grid_shift_md", False), "preserve_grid_shift_md"),
         outcar_patterns=tuple(outcar_patterns),
     )

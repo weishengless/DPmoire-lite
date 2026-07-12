@@ -118,3 +118,37 @@ def test_wheel_includes_bundled_example_template():
     assert "dpmoire_lite/example/config.yaml" in names
     assert "dpmoire_lite/example/input/rlx_INCAR" in names
     assert "dpmoire_lite/example/scripts/sub" in names
+
+
+def test_wheel_example_contains_preserve_grid_shift_md_false():
+    if subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True).returncode != 0:
+        pytest.skip("pip is unavailable in this Python environment")
+    for module in ("setuptools", "wheel"):
+        if subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True).returncode != 0:
+            pytest.skip(f"{module} is unavailable in this Python environment")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    with local_tmp_dir("wheel-config") as tmp_path:
+        wheel_dir = tmp_path / "wheelhouse"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "wheel",
+                "--no-deps",
+                "--no-build-isolation",
+                "-w",
+                str(wheel_dir),
+                str(repo_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        wheels = list(wheel_dir.glob("*.whl"))
+        assert wheels
+        with zipfile.ZipFile(wheels[0]) as wheel:
+            data = yaml.safe_load(wheel.read("dpmoire_lite/example/config.yaml"))
+
+    assert data["preserve_grid_shift_md"] is False

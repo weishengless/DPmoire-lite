@@ -272,3 +272,38 @@ def test_load_config_rejects_invalid_d_mode(tmp_path):
 
     with pytest.raises(ConfigError, match="d_mode"):
         load_config(config_file)
+
+
+def test_preserve_grid_shift_md_defaults_false_when_omitted(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.preserve_grid_shift_md is False
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_preserve_grid_shift_md_accepts_explicit_boolean(tmp_path, value):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, preserve_grid_shift_md=value)
+
+    config = load_config(config_file)
+
+    assert config.preserve_grid_shift_md is value
+
+
+def test_preserve_grid_shift_md_rejects_invalid_boolean(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, preserve_grid_shift_md="sometimes")
+
+    with pytest.raises(ConfigError, match="preserve_grid_shift_md"):
+        load_config(config_file)
+
+
+def test_source_and_bundled_examples_show_false_default():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    for relative_path in ("example/config.yaml", "src/dpmoire_lite/example/config.yaml"):
+        data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
+        assert data["preserve_grid_shift_md"] is False

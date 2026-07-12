@@ -31,6 +31,7 @@ r_cut: -1               #Value written to ML_RCUT1 and ML_RCUT2. Use a negative 
 
 sc: 2                   #Supercell expansion for MD and, when sc_rlx is true, relaxation. An integer means [n, n]; a pair [m, n] allows rectangular supercells.
 sc_rlx: false            #true: relax supercell stacking structures. false: relax primitive glide structures, then expand the converged CONTCAR during stage1.
+preserve_grid_shift_md: false #true: preserve only DPmoire-lite grid-shift anchors; F F T means fixed x/y and movable z. false: clear MD constraints.
 d: 7.3                  #Distance value interpreted by d_mode.
 d_mode: surface_gap     #surface_gap: min_z(top)-max_z(bot); reference_plane_gap: selected mean-z distance.
 #d_reference:           #Optional, only used by reference_plane_gap.

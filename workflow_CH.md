@@ -96,6 +96,10 @@ sc: [3, 2]  # 矩形超胞
 
 如果 `sc_rlx: true`，弛豫目录中写入超胞堆垛结构。如果 `sc_rlx: false`，弛豫目录中写入 primitive glide structure；stage1 会把收敛后的 `CONTCAR` 扩展到 `sc`。
 
+Stage1 默认清除 MD 约束。设置 `preserve_grid_shift_md: true` 只保留
+DPmoire-lite 的网格平移锚点；其 `F F T` 掩码表示固定 x/y、允许 z 移动。
+该选项不适用于任意用户约束。
+
 如果 `symm_reduce: true`，DPmoire-lite 会用 `pymatgen`/`spglib` 对等价堆垛做对称性约化，并写出 `sym_reduced_stackings.txt`。
 
 ## 5. 提交 Stage0
