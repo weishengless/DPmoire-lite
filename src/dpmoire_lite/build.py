@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import warnings
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ from .manifest import Manifest, read_manifest, write_manifest
 from .paths import backup_existing_directory, manifest_path, relative_to_workdir, stage_dir
 from .provenance import structure_identity
 from .slurm import SlurmJob, SlurmRunner
-from .structures import StructureHandler, generate_stackings, rewrite_contcar_as_poscar, supercell_matrix
+from .structures import StructureHandler, generate_stackings, supercell_matrix
 
 
 VASP_RELAXATION_CONVERGED_PHRASE = "reached required accuracy - stopping structural energy minimisation"
@@ -142,20 +143,35 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         source_dir = config.work_dir / "rlx" / f"{i}_{j}"
         target = md_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
-        _write_md_poscar(source_dir / "CONTCAR", target / "POSCAR", md_sc)
+        _write_md_poscar(
+            source_dir / "CONTCAR",
+            target / "POSCAR",
+            md_sc,
+            preserve_constraints=config.preserve_grid_shift_md,
+        )
         atoms = structures.read_atoms(target / "POSCAR")
         _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
         if config.vasp_ml:
             stage_mlff_files(init_mlff_dir, target)
         directories.append(target)
 
+    monolayer_constraint_warning_emitted = False
     if config.include_monolayer_md:
         for layer_name in ("top_layer", "bot_layer"):
             target = md_dir / layer_name
             target.mkdir(parents=True, exist_ok=True)
-            write_supercell_poscar(config.input_dir / f"{layer_name}.poscar", target / "POSCAR", config.sc)
-            atoms = structures.read_atoms(target / "POSCAR")
-            _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_monolayer_INCAR", rcut)
+            atoms = structures.read_atoms(config.input_dir / f"{layer_name}.poscar")
+            had_constraints = _normalize_stage1_structure(
+                atoms,
+                clear_constraints=True,
+                warn_on_constraints=not monolayer_constraint_warning_emitted,
+            )
+            if had_constraints:
+                monolayer_constraint_warning_emitted = True
+            atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(config.sc)))
+            _assert_stage1_structure_cleared(atoms_sc)
+            write_vasp(target / "POSCAR", atoms=atoms_sc)
+            _write_vasp_inputs(config, target, atoms_sc, config.input_dir / "MD_monolayer_INCAR", rcut)
             if config.vasp_ml:
                 stage_mlff_files(init_mlff_dir, target)
             directories.append(target)
@@ -469,13 +485,50 @@ def _stage1_failure_reason(exc: Exception, source_dir: Path) -> str:
     return text
 
 
-def _write_md_poscar(contcar: Path, poscar: Path, sc: tuple[int, int] | None) -> None:
+def _normalize_stage1_structure(
+    atoms: Atoms,
+    *,
+    clear_constraints: bool,
+    warn_on_constraints: bool = False,
+) -> bool:
+    had_constraints = bool(atoms.constraints)
+    if clear_constraints:
+        atoms.set_constraint([])
+    if "momenta" in atoms.arrays:
+        atoms.set_momenta(None)
+    if had_constraints and warn_on_constraints:
+        warnings.warn(
+            "Clearing constraints from monolayer MD input; preserve_grid_shift_md does not apply.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return had_constraints
+
+
+def _assert_stage1_structure_cleared(atoms: Atoms) -> None:
+    if atoms.constraints or "momenta" in atoms.arrays:
+        raise RuntimeError("Stage1 normalization failed to clear constraints and momenta")
+
+
+def _write_md_poscar(
+    contcar: Path,
+    poscar: Path,
+    sc: tuple[int, int] | None,
+    *,
+    preserve_constraints: bool = False,
+) -> None:
+    atoms = read_vasp(contcar)
+    _normalize_stage1_structure(atoms, clear_constraints=not preserve_constraints)
     if sc is None:
-        rewrite_contcar_as_poscar(contcar, poscar)
+        if not preserve_constraints:
+            _assert_stage1_structure_cleared(atoms)
+        poscar.parent.mkdir(parents=True, exist_ok=True)
+        write_vasp(poscar, atoms=atoms, direct=True, sort=False)
         return
 
-    atoms = read_vasp(contcar)
     atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(sc)))
+    if not preserve_constraints:
+        _assert_stage1_structure_cleared(atoms_sc)
     poscar.parent.mkdir(parents=True, exist_ok=True)
     write_vasp(poscar, atoms=atoms_sc, direct=True, sort=False)
 
