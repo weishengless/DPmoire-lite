@@ -269,6 +269,31 @@ def test_write_potcar_concatenates_source_bytes_without_extra_newlines(tmp_path)
     assert (tmp_path / "POTCAR").read_bytes() == h_source + he_source
 
 
+def test_write_prepared_potcar_concatenates_source_bytes_without_extra_newlines(
+    tmp_path,
+):
+    potcars = tmp_path / "potcars"
+    h_source = b"H prepared source\nEnd of Dataset\n"
+    he_source = b"He prepared source\nEnd of Dataset\n"
+    h_path = potcars / "H" / "POTCAR"
+    he_path = potcars / "He" / "POTCAR"
+    h_path.parent.mkdir(parents=True)
+    he_path.parent.mkdir(parents=True)
+    h_path.write_bytes(h_source)
+    he_path.write_bytes(he_source)
+    prepared = (
+        inputs.PreparedPotcar("H", inputs.prepare_source(h_path), 10.0),
+        inputs.PreparedPotcar("He", inputs.prepare_source(he_path), 20.0),
+    )
+
+    max_enmax = inputs.write_prepared_potcar(
+        ["H", "He"], prepared, tmp_path / "prepared.POTCAR"
+    )
+
+    assert max_enmax == 20.0
+    assert (tmp_path / "prepared.POTCAR").read_bytes() == h_source + he_source
+
+
 def test_write_potcar_uses_minimal_policy(tmp_path):
     potcars = tmp_path / "potcars"
     mo_source = b"Mo minimal\n ENMAX = 224; ZVAL = 6; \n End of Dataset\n"
