@@ -10,6 +10,7 @@ import yaml
 import dpmoire_lite.build as build_module
 from dpmoire_lite.build import _ordered_elements, build_stage0, build_stage1, build_stage_all, run_build
 from dpmoire_lite.config import ConfigError, load_config
+from dpmoire_lite.manifest import Manifest, write_manifest
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
 
 
@@ -109,6 +110,18 @@ def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_bl
         encoding="utf-8",
     )
     return target
+
+
+def write_relaxation_manifest(work, stackings):
+    write_manifest(
+        work,
+        Manifest(
+            stage="rlx",
+            generated_at="test",
+            directories=[f"rlx/{i}_{j}" for i, j in stackings],
+            stackings=[list(stacking) for stacking in stackings],
+        ),
+    )
 
 
 def read_selective_dynamics_flags(poscar):
@@ -332,6 +345,7 @@ def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     )
     work = tmp_path / "work"
     write_converged_relaxation(work, with_velocity_block=True)
+    write_relaxation_manifest(work, [(0, 0)])
     init_mlff = work / "init_mlff"
     init_mlff.mkdir(parents=True)
     seed = Path(__file__).parent / "data" / "mlab" / "complete_vasp_651.mlab"
@@ -362,6 +376,7 @@ def test_stage1_fails_for_unconverged_relaxation(tmp_path):
     target.mkdir(parents=True, exist_ok=True)
     write_vasp(target / "CONTCAR", atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
     (target / "OUTCAR").write_text("not there yet\n", encoding="utf-8")
+    write_relaxation_manifest(tmp_path / "work", [(0, 0)])
 
     with pytest.raises(RuntimeError, match="rlx/0_0: Relaxation did not converge"):
         run_build(config, wait=False)
@@ -383,6 +398,7 @@ def test_stage1_preflight_reports_all_failures_without_creating_md(tmp_path):
     unconverged.mkdir(parents=True, exist_ok=True)
     write_vasp(unconverged / "CONTCAR", atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
     (unconverged / "OUTCAR").write_text("not there yet\n", encoding="utf-8")
+    write_relaxation_manifest(work, [(0, 0), (1, 0)])
     with pytest.raises(RuntimeError) as exc_info:
         run_build(config, wait=False)
 
@@ -406,6 +422,7 @@ def test_stage1_expands_primitive_relaxation_when_sc_rlx_is_false(tmp_path):
     )
     work = tmp_path / "work"
     write_converged_relaxation(work, atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
+    write_relaxation_manifest(work, [(0, 0)])
 
     run_build(config, wait=False)
 

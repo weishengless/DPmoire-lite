@@ -7,8 +7,7 @@ from .config import DPmoireLiteConfig, load_config
 from .dataset import Dataset, count_ml_ab_configs
 from .manifest import Manifest, read_manifest, write_manifest
 from .outcar import find_outcar_series
-from .paths import relative_to_workdir, stage_dir
-from .structures import generate_stackings
+from .paths import manifest_path, relative_to_workdir
 
 
 COLLECT_OUTPUTS = {
@@ -23,7 +22,7 @@ def run_collect(config_path: Path, stage: str) -> None:
         raise ValueError(f"Unknown collect stage: {stage}")
 
     config = load_config(config_path)
-    manifest = read_manifest(config.work_dir, stage) or _new_manifest(config, stage)
+    manifest = _require_stage_manifest(config, stage)
     collectors = {
         "rlx": collect_rlx,
         "md": collect_md,
@@ -123,44 +122,30 @@ def _collect_outcars(config: DPmoireLiteConfig, manifest: Manifest, freq: int) -
 
 
 def _prepare_manifest(config: DPmoireLiteConfig, manifest: Manifest, stage: str) -> Manifest:
+    del config
     manifest.stage = stage
-    if not manifest.directories:
-        manifest.directories = _derived_directories(config, stage)
     manifest.collect = {}
     manifest.skipped = []
     manifest.failed = []
     return manifest
 
 
-def _new_manifest(config: DPmoireLiteConfig, stage: str) -> Manifest:
-    return Manifest(
-        stage=stage,
-        generated_at=datetime.now().isoformat(timespec="seconds"),
-        config_summary={
-            "vasp_ml": config.vasp_ml,
-            "outcar_collect_freq": config.outcar_collect_freq,
-            "n_sectors": list(config.n_sectors),
-            "include_monolayer_md": config.include_monolayer_md,
-        },
-        directories=_derived_directories(config, stage),
-    )
-
-
-def _derived_directories(config: DPmoireLiteConfig, stage: str) -> list[str]:
-    if stage in {"rlx", "md"}:
-        directories = [f"{stage}/{i}_{j}" for i, j in generate_stackings(config.n_sectors)]
-        if stage == "md" and config.include_monolayer_md:
-            directories.extend(["md/top_layer", "md/bot_layer"])
-        return directories
-
-    validation_root = stage_dir(config.work_dir, "validation")
-    if not validation_root.exists():
-        return []
-    return [
-        _display_path(config.work_dir, path)
-        for path in sorted(validation_root.iterdir())
-        if path.is_dir()
-    ]
+def _require_stage_manifest(config: DPmoireLiteConfig, stage: str) -> Manifest:
+    path = manifest_path(config.work_dir, stage)
+    result = read_manifest(config.work_dir, stage)
+    if result.kind == "missing":
+        raise RuntimeError(
+            f"Missing {stage} manifest at {path}; collect requires a completed stage manifest. "
+            "The stage may be an incomplete build; complete or delete and rebuild it first."
+        )
+    if result.kind == "legacy":
+        raise RuntimeError(
+            f"Legacy {stage} manifest at {path} is not accepted by collect; "
+            "a current Manifest v2 is required."
+        )
+    if result.manifest is None:
+        raise RuntimeError(f"Invalid {stage} manifest at {path}; no manifest data was loaded.")
+    return result.manifest
 
 
 def _manifest_directories(config: DPmoireLiteConfig, manifest: Manifest) -> list[Path]:

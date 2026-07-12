@@ -7,7 +7,7 @@ import dpmoire_lite.build as build_module
 from dpmoire_lite.build import run_build
 from dpmoire_lite.manifest import read_manifest
 
-from test_build import write_build_config, write_converged_relaxation
+from test_build import write_build_config, write_converged_relaxation, write_relaxation_manifest
 
 
 def _mark_stage(work, stage: str, text: str = "keep me"):
@@ -287,6 +287,7 @@ def test_stage1_preflight_aggregates_all_relaxation_failures(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "input" / "MD_INCAR").unlink()
+    write_relaxation_manifest(work, [(0, 0), (1, 0)])
 
     with pytest.raises(Exception) as exc_info:
         run_build(config, wait=False)
@@ -310,6 +311,7 @@ def test_stage1_preflight_fully_parses_initial_seed(tmp_path):
     )
     work = tmp_path / "work"
     write_converged_relaxation(work)
+    write_relaxation_manifest(work, [(0, 0)])
     init_mlff = work / "init_mlff"
     init_mlff.mkdir(parents=True)
     (init_mlff / "ML_ABN").write_text(

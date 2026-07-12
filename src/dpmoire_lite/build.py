@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import yaml
 from ase.build import make_supercell, sort
 from ase import Atoms
 from ase.io.vasp import read_vasp, write_vasp
@@ -23,8 +22,8 @@ from .inputs import (
     write_potcar,
     write_supercell_poscar,
 )
-from .manifest import Manifest, write_manifest
-from .paths import backup_existing_directory, relative_to_workdir, stage_dir
+from .manifest import Manifest, read_manifest, write_manifest
+from .paths import backup_existing_directory, manifest_path, relative_to_workdir, stage_dir
 from .slurm import SlurmJob, SlurmRunner
 from .structures import StructureHandler, generate_stackings, rewrite_contcar_as_poscar, supercell_matrix
 
@@ -373,21 +372,33 @@ def _build_validation(
 
 
 def _stage1_stackings(config: DPmoireLiteConfig) -> list[tuple[int, int]]:
-    rlx_manifest = config.work_dir / "rlx" / "manifest.yaml"
-    if rlx_manifest.exists():
-        data = yaml.safe_load(rlx_manifest.read_text(encoding="utf-8")) or {}
-        stackings = data.get("stackings") or []
-        if stackings:
-            return [(int(i), int(j)) for i, j in stackings]
+    path = manifest_path(config.work_dir, "rlx")
+    result = read_manifest(config.work_dir, "rlx")
+    if result.kind == "missing":
+        raise RuntimeError(
+            f"Missing relaxation manifest at {path}; Stage1 cannot determine its stacking list. "
+            "The relaxation stage may be an incomplete build; rebuild it before Stage1."
+        )
+    if result.kind == "legacy":
+        raise RuntimeError(
+            f"Legacy relaxation manifest at {path} is not accepted by Stage1; "
+            "a current Manifest v2 is required."
+        )
 
-    symm_file = config.work_dir / "sym_reduced_stackings.txt"
-    if config.symm_reduce and symm_file.exists():
-        data = np.loadtxt(symm_file, dtype=int)
-        if data.ndim == 1:
-            data = data.reshape(1, 2)
-        return [(int(i), int(j)) for i, j in data.tolist()]
+    manifest = result.manifest
+    if manifest is None:
+        raise RuntimeError(f"Invalid relaxation manifest at {path}; no manifest data was loaded.")
+    if not manifest.stackings:
+        raise ValueError(f"Invalid relaxation manifest at {path}; stackings must not be empty.")
 
-    return generate_stackings(config.n_sectors)
+    stackings: list[tuple[int, int]] = []
+    for stacking in manifest.stackings:
+        if len(stacking) != 2:
+            raise ValueError(
+                f"Invalid relaxation manifest at {path}; each stacking must contain two indices."
+            )
+        stackings.append((int(stacking[0]), int(stacking[1])))
+    return stackings
 
 
 def _make_temp_work_dir(work_dir: Path, name: str, timestamp: str) -> Path:
