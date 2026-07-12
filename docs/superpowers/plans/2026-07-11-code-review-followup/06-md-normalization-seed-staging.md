@@ -11,7 +11,7 @@ Consumes:
 - [Plan 03 ML_AB parser and digest](03-mlab-parser-digest.md)
 - [Plan 05 Stage provenance](05-stage-provenance.md)
 
-Unlocks: Plan 10
+Unlocks: Plan 06R
 
 ## Goal and Done State
 

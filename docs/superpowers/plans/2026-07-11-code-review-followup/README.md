@@ -2,32 +2,34 @@
 
 Date: 2026-07-11
 
-Status: implementation in progress; Plans 00 and 01 are complete, Plan 02 is
-active, and later collection plans include the approved 2026-07-12 amendment
+Status: approved roadmap under implementation. Dynamic progress and the unique
+active execution unit live only in ignored `IMPLEMENTATION-STATUS.local.md`.
 
 Approved designs:
 
 - [`2026-07-11-code-review-followup-decomposition-design.md`](../../specs/2026-07-11-code-review-followup-decomposition-design.md)
 - [`2026-07-12-mlff-full-dedup-legacy-collection-design.md`](../../specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
+- [`2026-07-12-code-review-followup-route-correction-and-low-reasoning-execution-design.md`](../../specs/2026-07-12-code-review-followup-route-correction-and-low-reasoning-execution-design.md)
 
-Reusable low-reasoning execution prompt:
+Current legacy execution prompt, scheduled for replacement by Plan 06R Task 1:
 [`LOW-REASONING-EXECUTION-PROMPT.md`](LOW-REASONING-EXECUTION-PROMPT.md)
 
 Authoritative requirement index:
 [`docs/code-review-notes/README.md`](../../../code-review-notes/README.md)
 
-Design checkpoints: `01b1b49`, `54e9886`; authoritative amendment: `d69a15b`
+Design checkpoints: `01b1b49`, `54e9886`, `db9c842`, `b4d3ab9`;
+authoritative amendment: `d69a15b`
 
 ## Objective
 
 Implement the confirmed code-review follow-up without creating one oversized
 change, duplicating shared contracts, or reopening deferred automation. The work
-is divided into twelve leaf plans, counting the bounded Plan 08A amendment. Each
-leaf plan has a bounded done state,
+is divided into thirteen leaf plans, counting the blocking Plan 06R correction
+and bounded Plan 08A amendment. Each leaf plan has a bounded done state,
 test-first tasks, explicit dependencies, and a review/rollback checkpoint.
 
-The implementation is complete only after Plan 08A, Plan 10, and the final
-integration gate.
+The implementation is complete only after blocking Plan 06R, Plan 08A, Plan 10,
+and the final integration gate.
 Completion of an earlier plan must not be described as completion of the full
 follow-up.
 
@@ -56,13 +58,19 @@ follow-up.
    recovery rule inside production code.
 9. Do not start a dependent plan while its predecessor acceptance tests are red.
 10. Run the focused/affected suites after each execution unit. Run the full suite
-    before every checkpoint commit and every leaf-plan checkpoint. The current
-    baseline is 93 passed and 5 skipped.
+    before every checkpoint commit and every leaf-plan checkpoint. The original
+    pre-implementation baseline was 93 passed and 5 skipped; it is historical
+    evidence, not the expected count for later runs.
+11. After Plan 06R Task 1, only the high-reasoning orchestrator may choose units,
+    stage, commit, or update active state. A worker returns unstaged changes and
+    evidence for review.
+12. Use one write-capable agent at a time. Parallel agents are limited to
+    independent read-only exploration, tests, or review.
 
-## Pre-implementation Repository Gate
+## Historical Pre-implementation Repository Gate
 
-The approved review corpus is currently a working-tree change. Before Plan 00
-production work begins, intentionally review and version only the approved scope:
+This gate defined the original repository entry condition and is not an active
+execution step. Before Plan 00 production work began, its approved scope was:
 
 - `.gitignore` root rule `/example-test/`;
 - `docs/2026-07-11-code-review.md`;
@@ -125,14 +133,15 @@ existing source cannot represent an authoritative format boundary.
 | 01 | [INCAR engine](01-incar-engine.md) | P1-4 | 00 | 04 |
 | 02 | [Manifest v2](02-manifest-v2.md) | shared P1-5/P2-2/P2-3/P2-6 contracts | 00 | 04, 05, 08, 08A, 09 |
 | 03 | [ML_AB parser and identities](03-mlab-parser-digest.md) | P2-1 parsing/identity core | 00 | 04, 06, 08, 08A |
-| 04 | [One-shot build](04-one-shot-build.md) | P2-2 | 01, 02, 03 | 05 |
-| 05 | [Stage provenance](05-stage-provenance.md) | P1-5 | 02, 04 | 06 |
-| 06 | [MD normalization and seed staging](06-md-normalization-seed-staging.md) | P1-1, P1-6, P2-1 producer side | 03, 05 | 10 |
-| 07 | [OUTCAR ingestion](07-outcar-ingestion.md) | P2-4, P2-5 | 00 | 08 |
+| 04 | [One-shot build](04-one-shot-build.md) | P2-2 | 01, 02, 03 | 05, 06R |
+| 05 | [Stage provenance](05-stage-provenance.md) | P1-5 | 02, 04 | 06, 06R |
+| 06 | [MD normalization and seed staging](06-md-normalization-seed-staging.md) | P1-1, P1-6, P2-1 producer side | 03, 05 | 06R |
+| 06R | [Route correction and execution governance](06r-route-correction-execution-governance.md) | audited P1-1/P1-5/P2-2 corrections and progressive execution | 04, 05, 06 | 07, 09, 10 |
+| 07 | [OUTCAR ingestion](07-outcar-ingestion.md) | P2-4, P2-5 | 00, 06R | 08 |
 | 08 | [Per-source collection](08-source-collection.md) | P2-1 source classification and seed-aware consumer | 02, 03, 07 | 08A, 10 |
 | 08A | [MLFF full-dedup and legacy inventory](08a-mlff-full-dedup-legacy-collection.md) | P2-1 exact optional consumer; P2-6 missing-manifest exception | 02, 03, 08 | 10 |
-| 09 | [Collection publication engine](09-collection-publication-engine.md) | P2-3 persistence engine | 02 | 10 |
-| 10 | [Collect integration and CLI](10-collect-integration-cli.md) | P2-3 orchestration, P2-6 | 06, 08, 08A, 09 | final gate |
+| 09 | [Collection publication engine](09-collection-publication-engine.md) | P2-3 persistence engine | 02, 06R | 10 |
+| 10 | [Collect integration and CLI](10-collect-integration-cli.md) | P2-3 orchestration, P2-6 | 06, 06R, 08, 08A, 09 | final gate |
 
 ## Dependency Graph
 
@@ -153,6 +162,11 @@ flowchart LR
     P03 --> P06["06 MD normalization"]
     P05 --> P06
 
+    P04 --> P06R["06R Route correction + governance"]
+    P05 --> P06R
+    P06 --> P06R
+    P06R --> P07
+
     P02 --> P08["08 Source collection"]
     P03 --> P08
     P07 --> P08
@@ -162,8 +176,10 @@ flowchart LR
     P08 --> P08A
 
     P02 --> P09["09 Publication engine"]
+    P06R --> P09
 
     P06 --> P10["10 Collect integration"]
+    P06R --> P10
     P08 --> P10
     P08A --> P10
     P09 --> P10
@@ -171,53 +187,48 @@ flowchart LR
 
 ## Execution Waves
 
-### Wave 0
+Waves express dependency shape, not dynamic progress. Runtime progress is read
+only from the ignored active-state snapshot.
 
-- Plan 00: freeze the approved repository/spec baseline and close unsafe automated
-  entry points.
+### Waves 0–4: Established Build Foundation
 
-### Wave 1
+- Wave 0: Plan 00 containment.
+- Wave 1: Plans 01, 02, and 03 reusable parsing/persistence contracts.
+- Wave 2: Plan 04 one-shot build and aggregate preflight.
+- Wave 3: Plan 05 strict and legacy Stage provenance.
+- Wave 4: Plan 06 MD normalization, anchors, and seed producer.
 
-- Plan 01: INCAR parser and build-preflight adapter.
-- Plan 02: Manifest v2 and atomic persistence primitives.
-- Plan 03: ML_AB/ML_ABN parser and shared seed/configuration identities.
+### Wave 4R: Blocking Route Correction
+
+- Plan 06R: restore the audited manifest/preflight/module contracts and bootstrap
+  progressive orchestrator/worker execution.
+
+No Plan 07 or Plan 09 production work begins before the Plan 06R final gate.
+
+### Wave 5: Collection Inputs and Publication Core
+
 - Plan 07: deterministic OUTCAR discovery and streaming.
-
-These plans have no semantic dependency on one another. Plans 01 and 07 both
-touch `config.py`, so a single implementer should still execute them sequentially
-or rebase carefully.
-
-### Wave 2
-
-- Plan 04: one-shot build and aggregate preflight.
-- Plan 08: per-source collection semantics using synthetic Manifest v2 fixtures.
 - Plan 09: collection publication engine and recovery state machine.
 
-Plan 09 and Plan 10 should normally share one PR unless the project explicitly
-accepts a tested but temporarily unwired internal publication API.
+These plans are semantically independent after Plan 06R, but a shared worktree
+still uses one write-capable agent at a time. Plan 09 and Plan 10 should normally
+share one PR unless the project explicitly accepts a tested but temporarily
+unwired internal publication API.
 
-### Wave 2A
+### Wave 6
 
-- Plan 08A: exact MLFF full-dedup and bounded legacy/missing inventory, after
-  Plan 08 is green.
+- Plan 08: per-source collection semantics after Plan 07.
 
-Plan 08A remains a separate checkpoint because it changes optional collection
-semantics and compatibility discovery, not the default per-source classifier.
-If project policy rejects merging the unwired mode core, keep its commit boundary
-but merge it with Plan 10.
+### Wave 6A
 
-### Wave 3
+- Plan 08A: exact MLFF full-dedup and bounded legacy/missing inventory after Plan
+  08. Keep its checkpoint separate, but merge it with Plan 10 if project policy
+  rejects an unwired optional mode.
 
-- Plan 05: Stage0/Stage1 structure provenance and legacy inference.
+### Wave 7
 
-### Wave 4
-
-- Plan 06: MD constraint/velocity normalization and real Stage1 seed producer.
-
-### Wave 5
-
-- Plan 10: wire real producers, source collection, publication, manifest status,
-  and CLI exit codes; then run the final integration gate.
+- Plan 10: wire the prepared producer, collectors, publication, manifest status,
+  and CLI outcomes; then run the final integration gate.
 
 ## Shared Production Boundaries
 
@@ -258,17 +269,25 @@ change existing seed digest semantics.
 `dataset.py` converts accepted parsed configurations into ASE objects; it does not
 parse the raw format itself after Plan 03.
 
+### `src/dpmoire_lite/inputs.py`
+
+Owns VASP input preparation and publication helpers. Plan 06R makes it return
+prepared INCAR, POTCAR, submit-script, and vdW source records with byte identity;
+generation consumes those records instead of reselecting or reparsing sources.
+
 ### `src/dpmoire_lite/build_preflight.py`
 
 Owns target-stage discovery, conflict checks, aggregated preflight diagnostics,
-and the no-side-effect boundary. Domain modules provide validators; this module
-orders them before generation.
+the no-side-effect boundary, and construction of one prepared build result.
+Domain modules provide validators and prepared values; this module orders them
+before generation but does not implement their scientific rules.
 
 ### `src/dpmoire_lite/provenance.py`
 
-Owns structure fingerprints, Manifest v2 Stage0 provenance validation, and legacy
-atom-count/cell inference. `build.py` consumes its result instead of interpreting
-the current config independently.
+Owns structure fingerprints, Stage0 manifest/anchor evidence, strict current
+Stage1 validation, deterministic legacy atom-count/cell inference, and provenance
+domain results/issues. `build_preflight.py` aggregates those issues and `build.py`
+consumes the validated result instead of interpreting config independently.
 
 ### `src/dpmoire_lite/collect_models.py`
 
@@ -314,19 +333,19 @@ delegated to Plan 08A after mode validation.
 
 | Spec | Primary plan(s) | Final closing gate |
 | --- | --- | --- |
-| P0 repository hygiene | 00; fixture work in 03 and 07 | 10 packaging/git audit |
-| P1-1 MD constraints | 02 schema location; 06 anchor provenance and behavior | 10 producer/consumer regression |
+| P0 repository hygiene | 00; execution governance in 06R; fixture work in 03 and 07 | 10 packaging/git audit |
+| P1-1 MD constraints | 02 schema; 06 behavior; 06R top-level anchor correction | 10 producer/consumer regression |
 | P1-2 safety gate | 00 | remains active after 10 |
-| P1-4 INCAR rendering | 01; preflight wiring in 04 | 04 no-side-effect integration |
-| P1-5 Stage provenance | 02 schema; 05 validation/inference | 06 Stage1 integration |
+| P1-4 INCAR rendering | 01 engine; 04 preflight; 06R single prepared consumption | 06R no-side-effect gate |
+| P1-5 Stage provenance | 02 schema; 05 behavior; 06R warning and ownership correction | 06R Stage1 regression |
 | P1-6 MD velocities | 06 | 06 focused and full suites |
 | P2-1 partial/seed/exact mode | 03 parser/identity; 06 producer; 08 seed-aware consumer; 08A full-dedup | 10 both-mode end-to-end contract |
-| P2-2 one-shot build | 02 strict manifest; 04 lifecycle; 05/06 validators | 06 Stage1 preflight regression |
+| P2-2 one-shot build | 02 strict manifest; 04 lifecycle; 05/06 validators; 06R authoritative prepared result | 06R preflight regression |
 | P2-3 safe publication | 02 atomic primitives; 09 engine; 10 orchestration | 10 fault-injection integration |
 | P2-4 OUTCAR patterns | 07 | 08 source-order manifest tests |
 | P2-5 OUTCAR streaming | 07 | 08 partial/source tests |
 | P2-6 collect exit codes | 02 classification; 08 source results; 08A coverage evidence; 09 result targets; 10 aggregate/CLI | 10 CLI integer assertions |
-| Testing/tooling scope | every plan | final gate below |
+| Testing/tooling scope | every plan; progressive execution in 06R | final gate below |
 
 ## Per-Task TDD Contract
 
@@ -420,7 +439,8 @@ After Plan 10:
 
 The follow-up is complete only when:
 
-- Plans 00 through 10, including Plan 08A, are implemented in dependency order;
+- Plans 00 through 10, including blocking Plan 06R and bounded Plan 08A, are
+  implemented in dependency order;
 - all focused and full tests pass;
 - the final integration gate passes;
 - the approved notes and bundled examples match production behavior;

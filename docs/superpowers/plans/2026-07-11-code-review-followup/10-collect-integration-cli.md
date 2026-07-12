@@ -11,6 +11,7 @@ Authoritative specs:
 Consumes:
 
 - [Plan 06 MD normalization and seed staging](06-md-normalization-seed-staging.md)
+- [Plan 06R Route correction and execution governance](06r-route-correction-execution-governance.md)
 - [Plan 08 Per-source collection](08-source-collection.md)
 - [Plan 08A MLFF full-dedup and legacy inventory](08a-mlff-full-dedup-legacy-collection.md)
 - [Plan 09 Collection publication engine](09-collection-publication-engine.md)

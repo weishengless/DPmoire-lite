@@ -6,7 +6,10 @@ Authoritative specs:
 - [P2-6 Legacy-compatible result manifest](../../../code-review-notes/P2-6-collect-exit-codes.md)
 - [Approved full-dedup design](../../specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 
-Consumes: [Plan 02 Manifest v2 and atomic I/O](02-manifest-v2.md)
+Consumes:
+
+- [Plan 02 Manifest v2 and atomic I/O](02-manifest-v2.md)
+- [Plan 06R Route correction and execution governance](06r-route-correction-execution-governance.md)
 
 Unlocks: Plan 10
 

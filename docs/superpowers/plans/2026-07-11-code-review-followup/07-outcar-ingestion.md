@@ -5,7 +5,10 @@ Authoritative specs:
 - [P2-4 OUTCAR pattern validation](../../../code-review-notes/P2-4-outcar-pattern-validation.md)
 - [P2-5 OUTCAR streaming](../../../code-review-notes/P2-5-outcar-streaming.md)
 
-Depends on: Plan 00
+Depends on:
+
+- [Plan 00 Containment baseline](00-containment-baseline.md)
+- [Plan 06R Route correction and execution governance](06r-route-correction-execution-governance.md)
 
 Unlocks: Plan 08
 

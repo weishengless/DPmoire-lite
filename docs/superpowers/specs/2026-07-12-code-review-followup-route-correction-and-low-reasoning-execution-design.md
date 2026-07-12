@@ -2,9 +2,9 @@
 
 Date: 2026-07-12
 
-Status: original sections and the dual-execution amendment approved in
-discussion; written specification awaiting final user review before
-implementation planning
+Status: approved by the user on 2026-07-12; incorporated into
+[Plan 06R](../plans/2026-07-11-code-review-followup/06r-route-correction-execution-governance.md),
+whose written implementation plan awaits review before execution
 
 ## Purpose
 
