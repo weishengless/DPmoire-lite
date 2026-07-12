@@ -12,6 +12,7 @@ from ase import Atoms
 from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
+from .atomic_io import sha256_file
 from .build_preflight import preflight_stage0, preflight_stage1
 from .config import ConfigError, DPmoireLiteConfig, load_config
 from .inputs import (
@@ -25,6 +26,7 @@ from .inputs import (
     write_supercell_poscar,
 )
 from .manifest import Manifest, read_manifest, write_manifest
+from .mlab import seed_prefix_identity
 from .paths import backup_existing_directory, manifest_path, relative_to_workdir, stage_dir
 from .provenance import structure_identity
 from .slurm import SlurmJob, SlurmRunner
@@ -116,6 +118,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
     _check_target_stages_absent(config, _stage1_target_stages(config))
     stackings = _stage1_stackings(config)
     preflight = preflight_stage1(config, stackings)
+    mlff_seed = _stage1_mlff_seed_identity(config, preflight)
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -157,6 +160,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
         if config.vasp_ml:
             stage_mlff_files(init_mlff_dir, target)
+            _verify_staged_mlff_files(init_mlff_dir, target, mlff_seed)
         directories.append(target)
 
     monolayer_constraint_warning_emitted = False
@@ -178,6 +182,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             _write_vasp_inputs(config, target, atoms_sc, config.input_dir / "MD_monolayer_INCAR", rcut)
             if config.vasp_ml:
                 stage_mlff_files(init_mlff_dir, target)
+                _verify_staged_mlff_files(init_mlff_dir, target, mlff_seed)
             directories.append(target)
 
     if not config.submit:
@@ -197,6 +202,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             stackings=[[i, j] for i, j in stackings],
             structure_provenance=_stage1_structure_provenance(preflight),
             grid_shift_anchors=md_anchor_records,
+            mlff_seed=mlff_seed,
         ),
     )
 
@@ -210,6 +216,57 @@ def _stage1_structure_provenance(preflight) -> dict[str, object]:
         "sc": list(preflight.trusted_sc) if preflight.trusted_sc is not None else None,
         "evidence": preflight.provenance_evidence,
     }
+
+
+def _stage1_mlff_seed_identity(
+    config: DPmoireLiteConfig,
+    preflight,
+) -> dict[str, object]:
+    if not config.vasp_ml:
+        return {}
+    if preflight.initial_seed is None:
+        raise RuntimeError("Stage1 MLFF seed preflight did not return a complete seed")
+
+    init_dir = config.work_dir / "init_mlff"
+    seed_identity = seed_prefix_identity(preflight.initial_seed)
+    return {
+        "source": "init_mlff/ML_ABN",
+        "configurations": preflight.initial_seed.complete_count,
+        "digest_schema": seed_identity.schema,
+        "seed_prefix_sha256": seed_identity.sha256,
+        "ml_ab_sha256": sha256_file(init_dir / "ML_ABN"),
+        "ml_ff_sha256": sha256_file(init_dir / "ML_FFN"),
+    }
+
+
+def _verify_staged_mlff_files(
+    init_dir: Path,
+    output_dir: Path,
+    seed_identity: dict[str, object],
+) -> None:
+    for source_name, destination_name, digest_key in (
+        ("ML_ABN", "ML_AB", "ml_ab_sha256"),
+        ("ML_FFN", "ML_FF", "ml_ff_sha256"),
+    ):
+        source = Path(init_dir) / source_name
+        destination = Path(output_dir) / destination_name
+        if not destination.is_file():
+            raise RuntimeError(
+                f"Stage1 MLFF copy verification failed for {destination}: missing file"
+            )
+        source_size = source.stat().st_size
+        destination_size = destination.stat().st_size
+        if source_size != destination_size:
+            raise RuntimeError(
+                f"Stage1 MLFF copy verification failed for {destination}: "
+                f"size {destination_size} != {source_size}"
+            )
+        destination_hash = sha256_file(destination)
+        if destination_hash != seed_identity[digest_key]:
+            raise RuntimeError(
+                f"Stage1 MLFF copy verification failed for {destination}: "
+                f"hash {destination_hash} != {seed_identity[digest_key]}"
+            )
 
 
 def build_stage_all(

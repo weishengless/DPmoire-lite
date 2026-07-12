@@ -1,4 +1,6 @@
 import hashlib
+from pathlib import Path
+import shutil
 
 import numpy as np
 from ase.io.vasp import read_vasp
@@ -9,8 +11,11 @@ from ase.constraints import FixedLine
 import pytest
 
 from dpmoire_lite.build import run_build
+import dpmoire_lite.inputs as inputs_module
 from dpmoire_lite.manifest import read_manifest
 from dpmoire_lite.manifest import write_manifest
+from dpmoire_lite.mlab import parse_mlab
+from dpmoire_lite.mlab import seed_prefix_identity
 
 from test_build import read_selective_dynamics_flags, write_build_config
 from test_stage_provenance import complete_stage0_relaxations, prepare_legacy_case, prepare_stage1_case, switch_to_stage1
@@ -592,3 +597,131 @@ class TestPreserveExpansion:
         true_atoms = read_vasp(true_root / "work" / "md" / "0_0" / "POSCAR")
         false_atoms = read_vasp(false_root / "work" / "md" / "0_0" / "POSCAR")
         assert len(_md_anchor_indices(true_atoms)) == len(_md_anchor_indices(false_atoms)) == 2
+
+
+def _prepare_seed_stage1(tmp_path, *, seed_name="complete_vasp_651.mlab", n_sectors=(1, 1)):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": list(n_sectors)},
+        stage1_overrides={"vasp_ml": True},
+    )
+    init_mlff = tmp_path / "work" / "init_mlff"
+    init_mlff.mkdir(parents=True)
+    shutil.copy2(
+        Path(__file__).parent / "data" / "mlab" / seed_name,
+        init_mlff / "ML_ABN",
+    )
+    (init_mlff / "ML_FFN").write_text("initial-force-field\n", encoding="utf-8")
+    return config, init_mlff
+
+
+class TestSeedStaging:
+    def test_stage1_seed_preflight_requires_complete_initial_mlab(self, tmp_path):
+        config, _ = _prepare_seed_stage1(
+            tmp_path,
+            seed_name="tail_position_crop.mlab",
+        )
+
+        with pytest.raises(RuntimeError, match="complete|partial|ML_ABN|seed"):
+            run_build(config, wait=False)
+
+        assert not (tmp_path / "work" / "md" / "manifest.yaml").exists()
+
+    def test_stage1_seed_manifest_records_count_schema_and_prefix_digest(self, tmp_path):
+        config, init_mlff = _prepare_seed_stage1(tmp_path)
+        parsed = parse_mlab(init_mlff / "ML_ABN")
+        identity = seed_prefix_identity(parsed)
+
+        run_build(config, wait=False)
+
+        manifest = read_manifest(tmp_path / "work", "md").manifest
+        assert manifest is not None
+        seed = manifest.mlff_seed
+        assert seed["source"] == "init_mlff/ML_ABN"
+        assert seed["configurations"] == parsed.complete_count
+        assert seed["digest_schema"] == identity.schema == "mlab-seed-v1"
+        assert seed["seed_prefix_sha256"] == identity.sha256
+
+    def test_stage1_seed_manifest_records_raw_ml_ab_and_ml_ff_hashes(self, tmp_path):
+        config, init_mlff = _prepare_seed_stage1(tmp_path)
+
+        run_build(config, wait=False)
+
+        manifest = read_manifest(tmp_path / "work", "md").manifest
+        assert manifest is not None
+        seed = manifest.mlff_seed
+        assert seed["ml_ab_sha256"] == hashlib.sha256(
+            (init_mlff / "ML_ABN").read_bytes()
+        ).hexdigest()
+        assert seed["ml_ff_sha256"] == hashlib.sha256(
+            (init_mlff / "ML_FFN").read_bytes()
+        ).hexdigest()
+
+    def test_stage1_verifies_copied_size_and_hash(self, tmp_path, monkeypatch):
+        config, _ = _prepare_seed_stage1(tmp_path)
+        real_copy2 = inputs_module.shutil.copy2
+
+        def corrupt_copy(source, destination, *args, **kwargs):
+            result = real_copy2(source, destination, *args, **kwargs)
+            if Path(destination).name == "ML_FF":
+                Path(destination).write_bytes(b"corrupted-seed-copy")
+            return result
+
+        monkeypatch.setattr(inputs_module.shutil, "copy2", corrupt_copy)
+
+        with pytest.raises(RuntimeError, match="hash|size|ML_FF"):
+            run_build(config, wait=False)
+
+    def test_stage1_seed_copy_failure_prevents_complete_md_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        config, _ = _prepare_seed_stage1(tmp_path, n_sectors=(2, 1))
+        real_copy2 = inputs_module.shutil.copy2
+
+        def skip_second_seed_copy(source, destination, *args, **kwargs):
+            if (
+                Path(destination).name == "ML_AB"
+                and Path(destination).parent.name == "1_0"
+            ):
+                return destination
+            return real_copy2(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(inputs_module.shutil, "copy2", skip_second_seed_copy)
+
+        with pytest.raises(RuntimeError, match="hash|size|ML_AB"):
+            run_build(config, wait=False)
+
+        assert not (tmp_path / "work" / "md" / "manifest.yaml").exists()
+
+    def test_each_md_directory_receives_identical_initial_seed_identity(self, tmp_path):
+        config, init_mlff = _prepare_seed_stage1(tmp_path, n_sectors=(2, 1))
+
+        run_build(config, wait=False)
+
+        manifest = read_manifest(tmp_path / "work", "md").manifest
+        assert manifest is not None
+        seed = manifest.mlff_seed
+        for relative_directory in ("md/0_0", "md/1_0"):
+            directory = tmp_path / "work" / relative_directory
+            assert (directory / "ML_AB").stat().st_size == (init_mlff / "ML_ABN").stat().st_size
+            assert (directory / "ML_FF").stat().st_size == (init_mlff / "ML_FFN").stat().st_size
+            assert hashlib.sha256((directory / "ML_AB").read_bytes()).hexdigest() == seed["ml_ab_sha256"]
+            assert hashlib.sha256((directory / "ML_FF").read_bytes()).hexdigest() == seed["ml_ff_sha256"]
+
+    def test_later_md_ml_ab_changes_do_not_modify_manifest_seed_identity(self, tmp_path):
+        config, _ = _prepare_seed_stage1(tmp_path)
+
+        run_build(config, wait=False)
+
+        manifest_path = tmp_path / "work" / "md" / "manifest.yaml"
+        before = read_manifest(tmp_path / "work", "md").manifest
+        assert before is not None
+        before_seed = dict(before.mlff_seed)
+        assert before_seed
+        with (tmp_path / "work" / "md" / "0_0" / "ML_AB").open("ab") as handle:
+            handle.write(b"restart-change")
+
+        after = read_manifest(tmp_path / "work", "md").manifest
+        assert after is not None
+        assert after.mlff_seed == before_seed
+        assert manifest_path.exists()

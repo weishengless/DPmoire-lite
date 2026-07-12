@@ -1535,7 +1535,7 @@ def _validate_initial_seed(
     if not seed_path.is_file() or seed_path.stat().st_size == 0:
         return None
     try:
-        return parse_mlab(seed_path)
+        result = parse_mlab(seed_path)
     except Exception as exc:
         diagnostics.append(
             PreflightDiagnostic(
@@ -1545,6 +1545,20 @@ def _validate_initial_seed(
             )
         )
         return None
+    if result.status != "complete" or result.declared_count != result.complete_count:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="mlff",
+                path=seed_display_path,
+                reason=(
+                    "initial ML_ABN seed must be complete: "
+                    f"status={result.status!r}, declared={result.declared_count}, "
+                    f"complete={result.complete_count}"
+                ),
+            )
+        )
+        return None
+    return result
 
 
 def _raise_if_failed(diagnostics: list[PreflightDiagnostic]) -> None:
