@@ -2,8 +2,87 @@ import os
 import dataclasses
 from pathlib import Path
 
+import numpy as np
 import pytest
+from ase.io.vasp import read_vasp_out
 from dpmoire_lite.outcar import find_outcar_series
+
+
+OUTCAR_FIXTURE_ROOT = Path(__file__).parent / "data" / "outcar"
+OUTCAR_FIXTURE = OUTCAR_FIXTURE_ROOT / "complete_two_frame.OUTCAR"
+OUTCAR_INVENTORY = OUTCAR_FIXTURE_ROOT / "README.md"
+DATA_INVENTORY = OUTCAR_FIXTURE_ROOT.parent / "README.md"
+
+
+def test_outcar_fixture_inventory_has_provenance_entry():
+    inventory = OUTCAR_INVENTORY.read_text(encoding="utf-8")
+    data_inventory = DATA_INVENTORY.read_text(encoding="utf-8")
+
+    assert "`complete_two_frame.OUTCAR`" in inventory
+    assert "`outcar/complete_two_frame.OUTCAR`" in data_inventory
+    for field in (
+        "Source type:",
+        "Reason for cropping:",
+        "Retained blocks:",
+        "Removed private data:",
+        "Redistribution confirmation:",
+        "Expected parser behavior:",
+    ):
+        assert field in inventory
+
+
+def test_outcar_fixture_parses_expected_frames_and_properties():
+    frames = read_vasp_out(str(OUTCAR_FIXTURE), index=":")
+
+    assert len(frames) == 2
+    for frame in frames:
+        assert len(frame) == 1
+        assert {"energy", "free_energy", "forces", "stress"} <= set(
+            frame.calc.results
+        )
+        assert np.isfinite(frame.get_potential_energy())
+        assert frame.get_forces().shape == (1, 3)
+        assert np.isfinite(frame.get_forces()).all()
+        assert frame.get_stress().shape == (6,)
+        assert np.isfinite(frame.get_stress()).all()
+
+
+def test_outcar_fixture_contains_no_private_path_or_potcar_marker():
+    payload = OUTCAR_FIXTURE.read_text(encoding="utf-8")
+
+    # Stock ASE 3.28 requires these synthetic OUTCAR species metadata lines.
+    species_metadata = [
+        line.strip() for line in payload.splitlines() if "POTCAR:" in line
+    ]
+    assert species_metadata == ["POTCAR: synthetic H", "POTCAR: synthetic H"]
+    payload_without_species_metadata = "\n".join(
+        line for line in payload.splitlines() if "POTCAR:" not in line
+    ).casefold()
+
+    forbidden_markers = (
+        "potcar",
+        "paw_pbe",
+        "potpaw",
+        "titel",
+        "vrhfin",
+        "lexch",
+        "eatom",
+        "atomic configuration",
+        "end of dataset",
+        "wavecar",
+        "chgcar",
+        "c:\\users\\",
+        "e:\\",
+        "/home/",
+        "/scratch/",
+        "sbatch",
+        "slurm",
+        "hostname",
+        "account",
+        "partition",
+    )
+    for marker in forbidden_markers:
+        assert marker not in payload_without_species_metadata
 
 
 def touch(path, mtime):

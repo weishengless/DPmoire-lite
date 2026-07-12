@@ -20,3 +20,16 @@ Each fixture addition must record all of the following fields in this file:
 No parser fixtures are introduced by Plan 00. Their owning parser plans will add
 fixture-specific records below this policy before committing the corresponding
 files.
+
+## OUTCAR fixtures
+
+### `outcar/complete_two_frame.OUTCAR`
+
+- **Source type:** fully synthetic minimal OUTCAR-style text for stock ASE 3.28.
+- **Reason for cropping:** retain only the structure required to parse two complete ionic frames.
+- **Retained blocks:** synthetic species/count metadata plus cell, position/force, stress, and free-energy records.
+- **Removed private data:** no source calculation was copied; paths, users, hosts, jobs, accounts, cluster details, and unrelated output are absent.
+- **Redistribution confirmation:** all values and metadata are synthetic; the fixture contains no POTCAR or potential payload.
+- **Expected parser behavior:** complete; two frames, each with energy, free energy, forces, and stress.
+
+See `outcar/README.md` for the parser-specific compatibility boundary.
