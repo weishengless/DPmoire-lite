@@ -24,6 +24,7 @@ from .inputs import (
 )
 from .manifest import Manifest, read_manifest, write_manifest
 from .paths import backup_existing_directory, manifest_path, relative_to_workdir, stage_dir
+from .provenance import structure_identity
 from .slurm import SlurmJob, SlurmRunner
 from .structures import StructureHandler, generate_stackings, rewrite_contcar_as_poscar, supercell_matrix
 
@@ -312,14 +313,18 @@ def _build_relaxations(
     targets = [rlx_dir / f"{i}_{j}" for i, j in stackings]
     backups = []
     directories = []
+    rlx_poscars = {}
     for i, j in stackings:
         target = rlx_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
         atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
         write_vasp(target / "POSCAR", atoms=atoms)
+        relative_path = relative_to_workdir(config.work_dir, target / "POSCAR")
+        rlx_poscars[relative_path] = _structure_identity_record(target / "POSCAR", relative_path)
         _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", rcut)
         directories.append(target)
     jobs = _submit_dirs(config, runner, directories, wait)
+    provenance = _stage0_structure_provenance(config, structures, stackings, rlx_poscars)
     write_manifest(
         config.work_dir,
         Manifest(
@@ -330,6 +335,7 @@ def _build_relaxations(
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
             stackings=[[i, j] for i, j in stackings],
+            structure_provenance=provenance,
         ),
     )
 
@@ -514,4 +520,60 @@ def _config_summary(config: DPmoireLiteConfig) -> dict[str, object]:
         "k_mesh": config.k_mesh,
         "encut_factor": config.encut_factor,
         "r_cut": config.r_cut,
+    }
+
+
+def _structure_identity_record(
+    path: Path,
+    relative_path: str,
+    atoms: Atoms | None = None,
+) -> dict[str, object]:
+    identity = structure_identity(path, atoms)
+    return {
+        "path": relative_path,
+        "sha256": identity.sha256,
+        "atom_count": identity.atom_count,
+        "ordered_elements": list(identity.ordered_elements),
+        "composition": dict(identity.composition),
+        "cell": [list(row) for row in identity.cell],
+    }
+
+
+def _stage0_structure_provenance(
+    config: DPmoireLiteConfig,
+    structures: StructureHandler,
+    stackings: list[tuple[int, int]],
+    rlx_poscars: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    if structures.top_atoms is None or structures.bot_atoms is None:
+        raise RuntimeError("Stage0 structure provenance requires loaded top and bottom inputs")
+
+    summary = _config_summary(config)
+    input_paths = {
+        "input/top_layer.poscar": (config.input_dir / "top_layer.poscar", structures.top_atoms),
+        "input/bot_layer.poscar": (config.input_dir / "bot_layer.poscar", structures.bot_atoms),
+    }
+    inputs = {
+        relative_path: _structure_identity_record(path, relative_path, atoms)
+        for relative_path, (path, atoms) in input_paths.items()
+    }
+    stacking_values = [[int(i), int(j)] for i, j in stackings]
+    return {
+        "schema": "dpmoire-lite.structure-provenance.v1",
+        "stage": 0,
+        "sc_rlx": bool(config.sc_rlx),
+        "sc": list(config.sc),
+        "sc_semantics": (
+            "stage0_relaxation_supercell"
+            if config.sc_rlx
+            else "stage0_relaxation_primitive"
+        ),
+        "n_sectors": list(config.n_sectors),
+        "symm_reduce": bool(config.symm_reduce),
+        "d": config.d,
+        "d_mode": config.d_mode,
+        "d_reference": summary["d_reference"],
+        "stackings": stacking_values,
+        "inputs": inputs,
+        "rlx_poscars": rlx_poscars,
     }

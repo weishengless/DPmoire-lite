@@ -2,15 +2,19 @@ import hashlib
 
 from ase import Atoms
 from ase.build import make_supercell
-from ase.io.vasp import write_vasp
+from ase.io.vasp import read_vasp, write_vasp
 import numpy as np
 import pytest
 
+from dpmoire_lite.build import run_build
+from dpmoire_lite.manifest import read_manifest
 from dpmoire_lite.provenance import (
     infer_inplane_supercell_relation,
     structure_identity,
     structure_identity_differences,
 )
+
+from test_build import write_build_config
 
 
 def make_primitive(symbols="H"):
@@ -20,6 +24,25 @@ def make_primitive(symbols="H"):
         cell=[[3.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 12.0]],
         pbc=True,
     )
+
+
+def make_stage0_config(tmp_path, **overrides):
+    data = {
+        "stage": 0,
+        "init_mlff": False,
+        "do_relaxation": True,
+        "twist_val": False,
+        "n_sectors": [2, 1],
+        "vasp_ml": False,
+    }
+    data.update(overrides)
+    return write_build_config(tmp_path, **data)
+
+
+def read_rlx_manifest(work):
+    result = read_manifest(work, "rlx")
+    assert result.manifest is not None
+    return result.manifest
 
 
 def test_structure_identity_records_hash_count_composition_and_cell(tmp_path):
@@ -113,3 +136,90 @@ def test_inplane_supercell_relation_checks_determinant_against_atom_multiplier()
 
     with pytest.raises(ValueError, match="determinant|atom"):
         infer_inplane_supercell_relation(primitive, wrong_count)
+
+
+def test_stage0_manifest_v2_records_structure_source_fields(tmp_path):
+    config = make_stage0_config(
+        tmp_path,
+        n_sectors=[2, 1],
+        sc=[2, 1],
+        sc_rlx=True,
+        d=4.5,
+        d_mode="surface_gap",
+        symm_reduce=False,
+    )
+
+    run_build(config, wait=False)
+
+    manifest = read_rlx_manifest(tmp_path / "work")
+    provenance = manifest.structure_provenance
+    assert provenance["schema"] == "dpmoire-lite.structure-provenance.v1"
+    assert provenance["stage"] == 0
+    assert provenance["sc_rlx"] is True
+    assert provenance["sc"] == [2, 1]
+    assert provenance["n_sectors"] == [2, 1]
+    assert provenance["symm_reduce"] is False
+    assert provenance["d"] == pytest.approx(4.5)
+    assert provenance["d_mode"] == "surface_gap"
+    assert provenance["stackings"] == [[0, 0], [1, 0]]
+
+
+def test_stage0_manifest_records_input_hashes(tmp_path):
+    config = make_stage0_config(tmp_path, n_sectors=[1, 1])
+
+    run_build(config, wait=False)
+
+    provenance = read_rlx_manifest(tmp_path / "work").structure_provenance
+    for name in ("top_layer.poscar", "bot_layer.poscar"):
+        path = tmp_path / "input" / name
+        record = provenance["inputs"][f"input/{name}"]
+        assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_stage0_manifest_records_every_generated_rlx_poscar_identity(tmp_path):
+    config = make_stage0_config(tmp_path, n_sectors=[2, 1])
+
+    run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    provenance = read_rlx_manifest(work).structure_provenance
+    expected_paths = {"rlx/0_0/POSCAR", "rlx/1_0/POSCAR"}
+    assert set(provenance["rlx_poscars"]) == expected_paths
+    for relative_path in expected_paths:
+        path = work / relative_path
+        record = provenance["rlx_poscars"][relative_path]
+        assert record["path"] == relative_path
+        assert record["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert record["atom_count"] == len(read_vasp(path))
+        assert record["composition"]
+        assert record["cell"]
+
+
+def test_stage0_manifest_stackings_match_generated_directories(tmp_path):
+    config = make_stage0_config(tmp_path, n_sectors=[2, 1])
+
+    run_build(config, wait=False)
+
+    manifest = read_rlx_manifest(tmp_path / "work")
+    generated_stackings = [
+        [int(part) for part in directory.removeprefix("rlx/").split("_")]
+        for directory in manifest.directories
+    ]
+    assert manifest.stackings == generated_stackings
+    assert manifest.structure_provenance["stackings"] == generated_stackings
+
+
+def test_stage0_manifest_records_sc_only_with_clear_stage0_semantics(tmp_path):
+    config = make_stage0_config(
+        tmp_path,
+        n_sectors=[1, 1],
+        sc=[2, 3],
+        sc_rlx=True,
+    )
+
+    run_build(config, wait=False)
+
+    provenance = read_rlx_manifest(tmp_path / "work").structure_provenance
+    assert provenance["sc"] == [2, 3]
+    assert provenance["sc_rlx"] is True
+    assert provenance["sc_semantics"] == "stage0_relaxation_supercell"
