@@ -275,7 +275,7 @@ Affected suite:
 Then run the standard full checkpoint. Suggested orchestrator commit:
 `docs: bootstrap plan execution governance`.
 
-After the commit, set ignored status to Task 2 `red`, name the exact Task 2
+After the commit, set ignored status to Task 2 `inspect`, name the exact Task 2
 allowed files, and stop.
 
 ## Task 2: Restore Top-level Anchors and the Legacy Warning
@@ -354,7 +354,7 @@ The worker returns an unstaged diff. The orchestrator reviews the public schema
 location and warning count, runs the standard full checkpoint, and creates the
 suggested commit `fix: restore stage anchor and legacy warning contracts`.
 
-Update ignored status to Task 3 `red` and stop.
+Update ignored status to Task 3 `inspect` and stop.
 
 ## Task 3: Make Structure and Symmetry Preflight Pure and Authoritative
 
@@ -453,7 +453,7 @@ Affected suite:
 
 Run the standard full checkpoint. Suggested orchestrator commit:
 `refactor: consume prepared build structures`. Update ignored status to Task 4
-`red` and stop.
+`inspect` and stop.
 
 ## Task 4: Prepare and Consume Every Remaining Build Input Once
 
@@ -540,7 +540,7 @@ Affected suite:
 ```
 
 Run the standard full checkpoint. Suggested orchestrator commit:
-`refactor: consume prepared build inputs`. Update ignored status to Task 5 `red`
+`refactor: consume prepared build inputs`. Update ignored status to Task 5 `inspect`
 and stop.
 
 ## Task 5: Restore Provenance Module Ownership and Close Plan 06R
