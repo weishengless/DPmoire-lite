@@ -1,5 +1,6 @@
 import math
 import shutil
+from pathlib import Path
 
 from ase import Atoms
 from ase.io.vasp import read_vasp, write_vasp
@@ -333,7 +334,8 @@ def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     write_converged_relaxation(work, with_velocity_block=True)
     init_mlff = work / "init_mlff"
     init_mlff.mkdir(parents=True)
-    (init_mlff / "ML_ABN").write_text("abn", encoding="utf-8")
+    seed = Path(__file__).parent / "data" / "mlab" / "complete_vasp_651.mlab"
+    shutil.copy2(seed, init_mlff / "ML_ABN")
     (init_mlff / "ML_FFN").write_text("ffn", encoding="utf-8")
 
     run_build(config, wait=False)
@@ -343,7 +345,7 @@ def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     assert (md_dir / "KPOINTS").exists()
     assert (md_dir / "POTCAR").exists()
     assert (md_dir / "DFT_script.sh").exists()
-    assert (md_dir / "ML_AB").read_text(encoding="utf-8") == "abn"
+    assert (md_dir / "ML_AB").read_bytes() == seed.read_bytes()
     assert (md_dir / "ML_FF").read_text(encoding="utf-8") == "ffn"
     poscar_text = (md_dir / "POSCAR").read_text(encoding="utf-8")
     assert "9.0 9.0 9.0" not in poscar_text

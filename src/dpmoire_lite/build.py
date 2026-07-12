@@ -11,6 +11,7 @@ from ase.build import make_supercell, sort
 from ase import Atoms
 from ase.io.vasp import read_vasp, write_vasp
 
+from .build_preflight import preflight_stage0, preflight_stage1
 from .config import ConfigError, DPmoireLiteConfig, load_config
 from .inputs import (
     copy_submit_script,
@@ -78,6 +79,7 @@ def run_build(config_path: Path, wait: bool = False) -> None:
 def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     config.validate_build_mode(wait)
     _check_target_stages_absent(config, _stage0_target_stages(config))
+    preflight_stage0(config)
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -108,6 +110,8 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
     config.validate_build_mode(wait)
     _check_target_stages_absent(config, _stage1_target_stages(config))
+    stackings = _stage1_stackings(config)
+    preflight_stage1(config, stackings)
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -120,9 +124,6 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         config.d_reference,
     )
     rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
-    stackings = _stage1_stackings(config)
-    check_stage1_inputs(config, stackings)
-
     md_dir = stage_dir(config.work_dir, "md")
     targets = [md_dir / f"{i}_{j}" for i, j in stackings]
     if config.include_monolayer_md:
