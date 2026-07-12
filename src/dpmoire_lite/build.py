@@ -390,19 +390,23 @@ def _stage1_stackings(config: DPmoireLiteConfig) -> list[tuple[int, int]]:
             "The relaxation stage may be an incomplete build; rebuild it before Stage1."
         )
     if result.kind == "legacy":
-        raise RuntimeError(
-            f"Legacy relaxation manifest at {path} is not accepted by Stage1; "
-            "a current Manifest v2 is required."
-        )
+        manifest_data = result.raw_data or {}
+        manifest_stackings = manifest_data.get("stackings")
+        if not manifest_stackings:
+            raise ValueError(
+                f"Invalid legacy relaxation manifest at {path}; stackings must not be empty."
+            )
+    else:
+        manifest = result.manifest
+        if manifest is None:
+            raise RuntimeError(f"Invalid relaxation manifest at {path}; no manifest data was loaded.")
+        manifest_stackings = manifest.stackings
 
-    manifest = result.manifest
-    if manifest is None:
-        raise RuntimeError(f"Invalid relaxation manifest at {path}; no manifest data was loaded.")
-    if not manifest.stackings:
+    if not manifest_stackings:
         raise ValueError(f"Invalid relaxation manifest at {path}; stackings must not be empty.")
 
     stackings: list[tuple[int, int]] = []
-    for stacking in manifest.stackings:
+    for stacking in manifest_stackings:
         if len(stacking) != 2:
             raise ValueError(
                 f"Invalid relaxation manifest at {path}; each stacking must contain two indices."

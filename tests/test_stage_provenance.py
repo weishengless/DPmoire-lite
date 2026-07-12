@@ -80,6 +80,37 @@ def prepare_stage1_case(tmp_path, *, stage0_overrides=None, stage1_overrides=Non
     return switch_to_stage1(config, **(stage1_overrides or {}))
 
 
+def write_legacy_relaxation_manifest(work, stackings):
+    path = work / "rlx" / "manifest.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "stage": "rlx",
+                "generated_at": "legacy-test",
+                "directories": [f"rlx/{i}_{j}" for i, j in stackings],
+                "stackings": [list(stacking) for stacking in stackings],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def prepare_legacy_case(tmp_path, *, stage0_overrides=None, stage1_overrides=None):
+    config = make_stage0_config(tmp_path, **(stage0_overrides or {}))
+    run_build(config, wait=False)
+    work = tmp_path / "work"
+    complete_stage0_relaxations(work)
+    stackings = read_rlx_manifest(work).stackings
+    write_legacy_relaxation_manifest(work, stackings)
+    return switch_to_stage1(config, **(stage1_overrides or {}))
+
+
+def rewrite_poscar_cell(path, cell):
+    atoms = read_vasp(path)
+    atoms.set_cell(cell, scale_atoms=False)
+    write_vasp(path, atoms=atoms, direct=True)
+
+
 def test_structure_identity_records_hash_count_composition_and_cell(tmp_path):
     path = tmp_path / "POSCAR"
     atoms = Atoms(
@@ -374,4 +405,126 @@ def test_stage1_aggregates_provenance_failures_across_stackings(tmp_path):
     message = str(exc_info.value)
     assert "input/top_layer.poscar" in message
     assert "rlx/1_0/POSCAR" in message
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_legacy_manifest_infers_primitive_from_count_composition_and_cell(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [1, 1], "sc_rlx": False},
+    )
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert len(atoms) == 2
+
+
+def test_legacy_manifest_infers_supercell_and_sc(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+    )
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert len(atoms) == 4
+    assert atoms.cell.lengths()[0] == pytest.approx(8.0)
+    assert atoms.cell.lengths()[1] == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize("sc", [[2, 1], [1, 2]])
+def test_legacy_manifest_distinguishes_same_determinant_directions(tmp_path, sc):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": sc, "sc_rlx": True},
+    )
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert len(atoms) == 4
+    assert atoms.cell.lengths()[:2] == pytest.approx([4.0 * sc[0], 4.0 * sc[1]])
+
+
+def test_legacy_manifest_rejects_count_cell_conflict(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+    )
+    poscar = tmp_path / "work" / "rlx" / "0_0" / "POSCAR"
+    atoms = read_vasp(poscar)
+    cell = atoms.cell.array.copy()
+    cell[0, 0] *= 0.75
+    rewrite_poscar_cell(poscar, cell)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    assert "cell" in str(exc_info.value).lower()
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_legacy_manifest_rejects_inconsistent_stackings(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [2, 1], "sc": [1, 1], "sc_rlx": False},
+    )
+    poscar = tmp_path / "work" / "rlx" / "1_0" / "POSCAR"
+    expanded = make_supercell(read_vasp(poscar), [[2, 0, 0], [0, 1, 0], [0, 0, 1]])
+    write_vasp(poscar, atoms=expanded, direct=True)
+    (poscar.parent / "CONTCAR").write_bytes(poscar.read_bytes())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    assert "consistent" in str(exc_info.value).lower()
+    assert not (tmp_path / "work" / "md").exists()
+
+
+@pytest.mark.parametrize("missing", ["POSCAR", "CONTCAR"])
+def test_legacy_manifest_rejects_missing_poscar_or_contcar(tmp_path, missing):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1]},
+    )
+    (tmp_path / "work" / "rlx" / "0_0" / missing).unlink()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    assert missing in str(exc_info.value)
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_legacy_manifest_rejects_changed_current_inputs(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc_rlx": False},
+    )
+    input_path = tmp_path / "input" / "top_layer.poscar"
+    atoms = read_vasp(input_path)
+    cell = atoms.cell.array.copy()
+    cell[0, 0] = 5.0
+    rewrite_poscar_cell(input_path, cell)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    assert "cell" in str(exc_info.value).lower()
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_legacy_inference_conflict_with_current_config_fails_before_md(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+        stage1_overrides={"sc_rlx": False},
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    assert "sc_rlx" in str(exc_info.value)
     assert not (tmp_path / "work" / "md").exists()

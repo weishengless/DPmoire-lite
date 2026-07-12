@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +16,10 @@ from .inputs import get_ordered_elements, read_enmax, resolve_potcar_dir
 from .mlab import MlabParseResult, parse_mlab
 from .manifest import Manifest, read_manifest
 from .provenance import (
+    CELL_ATOL,
+    CELL_RTOL,
     StructureIdentity,
+    inplane_supercell_relation,
     structure_identity,
     structure_identity_differences,
 )
@@ -139,7 +143,14 @@ def preflight_stage1(
     trusted_sc_rlx = None
     trusted_sc = None
     manifest_result = read_manifest(config.work_dir, "rlx")
-    if manifest_result.kind == "current" and manifest_result.manifest is not None:
+    if manifest_result.kind == "legacy":
+        trusted_sc_rlx, trusted_sc = _infer_legacy_stage1_provenance(
+            config,
+            stackings,
+            structures,
+            diagnostics,
+        )
+    elif manifest_result.kind == "current" and manifest_result.manifest is not None:
         provenance = manifest_result.manifest.structure_provenance
         if provenance:
             trusted_sc_rlx, trusted_sc = _validate_strict_stage1_provenance(
@@ -660,6 +671,234 @@ def _validate_strict_stage1_provenance(
         return None, None
     trusted_sc = tuple(config.sc) if not manifest_sc_rlx else manifest_sc
     return manifest_sc_rlx, trusted_sc
+
+
+def _legacy_composition(atoms) -> Counter[str]:
+    return Counter(atoms.get_chemical_symbols())
+
+
+def _infer_legacy_structure_source(primitive, candidate) -> tuple[bool, tuple[int, int] | None]:
+    primitive_count = len(primitive)
+    candidate_count = len(candidate)
+    if primitive_count <= 0:
+        raise ValueError("primitive bilayer has no atoms")
+
+    primitive_composition = _legacy_composition(primitive)
+    candidate_composition = _legacy_composition(candidate)
+    if candidate_count == primitive_count and candidate_composition == primitive_composition:
+        count_sc_rlx = False
+        multiplier = 1
+    else:
+        if candidate_count % primitive_count:
+            raise ValueError("atom count is not an integer multiple of the primitive bilayer")
+        multiplier = candidate_count // primitive_count
+        expected_composition = Counter(
+            {
+                symbol: count * multiplier
+                for symbol, count in primitive_composition.items()
+            }
+        )
+        if candidate_composition != expected_composition:
+            raise ValueError("atom count and composition do not agree on a supercell multiplier")
+        if multiplier <= 1:
+            raise ValueError("atom count and composition do not identify a supercell")
+        count_sc_rlx = True
+
+    primitive_cell = np.asarray(primitive.cell.array[:2, :2], dtype=float)
+    candidate_cell = np.asarray(candidate.cell.array[:2, :2], dtype=float)
+    cell_matches_primitive = np.allclose(
+        primitive_cell,
+        candidate_cell,
+        atol=CELL_ATOL,
+        rtol=CELL_RTOL,
+    )
+    if not count_sc_rlx:
+        if not cell_matches_primitive:
+            raise ValueError(
+                "atom count/composition identify a primitive structure but its "
+                "in-plane cell does not match the primitive bilayer"
+            )
+        return False, None
+
+    if cell_matches_primitive:
+        raise ValueError(
+            "atom count/composition identify a supercell but its in-plane cell "
+            "matches the primitive bilayer"
+        )
+    try:
+        relation = inplane_supercell_relation(primitive, candidate)
+    except ValueError as exc:
+        raise ValueError(f"supercell count/composition conflicts with its in-plane cell: {exc}") from exc
+    matrix = relation.matrix
+    if matrix[0][1] != 0 or matrix[1][0] != 0 or matrix[0][0] <= 0 or matrix[1][1] <= 0:
+        raise ValueError(
+            "in-plane cell transform is not a supported positive diagonal supercell"
+        )
+    if relation.determinant != multiplier:
+        raise ValueError(
+            "supercell count/composition multiplier conflicts with in-plane cell determinant"
+        )
+    return True, (matrix[0][0], matrix[1][1])
+
+
+def _legacy_topology_differences(expected, actual) -> tuple[str, ...]:
+    differences = []
+    if len(expected) != len(actual):
+        differences.append("atom_count")
+    if _legacy_composition(expected) != _legacy_composition(actual):
+        differences.append("composition")
+    return tuple(differences)
+
+
+def _infer_legacy_stage1_provenance(
+    config: DPmoireLiteConfig,
+    stackings: list[tuple[int, int]],
+    structures: StructureHandler | None,
+    diagnostics: list[PreflightDiagnostic],
+) -> tuple[bool | None, tuple[int, int] | None]:
+    start_diagnostics = len(diagnostics)
+    if structures is None or structures.new_struct is None:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=Path("rlx") / "manifest.yaml",
+                reason="legacy inference requires readable current input structures",
+            )
+        )
+        return None, None
+
+    primitive = structures.new_struct
+    conclusions: list[tuple[bool, tuple[int, int] | None]] = []
+    for i, j in stackings:
+        directory = Path("rlx") / f"{i}_{j}"
+        poscar = config.work_dir / directory / "POSCAR"
+        contcar = config.work_dir / directory / "CONTCAR"
+        if not poscar.is_file():
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=directory / "POSCAR",
+                    reason="legacy inference requires the Stage0 POSCAR",
+                )
+            )
+            continue
+        try:
+            candidate = read_vasp(poscar)
+        except Exception as exc:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=directory / "POSCAR",
+                    reason=f"legacy inference could not read POSCAR: {exc}",
+                )
+            )
+            continue
+        try:
+            conclusion = _infer_legacy_structure_source(primitive, candidate)
+        except ValueError as exc:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=directory / "POSCAR",
+                    reason=f"legacy inference failed: {exc}",
+                )
+            )
+            continue
+
+        if not contcar.is_file():
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=directory / "CONTCAR",
+                    reason="legacy inference requires the converged CONTCAR",
+                )
+            )
+            continue
+        try:
+            contcar_atoms = read_vasp(contcar)
+        except Exception as exc:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=directory / "CONTCAR",
+                    reason=f"legacy inference could not read CONTCAR: {exc}",
+                )
+            )
+            continue
+        topology_differences = _legacy_topology_differences(candidate, contcar_atoms)
+        if topology_differences:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=directory / "CONTCAR",
+                    reason=(
+                        "legacy inference CONTCAR topology/composition mismatch: "
+                        f"{', '.join(topology_differences)}"
+                    ),
+                )
+            )
+            continue
+        conclusions.append(conclusion)
+
+    if conclusions:
+        inferred_modes = {mode for mode, _ in conclusions}
+        inferred_supercells = {sc for mode, sc in conclusions if mode and sc is not None}
+        if len(inferred_modes) != 1:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path("rlx") / "manifest.yaml",
+                    reason="legacy inference produced inconsistent sc_rlx conclusions across stackings",
+                )
+            )
+        elif True in inferred_modes and len(inferred_supercells) != 1:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path("rlx") / "manifest.yaml",
+                    reason="legacy inference produced inconsistent supercell directions across stackings",
+                )
+            )
+
+    if len(diagnostics) != start_diagnostics:
+        return None, None
+    if not conclusions:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=Path("rlx") / "manifest.yaml",
+                reason="legacy inference found no usable stacking evidence",
+            )
+        )
+        return None, None
+
+    inferred_sc_rlx = conclusions[0][0]
+    inferred_sc = conclusions[0][1]
+    if config.sc_rlx != inferred_sc_rlx:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=Path("rlx") / "manifest.yaml",
+                reason=(
+                    "Legacy inference conflicts with current config: "
+                    f"inferred sc_rlx={inferred_sc_rlx!r}, current sc_rlx={config.sc_rlx!r}"
+                ),
+            )
+        )
+    elif inferred_sc_rlx and inferred_sc is not None and tuple(config.sc) != inferred_sc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=Path("rlx") / "manifest.yaml",
+                reason=(
+                    "Legacy inference conflicts with current config: "
+                    f"inferred sc={list(inferred_sc)!r}, current sc={list(config.sc)!r}"
+                ),
+            )
+        )
+    if len(diagnostics) != start_diagnostics:
+        return None, None
+    return inferred_sc_rlx, tuple(config.sc) if not inferred_sc_rlx else inferred_sc
 
 
 def _validate_templates(
