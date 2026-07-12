@@ -1,9 +1,11 @@
+import shutil
 import warnings
 
 import pytest
 
 import dpmoire_lite.build as build_module
 from dpmoire_lite.build import run_build
+from dpmoire_lite.manifest import read_manifest
 
 from test_build import write_build_config, write_converged_relaxation
 
@@ -22,6 +24,32 @@ def _assert_explicit_delete_message(error: Exception, *stages: str) -> None:
         assert stage in message
     assert "delete" in message or "remove" in message
     assert "rerun" in message or "run again" in message
+
+
+def _stage0_relaxation_config(tmp_path):
+    return write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        n_sectors=[2, 1],
+        vasp_ml=False,
+    )
+
+
+def _fail_once_on_second_relaxation_target(monkeypatch):
+    original = build_module._write_vasp_inputs
+    failed = False
+
+    def fail_once(config, output_dir, atoms, incar_template, rcut):
+        nonlocal failed
+        if output_dir.name == "1_0" and not failed:
+            failed = True
+            raise RuntimeError("synthetic second-target failure")
+        return original(config, output_dir, atoms, incar_template, rcut)
+
+    monkeypatch.setattr(build_module, "_write_vasp_inputs", fail_once)
 
 
 def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
@@ -432,3 +460,58 @@ def test_stage1_does_not_regenerate_stackings_from_config(tmp_path):
     assert "manifest" in message
     assert "rlx/1_0" not in message
     assert not (work / "md").exists()
+
+
+def test_stage_manifest_published_only_after_all_targets_in_that_stage_succeed(monkeypatch, tmp_path):
+    config = _stage0_relaxation_config(tmp_path)
+    _fail_once_on_second_relaxation_target(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="synthetic second-target failure"):
+        run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    assert (work / "rlx" / "0_0" / "POSCAR").is_file()
+    assert not (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_generation_failure_leaves_partial_stage_without_manifest(monkeypatch, tmp_path):
+    config = _stage0_relaxation_config(tmp_path)
+    _fail_once_on_second_relaxation_target(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="synthetic second-target failure"):
+        run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    assert (work / "rlx" / "0_0").is_dir()
+    assert (work / "rlx" / "1_0").is_dir()
+    assert not (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_rerun_rejects_partial_stage_until_user_deletes_it(monkeypatch, tmp_path):
+    config = _stage0_relaxation_config(tmp_path)
+    _fail_once_on_second_relaxation_target(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="synthetic second-target failure"):
+        run_build(config, wait=False)
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    _assert_explicit_delete_message(exc_info.value, "rlx")
+    assert not (tmp_path / "work" / "rlx" / "manifest.yaml").exists()
+
+
+def test_delete_partial_stage_then_rerun_succeeds(monkeypatch, tmp_path):
+    config = _stage0_relaxation_config(tmp_path)
+    _fail_once_on_second_relaxation_target(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="synthetic second-target failure"):
+        run_build(config, wait=False)
+
+    shutil.rmtree(tmp_path / "work" / "rlx")
+    run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    assert (work / "rlx" / "0_0" / "POSCAR").is_file()
+    assert (work / "rlx" / "1_0" / "POSCAR").is_file()
+    assert read_manifest(work, "rlx").manifest is not None

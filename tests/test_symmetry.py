@@ -4,7 +4,12 @@ from ase import Atoms
 from ase.io.vasp import write_vasp
 import pytest
 
+import dpmoire_lite.build as build_module
+from dpmoire_lite.build import run_build
+from dpmoire_lite.manifest import read_manifest
 from dpmoire_lite.structures import StructureHandler
+
+from test_build import write_build_config
 
 
 def make_handler(tmp_path, n_sectors):
@@ -58,3 +63,69 @@ def test_find_sym_reduced_stackings_reports_missing_optional_dependency(monkeypa
 
     with pytest.raises(RuntimeError, match="pymatgen.*spglib"):
         handler.find_sym_reduced_stackings()
+
+
+def test_symmetry_auxiliary_file_written_only_after_preflight(monkeypatch, tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        symm_reduce=True,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    artifact = tmp_path / "work" / "sym_reduced_stackings.txt"
+    preflight_called = False
+    real_preflight = build_module.preflight_stage0
+
+    def observe_preflight(config):
+        nonlocal preflight_called
+        preflight_called = True
+        assert not artifact.exists()
+        return real_preflight(config)
+
+    monkeypatch.setattr(build_module, "preflight_stage0", observe_preflight)
+    monkeypatch.setattr(
+        build_module.StructureHandler,
+        "find_sym_reduced_stackings",
+        lambda self: [(0, 0)],
+    )
+
+    run_build(config, wait=False)
+
+    assert preflight_called
+    assert artifact.is_file()
+    assert [tuple(map(int, artifact.read_text(encoding="utf-8").split()))] == [(0, 0)]
+
+
+def test_manifest_stackings_equal_generated_and_auxiliary_stackings(monkeypatch, tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        symm_reduce=True,
+        n_sectors=[2, 1],
+        vasp_ml=False,
+    )
+    selected = [(0, 0), (1, 0)]
+    monkeypatch.setattr(
+        build_module.StructureHandler,
+        "find_sym_reduced_stackings",
+        lambda self: selected,
+    )
+
+    run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    manifest = read_manifest(work, "rlx").manifest
+    assert manifest is not None
+    assert manifest.stackings == [list(stacking) for stacking in selected]
+    auxiliary = [
+        tuple(int(value) for value in line.split())
+        for line in (work / "sym_reduced_stackings.txt").read_text(encoding="utf-8").splitlines()
+    ]
+    assert auxiliary == selected
