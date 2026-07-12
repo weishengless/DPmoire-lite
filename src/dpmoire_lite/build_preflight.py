@@ -8,6 +8,7 @@ from pathlib import Path
 import warnings as pywarnings
 
 import numpy as np
+from ase.constraints import FixScaled
 from ase.io.vasp import read_vasp
 
 from .config import DPmoireLiteConfig
@@ -178,6 +179,50 @@ def preflight_stage1(
                     "schema": provenance.get("schema"),
                     "stackings": [[i, j] for i, j in stackings],
                 }
+
+    if config.preserve_grid_shift_md:
+        if manifest_result.kind == "legacy":
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path("rlx") / "manifest.yaml",
+                    reason=(
+                        "preserve_grid_shift_md requires strict Stage0 provenance; "
+                        "legacy relaxation manifests cannot preserve grid-shift anchors"
+                    ),
+                )
+            )
+        elif manifest_result.kind == "current" and manifest_result.manifest is not None:
+            provenance = manifest_result.manifest.structure_provenance
+            if not provenance:
+                diagnostics.append(
+                    PreflightDiagnostic(
+                        domain="provenance",
+                        path=Path("rlx") / "manifest.yaml",
+                        reason=(
+                            "preserve_grid_shift_md requires strict Stage0 provenance "
+                            "with grid_shift_anchors"
+                        ),
+                    )
+                )
+            else:
+                _validate_preserved_grid_shift_anchors(
+                    config,
+                    manifest_result.manifest,
+                    stackings,
+                    diagnostics,
+                )
+        else:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path("rlx") / "manifest.yaml",
+                    reason=(
+                        "preserve_grid_shift_md requires a current strict Stage0 "
+                        "relaxation manifest with grid_shift_anchors"
+                    ),
+                )
+            )
 
     initial_seed = None
     if config.vasp_ml:
@@ -691,6 +736,289 @@ def _validate_strict_stage1_provenance(
         return None, None
     trusted_sc = tuple(config.sc) if not manifest_sc_rlx else manifest_sc
     return manifest_sc_rlx, trusted_sc
+
+
+def _preserved_anchor_constraints(
+    record: Mapping,
+    path: Path,
+    diagnostics: list[PreflightDiagnostic],
+) -> dict[int, list[bool]] | None:
+    top_index = record.get("top_index")
+    bottom_index = record.get("bottom_index")
+    if (
+        any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in (top_index, bottom_index)
+        )
+        or top_index == bottom_index
+    ):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason="grid-shift anchor record must contain two distinct integer indices",
+            )
+        )
+        return None
+
+    fixed_masks = record.get("fixed_masks")
+    if not isinstance(fixed_masks, Mapping):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason="grid-shift anchor fixed_masks must be a mapping",
+            )
+        )
+        return None
+
+    normalized_masks: dict[int, object] = {}
+    for raw_index, mask in fixed_masks.items():
+        if isinstance(raw_index, bool):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason="grid-shift anchor fixed_masks indices must be integers",
+                )
+            )
+            continue
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason="grid-shift anchor fixed_masks indices must be integers",
+                )
+            )
+            continue
+        if index in normalized_masks:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason="grid-shift anchor fixed_masks contain duplicate indices",
+                )
+            )
+        normalized_masks[index] = mask
+
+    expected_indices = {top_index, bottom_index}
+    if set(normalized_masks) != expected_indices:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason=(
+                    "grid-shift anchor fixed_masks must contain exactly the top and "
+                    f"bottom indices: expected={sorted(expected_indices)!r}, "
+                    f"actual={sorted(normalized_masks)!r}"
+                ),
+            )
+        )
+        return None
+
+    expected: dict[int, list[bool]] = {}
+    for index in (top_index, bottom_index):
+        mask = normalized_masks[index]
+        if (
+            not isinstance(mask, (list, tuple))
+            or len(mask) != 3
+            or any(type(value) is not bool for value in mask)
+            or list(mask) != [True, True, False]
+        ):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason="grid-shift anchor fixed mask must be [true, true, false]",
+                )
+            )
+            return None
+        expected[index] = list(mask)
+    return expected
+
+
+def _source_constraint_set(
+    atoms,
+    path: Path,
+    diagnostics: list[PreflightDiagnostic],
+) -> dict[int, list[bool]]:
+    constraints: dict[int, list[bool]] = {}
+    for constraint in atoms.constraints:
+        if not isinstance(constraint, FixScaled):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason=(
+                        "source CONTCAR uses an unsupported constraint type; "
+                        "preserved anchors must use FixScaled"
+                    ),
+                )
+            )
+            continue
+        indexes = np.asarray(getattr(constraint, "index", []), dtype=int).reshape(-1)
+        mask = np.asarray(getattr(constraint, "mask", []), dtype=bool).reshape(-1)
+        if indexes.size != 1 or mask.shape != (3,):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason=(
+                        "source CONTCAR constraints must contain one atom and a "
+                        "three-component mask"
+                    ),
+                )
+            )
+            continue
+        index = int(indexes[0])
+        if index < 0 or index >= len(atoms) or index in constraints:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=path,
+                    reason="source CONTCAR constraints contain invalid or duplicate anchor indices",
+                )
+            )
+            continue
+        constraints[index] = mask.tolist()
+    return constraints
+
+
+def _validate_preserved_grid_shift_anchors(
+    config: DPmoireLiteConfig,
+    manifest: Manifest,
+    stackings: list[tuple[int, int]],
+    diagnostics: list[PreflightDiagnostic],
+) -> None:
+    manifest_path = Path("rlx") / "manifest.yaml"
+    provenance = manifest.structure_provenance
+    anchors = provenance.get("grid_shift_anchors")
+    if not isinstance(anchors, Mapping):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason="preserve_grid_shift_md requires grid_shift_anchors mapping",
+            )
+        )
+        return
+
+    for i, j in stackings:
+        relative_directory = f"rlx/{i}_{j}"
+        display_path = Path(relative_directory)
+        anchor_record = anchors.get(relative_directory)
+        if not isinstance(anchor_record, Mapping):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path,
+                    reason="missing or invalid grid-shift anchor record",
+                )
+            )
+            continue
+
+        expected_constraints = _preserved_anchor_constraints(
+            anchor_record,
+            display_path,
+            diagnostics,
+        )
+        poscar = config.work_dir / relative_directory / "POSCAR"
+        contcar = config.work_dir / relative_directory / "CONTCAR"
+        try:
+            poscar_atoms = read_vasp(poscar)
+            poscar_identity = structure_identity(poscar, poscar_atoms)
+        except Exception as exc:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "POSCAR",
+                    reason=f"could not validate preserved-anchor POSCAR: {exc}",
+                )
+            )
+            continue
+
+        expected_atom_count = anchor_record.get("atom_count")
+        expected_hash = anchor_record.get("poscar_sha256")
+        if (
+            isinstance(expected_atom_count, bool)
+            or not isinstance(expected_atom_count, int)
+            or expected_atom_count != poscar_identity.atom_count
+        ):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "POSCAR",
+                    reason=(
+                        "preserved grid-shift anchor atom_count does not match POSCAR: "
+                        f"anchor={expected_atom_count!r}, actual={poscar_identity.atom_count!r}"
+                    ),
+                )
+            )
+        if not isinstance(expected_hash, str) or expected_hash != poscar_identity.sha256:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "POSCAR",
+                    reason=(
+                        "preserved grid-shift anchor POSCAR hash does not match "
+                        f"the current POSCAR: anchor={expected_hash!r}, "
+                        f"actual={poscar_identity.sha256!r}"
+                    ),
+                )
+            )
+
+        try:
+            contcar_atoms = read_vasp(contcar)
+        except Exception as exc:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "CONTCAR",
+                    reason=f"could not validate preserved grid-shift anchors: {exc}",
+                )
+            )
+            continue
+
+        if len(poscar_atoms) != len(contcar_atoms):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "CONTCAR",
+                    reason=(
+                        "preserved grid-shift anchor atom order/count mismatch: "
+                        f"POSCAR={len(poscar_atoms)}, CONTCAR={len(contcar_atoms)}"
+                    ),
+                )
+            )
+        elif poscar_atoms.get_chemical_symbols() != contcar_atoms.get_chemical_symbols():
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "CONTCAR",
+                    reason="preserved grid-shift anchor atom order mismatch",
+                )
+            )
+
+        actual_constraints = _source_constraint_set(
+            contcar_atoms,
+            display_path / "CONTCAR",
+            diagnostics,
+        )
+        if expected_constraints is not None and actual_constraints != expected_constraints:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path / "CONTCAR",
+                    reason=(
+                        "source CONTCAR constraint set does not exactly match "
+                        "the two manifest grid-shift anchors: "
+                        f"expected={expected_constraints!r}, actual={actual_constraints!r}"
+                    ),
+                )
+            )
 
 
 def _legacy_composition(atoms) -> Counter[str]:

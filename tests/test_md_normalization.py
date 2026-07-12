@@ -3,14 +3,17 @@ import hashlib
 import numpy as np
 from ase.io.vasp import read_vasp
 from ase.io.vasp import write_vasp
+from ase.constraints import FixAtoms
+from ase.constraints import FixScaled
 from ase.constraints import FixedLine
 import pytest
 
 from dpmoire_lite.build import run_build
 from dpmoire_lite.manifest import read_manifest
+from dpmoire_lite.manifest import write_manifest
 
 from test_build import read_selective_dynamics_flags, write_build_config
-from test_stage_provenance import complete_stage0_relaxations, prepare_stage1_case, switch_to_stage1
+from test_stage_provenance import complete_stage0_relaxations, prepare_legacy_case, prepare_stage1_case, switch_to_stage1
 
 
 def build_stage0(tmp_path, **overrides):
@@ -227,3 +230,171 @@ def test_monolayer_constraint_clear_emits_one_warning(tmp_path):
 
     assert len(caught) == 1
     assert "constraint" in str(caught[0].message).lower()
+
+
+def _prepare_three_atom_preserve_stage1(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        n_sectors=[1, 1],
+        sc_rlx=True,
+        sc=[1, 1],
+        include_monolayer_md=False,
+    )
+    (tmp_path / "input" / "top_layer.poscar").write_text(
+        """H
+1.0
+  4.0 0.0 0.0
+  0.0 4.0 0.0
+  0.0 0.0 12.0
+H
+2
+Direct
+  0.0 0.0 0.25
+  0.5 0.5 0.25
+""",
+        encoding="utf-8",
+    )
+
+    run_build(config, wait=False)
+    complete_stage0_relaxations(tmp_path / "work")
+    switch_to_stage1(config, preserve_grid_shift_md=True)
+    return config
+
+
+def _preserve_anchor_record(tmp_path):
+    manifest = read_manifest(tmp_path / "work", "rlx").manifest
+    assert manifest is not None
+    return manifest, manifest.structure_provenance["grid_shift_anchors"]["rlx/0_0"]
+
+
+def _rewrite_constraints(path, constraints):
+    atoms = read_vasp(path)
+    atoms.set_constraint(constraints)
+    write_vasp(path, atoms=atoms, direct=True, sort=False)
+
+
+def _replace_constraint(path, target_index, replacement):
+    atoms = read_vasp(path)
+    constraints = []
+    for constraint in atoms.constraints:
+        indices = np.asarray(constraint.index, dtype=int).reshape(-1)
+        if target_index in indices:
+            constraints.append(replacement)
+        else:
+            constraints.append(constraint)
+    _rewrite_constraints(path, constraints)
+
+
+def test_preserve_true_accepts_exact_two_manifest_anchors(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    _, record = _preserve_anchor_record(tmp_path)
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert len(atoms.constraints) == 2
+    assert {
+        int(index)
+        for constraint in atoms.constraints
+        for index in np.asarray(constraint.index, dtype=int).reshape(-1)
+    } == {record["top_index"], record["bottom_index"]}
+    assert all(
+        list(constraint.mask) == [True, True, False]
+        for constraint in atoms.constraints
+    )
+
+
+def test_preserve_true_rejects_missing_anchor(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    contcar = tmp_path / "work" / "rlx" / "0_0" / "CONTCAR"
+    atoms = read_vasp(contcar)
+    _rewrite_constraints(contcar, list(atoms.constraints)[:1])
+
+    with pytest.raises(RuntimeError, match="anchor|constraint|preserve"):
+        run_build(config, wait=False)
+
+
+def test_preserve_true_rejects_extra_constraint(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    contcar = tmp_path / "work" / "rlx" / "0_0" / "CONTCAR"
+    _, record = _preserve_anchor_record(tmp_path)
+    atoms = read_vasp(contcar)
+    extra_index = next(
+        index
+        for index in range(len(atoms))
+        if index not in {record["top_index"], record["bottom_index"]}
+    )
+    _rewrite_constraints(
+        contcar,
+        [*atoms.constraints, FixScaled([extra_index], [True, True, False])],
+    )
+
+    with pytest.raises(RuntimeError, match="anchor|constraint|preserve"):
+        run_build(config, wait=False)
+
+
+def test_preserve_true_rejects_changed_fixed_mask(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    _, record = _preserve_anchor_record(tmp_path)
+    contcar = tmp_path / "work" / "rlx" / "0_0" / "CONTCAR"
+    _replace_constraint(
+        contcar,
+        record["top_index"],
+        FixScaled([record["top_index"]], [False, True, False]),
+    )
+
+    with pytest.raises(RuntimeError, match="anchor|constraint|preserve"):
+        run_build(config, wait=False)
+
+
+def test_preserve_true_rejects_other_constraint_type(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    _, record = _preserve_anchor_record(tmp_path)
+    contcar = tmp_path / "work" / "rlx" / "0_0" / "CONTCAR"
+    _replace_constraint(
+        contcar,
+        record["top_index"],
+        FixAtoms([record["top_index"]]),
+    )
+
+    with pytest.raises(RuntimeError, match="anchor|constraint|preserve"):
+        run_build(config, wait=False)
+
+
+def test_preserve_true_rejects_atom_order_or_hash_mismatch(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    manifest, _ = _preserve_anchor_record(tmp_path)
+    manifest.structure_provenance["grid_shift_anchors"]["rlx/0_0"][
+        "poscar_sha256"
+    ] = "0" * 64
+    write_manifest(tmp_path / "work", manifest)
+
+    with pytest.raises(RuntimeError, match="anchor|hash|constraint|preserve"):
+        run_build(config, wait=False)
+
+
+def test_preserve_true_rejects_legacy_manifest(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc_rlx": False, "sc": [1, 1]},
+        stage1_overrides={
+            "preserve_grid_shift_md": True,
+            "sc_rlx": False,
+            "sc": [1, 1],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="legacy|anchor|preserve"):
+        run_build(config, wait=False)
+
+
+def test_preserve_validation_failure_leaves_md_absent(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    contcar = tmp_path / "work" / "rlx" / "0_0" / "CONTCAR"
+    atoms = read_vasp(contcar)
+    _rewrite_constraints(contcar, list(atoms.constraints)[:1])
+
+    with pytest.raises(RuntimeError, match="anchor|constraint|preserve"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
