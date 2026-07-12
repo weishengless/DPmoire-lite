@@ -370,3 +370,65 @@ def test_preflight_warnings_are_deduplicated_per_template_and_tag(tmp_path):
     assert len(matching) == 1
     assert (tmp_path / "work" / "rlx" / "0_0").is_dir()
     assert (tmp_path / "work" / "rlx" / "1_0").is_dir()
+
+
+def test_stage1_missing_relaxation_manifest_fails_without_md_change(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value).lower()
+    assert "manifest" in message
+    assert "rlx" in message
+    assert not (work / "md").exists()
+
+
+def test_stage1_does_not_use_sym_reduced_file_without_manifest(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[2, 1],
+        symm_reduce=True,
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+    (work / "sym_reduced_stackings.txt").write_text("0 0\n", encoding="utf-8")
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value).lower()
+    assert "manifest" in message
+    assert "rlx" in message
+    assert not (work / "md").exists()
+
+
+def test_stage1_does_not_regenerate_stackings_from_config(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[2, 1],
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+
+    with pytest.raises(Exception) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value).lower()
+    assert "manifest" in message
+    assert "rlx/1_0" not in message
+    assert not (work / "md").exists()

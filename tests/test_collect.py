@@ -213,3 +213,47 @@ def test_collect_validation_uses_all_ionic_steps(monkeypatch, tmp_path):
     assert seen_freqs == [1]
     manifest = read_manifest(work, "validation")
     assert manifest.collect["frames"] == 1
+
+
+def test_collect_missing_stage_manifest_fails_without_output_or_manifest(tmp_path):
+    config_path = write_collect_config(tmp_path, vasp_ml=False)
+    work = tmp_path / "work"
+
+    with pytest.raises(Exception) as exc_info:
+        run_collect(config_path, stage="rlx")
+
+    message = str(exc_info.value).lower()
+    assert "manifest" in message
+    assert "rlx" in message
+    assert not (work / "rlx_data.extxyz").exists()
+    assert not (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_collect_does_not_derive_directories_from_config(tmp_path):
+    config_path = write_collect_config(tmp_path, vasp_ml=False, n_sectors=[2, 1])
+    work = tmp_path / "work"
+    (work / "rlx" / "0_0").mkdir(parents=True)
+
+    with pytest.raises(Exception) as exc_info:
+        run_collect(config_path, stage="rlx")
+
+    message = str(exc_info.value).lower()
+    assert "manifest" in message
+    assert "rlx" in message
+    assert not (work / "rlx_data.extxyz").exists()
+    assert not (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_collect_does_not_scan_validation_directories_without_manifest(tmp_path):
+    config_path = write_collect_config(tmp_path, vasp_ml=False)
+    work = tmp_path / "work"
+    (work / "validation" / "1.00deg").mkdir(parents=True)
+
+    with pytest.raises(Exception) as exc_info:
+        run_collect(config_path, stage="validation")
+
+    message = str(exc_info.value).lower()
+    assert "manifest" in message
+    assert "validation" in message
+    assert not (work / "valid.extxyz").exists()
+    assert not (work / "validation" / "manifest.yaml").exists()
