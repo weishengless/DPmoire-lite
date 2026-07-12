@@ -19,57 +19,26 @@ from .build_preflight import (
 )
 from .config import ConfigError, DPmoireLiteConfig, load_config
 from .inputs import (
-    copy_submit_script,
-    copy_vdw_if_needed,
+    PreparedIncarTemplate,
+    PreparedPotcar,
+    PreparedSource,
+    copy_prepared_source,
     get_ordered_elements,
-    render_incar,
+    render_prepared_incar,
     stage_mlff_files,
     write_kpoints,
-    write_potcar,
+    write_prepared_potcar,
     write_supercell_poscar,
 )
 from .manifest import Manifest, write_manifest
 from .mlab import seed_prefix_identity
-from .paths import backup_existing_directory, relative_to_workdir, stage_dir
+from .paths import backup_existing_directory, relative_to_workdir
 from .provenance import structure_identity
 from .slurm import SlurmJob, SlurmRunner
-from .structures import StructureHandler, generate_stackings, supercell_matrix
+from .structures import StructureHandler, supercell_matrix
 
 
 VASP_RELAXATION_CONVERGED_PHRASE = "reached required accuracy - stopping structural energy minimisation"
-
-
-def _stage0_target_stages(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
-    targets = []
-    if config.init_mlff:
-        targets.append(("init_mlff", stage_dir(config.work_dir, "init_mlff")))
-    if config.do_relaxation:
-        targets.append(("rlx", stage_dir(config.work_dir, "rlx")))
-    if config.twist_val:
-        targets.append(("validation", stage_dir(config.work_dir, "validation")))
-    return targets
-
-
-def _stage1_target_stages(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
-    return [("md", stage_dir(config.work_dir, "md"))]
-
-
-def _check_target_stages_absent(config: DPmoireLiteConfig, targets: list[tuple[str, Path]]) -> None:
-    conflicts = [(stage, path) for stage, path in targets if path.exists()]
-    if not conflicts:
-        return
-
-    details = "\n".join(
-        f"- {stage} ({relative_to_workdir(config.work_dir, path)}) already exists"
-        for stage, path in conflicts
-    )
-    raise RuntimeError(
-        "Build target conflict(s):\n"
-        f"{details}\n"
-        "DPmoire-lite does not rebuild stages in place. "
-        "Delete the listed stage directories and rerun the build. "
-        "No files were modified."
-    )
 
 
 def run_build(config_path: Path, wait: bool = False) -> None:
@@ -83,30 +52,109 @@ def run_build(config_path: Path, wait: bool = False) -> None:
         build_stage_all(config, wait=wait)
 
 
+def _prepared_template(
+    templates: dict[str, PreparedIncarTemplate],
+    name: str,
+) -> PreparedIncarTemplate:
+    try:
+        return templates[name]
+    except KeyError as exc:
+        raise RuntimeError(f"Preflight did not prepare required template {name}") from exc
+
+
+def _take_prepared_output_dirs(
+    output_dirs,
+    count: int,
+    label: str,
+) -> tuple[Path, ...]:
+    selected = []
+    for _index in range(count):
+        try:
+            selected.append(next(output_dirs))
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"Preflight did not return every required {label} output directory"
+            ) from exc
+    return tuple(selected)
+
+
+def _assert_no_prepared_output_dirs_remain(output_dirs) -> None:
+    try:
+        extra = next(output_dirs)
+    except StopIteration:
+        return
+    raise RuntimeError(f"Preflight returned an unexpected output directory: {extra}")
+
+
 def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     config.validate_build_mode(wait)
-    _check_target_stages_absent(config, _stage0_target_stages(config))
     preflight = preflight_stage0(config)
     if preflight.structures is None or preflight.rcut is None:
         raise RuntimeError("Stage0 preflight did not return prepared structures and rcut")
+    if preflight.submit_script is None:
+        raise RuntimeError("Stage0 preflight did not return a prepared submit script")
     structures = preflight.structures
     rcut = preflight.rcut
     stackings = preflight.stackings
+    templates = {template.name: template for template in preflight.templates}
+    output_dirs = iter(preflight.output_dirs)
+    init_dir = (
+        _take_prepared_output_dirs(output_dirs, 1, "init_mlff")[0]
+        if config.init_mlff
+        else None
+    )
+    relaxation_dirs = _take_prepared_output_dirs(
+        output_dirs,
+        len(stackings) if config.do_relaxation else 0,
+        "rlx",
+    )
+    validation_dirs = _take_prepared_output_dirs(
+        output_dirs,
+        len(preflight.validation_structures) if config.twist_val else 0,
+        "validation",
+    )
+    _assert_no_prepared_output_dirs_remain(output_dirs)
     generated_at = datetime.now().isoformat(timespec="seconds")
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
     if config.symm_reduce:
         structures.write_sym_reduced_stackings(list(stackings))
     runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
 
     if config.init_mlff:
-        _build_init_mlff(config, structures, rcut, generated_at, timestamp, runner, wait)
+        _build_init_mlff(
+            config,
+            structures,
+            init_dir,
+            _prepared_template(templates, "init_INCAR"),
+            preflight.potcars,
+            preflight.submit_script,
+            rcut,
+            generated_at,
+            runner,
+            wait,
+        )
     if config.do_relaxation:
-        _build_relaxations(config, structures, stackings, rcut, generated_at, timestamp, runner, wait)
+        _build_relaxations(
+            config,
+            structures,
+            stackings,
+            relaxation_dirs,
+            _prepared_template(templates, "rlx_INCAR"),
+            preflight.potcars,
+            preflight.submit_script,
+            rcut,
+            generated_at,
+            runner,
+            wait,
+        )
     if config.twist_val:
         _build_validation(
             config,
             preflight.validation_structures,
+            validation_dirs,
+            _prepared_template(templates, "val_INCAR"),
+            preflight.potcars,
+            preflight.submit_script,
             rcut,
             generated_at,
             runner,
@@ -116,20 +164,30 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
 
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
     config.validate_build_mode(wait)
-    _check_target_stages_absent(config, _stage1_target_stages(config))
     preflight = preflight_stage1(config)
     if preflight.structures is None or preflight.rcut is None:
         raise RuntimeError("Stage1 preflight did not return prepared structures and rcut")
+    if preflight.submit_script is None:
+        raise RuntimeError("Stage1 preflight did not return a prepared submit script")
     structures = preflight.structures
     rcut = preflight.rcut
     stackings = preflight.stackings
+    templates = {template.name: template for template in preflight.templates}
+    output_dirs = iter(preflight.output_dirs)
+    relaxation_output_dirs = _take_prepared_output_dirs(
+        output_dirs,
+        len(preflight.relaxations),
+        "md relaxations",
+    )
+    monolayer_output_dirs = _take_prepared_output_dirs(
+        output_dirs,
+        2 if config.include_monolayer_md else 0,
+        "md monolayers",
+    )
+    _assert_no_prepared_output_dirs_remain(output_dirs)
     mlff_seed = _stage1_mlff_seed_identity(config, preflight)
     generated_at = datetime.now().isoformat(timespec="seconds")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    md_dir = stage_dir(config.work_dir, "md")
-    targets = [md_dir / f"{i}_{j}" for i, j in stackings]
-    if config.include_monolayer_md:
-        targets.extend([md_dir / "top_layer", md_dir / "bot_layer"])
     backups = []
 
     directories = []
@@ -139,9 +197,12 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         md_sc = None if config.sc_rlx else config.sc
     else:
         md_sc = None if preflight.trusted_sc_rlx else preflight.trusted_sc
-    for relaxation in preflight.relaxations:
+    for relaxation, target in zip(
+        preflight.relaxations,
+        relaxation_output_dirs,
+        strict=True,
+    ):
         i, j = relaxation.stacking
-        target = md_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
         atoms, anchor_records = _write_md_poscar(
             relaxation.atoms.copy(),
@@ -151,7 +212,15 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         )
         if anchor_records is not None:
             md_anchor_records[relative_to_workdir(config.work_dir, target)] = anchor_records
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
+        _write_vasp_inputs(
+            config,
+            target,
+            atoms,
+            _prepared_template(templates, "MD_INCAR"),
+            rcut,
+            preflight.potcars,
+            preflight.submit_script,
+        )
         if config.vasp_ml:
             stage_mlff_files(init_mlff_dir, target)
             _verify_staged_mlff_files(init_mlff_dir, target, mlff_seed)
@@ -163,10 +232,13 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             "top_layer": structures.top_atoms,
             "bot_layer": structures.bot_atoms,
         }
-        for layer_name, source_atoms in layer_sources.items():
+        for (layer_name, source_atoms), target in zip(
+            layer_sources.items(),
+            monolayer_output_dirs,
+            strict=True,
+        ):
             if source_atoms is None:
                 raise RuntimeError(f"Stage1 preflight did not return {layer_name} atoms")
-            target = md_dir / layer_name
             target.mkdir(parents=True, exist_ok=True)
             atoms = source_atoms.copy()
             had_constraints = _normalize_stage1_structure(
@@ -179,7 +251,15 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(config.sc)))
             _assert_stage1_structure_cleared(atoms_sc)
             write_vasp(target / "POSCAR", atoms=atoms_sc)
-            _write_vasp_inputs(config, target, atoms_sc, config.input_dir / "MD_monolayer_INCAR", rcut)
+            _write_vasp_inputs(
+                config,
+                target,
+                atoms_sc,
+                _prepared_template(templates, "MD_monolayer_INCAR"),
+                rcut,
+                preflight.potcars,
+                preflight.submit_script,
+            )
             if config.vasp_ml:
                 stage_mlff_files(init_mlff_dir, target)
                 _verify_staged_mlff_files(init_mlff_dir, target, mlff_seed)
@@ -277,38 +357,8 @@ def build_stage_all(
     if config.stage != "all":
         raise ConfigError("build_stage_all requires stage: all")
     config.validate_build_mode(wait)
-
-    generated_at = datetime.now().isoformat(timespec="seconds")
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    config.work_dir.mkdir(parents=True, exist_ok=True)
-    structures = StructureHandler(
-        config.input_dir,
-        config.work_dir,
-        config.n_sectors,
-        config.d,
-        config.d_mode,
-        config.d_reference,
-    )
-    rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
-    stackings = (
-        structures.find_sym_reduced_stackings()
-        if config.symm_reduce
-        else generate_stackings(config.n_sectors)
-    )
-    runner = (
-        runner_factory(config)
-        if runner_factory is not None
-        else SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub)
-    )
-
-    if config.init_mlff:
-        _build_init_mlff(config, structures, rcut, generated_at, timestamp, runner, wait=True)
-    if config.do_relaxation:
-        _build_relaxations(config, structures, stackings, rcut, generated_at, timestamp, runner, wait=True)
-    if config.twist_val:
-        _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait=True)
-
-    build_stage1(config, wait=True, runner=runner)
+    del runner_factory
+    raise ConfigError("stage: all is unavailable")
 
 
 def check_relaxation_converged(directory: Path) -> None:
@@ -364,13 +414,15 @@ def prepare_init_mlff_step2(init_dir: Path, input_dir: Path, sc: tuple[int, int]
 def _build_init_mlff(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
+    init_dir: Path,
+    template: PreparedIncarTemplate,
+    potcars: tuple[PreparedPotcar, ...],
+    submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
-    timestamp: str,
     runner: SlurmRunner | None,
     wait: bool,
 ) -> None:
-    init_dir = stage_dir(config.work_dir, "init_mlff")
     backups = []
     init_dir.mkdir(parents=True, exist_ok=True)
     if structures.bot_atoms is None:
@@ -382,7 +434,15 @@ def _build_init_mlff(
         )
     )
     write_vasp(init_dir / "POSCAR", atoms=atoms)
-    _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", rcut)
+    _write_vasp_inputs(
+        config,
+        init_dir,
+        atoms,
+        template,
+        rcut,
+        potcars,
+        submit_script,
+    )
     jobs = _submit_dirs(config, runner, [init_dir], wait)
     if runner is not None and wait:
         prepare_init_mlff_step2(init_dir, config.input_dir, config.sc)
@@ -404,20 +464,20 @@ def _build_relaxations(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
     stackings: tuple[tuple[int, int], ...],
+    target_dirs: tuple[Path, ...],
+    template: PreparedIncarTemplate,
+    potcars: tuple[PreparedPotcar, ...],
+    submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
-    timestamp: str,
     runner: SlurmRunner | None,
     wait: bool,
 ) -> None:
-    rlx_dir = stage_dir(config.work_dir, "rlx")
-    targets = [rlx_dir / f"{i}_{j}" for i, j in stackings]
     backups = []
     directories = []
     rlx_poscars = {}
     grid_shift_anchors = {}
-    for i, j in stackings:
-        target = rlx_dir / f"{i}_{j}"
+    for (i, j), target in zip(stackings, target_dirs, strict=True):
         target.mkdir(parents=True, exist_ok=True)
         atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
         write_vasp(target / "POSCAR", atoms=atoms)
@@ -432,7 +492,15 @@ def _build_relaxations(
             top_indexes,
             bot_indexes,
         )
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", rcut)
+        _write_vasp_inputs(
+            config,
+            target,
+            atoms,
+            template,
+            rcut,
+            potcars,
+            submit_script,
+        )
         directories.append(target)
     jobs = _submit_dirs(config, runner, directories, wait)
     provenance = _stage0_structure_provenance(
@@ -460,20 +528,30 @@ def _build_relaxations(
 def _build_validation(
     config: DPmoireLiteConfig,
     validation_structures: tuple[PreparedValidationStructure, ...],
+    target_dirs: tuple[Path, ...],
+    template: PreparedIncarTemplate,
+    potcars: tuple[PreparedPotcar, ...],
+    submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
     runner: SlurmRunner | None,
     wait: bool,
 ) -> None:
-    validation_dir = stage_dir(config.work_dir, "validation")
-    directories = [validation_dir / record.angle for record in validation_structures]
+    directories = list(target_dirs)
     backups = []
-    for record in validation_structures:
-        target = validation_dir / record.angle
+    for record, target in zip(validation_structures, target_dirs, strict=True):
         target.mkdir(parents=True, exist_ok=True)
         atoms = record.atoms.copy()
         write_vasp(target / "POSCAR", atoms=atoms)
-        _write_vasp_inputs(config, target, atoms, config.input_dir / "val_INCAR", rcut)
+        _write_vasp_inputs(
+            config,
+            target,
+            atoms,
+            template,
+            rcut,
+            potcars,
+            submit_script,
+        )
     jobs = _submit_dirs(config, runner, directories, wait)
     write_manifest(
         config.work_dir,
@@ -629,39 +707,31 @@ def _write_vasp_inputs(
     config: DPmoireLiteConfig,
     output_dir: Path,
     atoms: Atoms,
-    incar_template: Path,
+    template: PreparedIncarTemplate,
     rcut: float,
+    potcars: tuple[PreparedPotcar, ...],
+    submit_script: PreparedSource,
 ) -> None:
     elements = _ordered_elements(atoms)
-    max_enmax = write_potcar(elements, config.potcar_dir, output_dir / "POTCAR", potcar_policy=config.potcar_policy)
-    render_incar(
-        incar_template,
+    max_enmax = write_prepared_potcar(elements, potcars, output_dir / "POTCAR")
+    render_prepared_incar(
+        template,
         output_dir / "INCAR",
         encut=max_enmax * config.encut_factor,
         rcut1=rcut,
         rcut2=rcut,
-        elements=elements,
     )
     write_kpoints(output_dir, atoms.cell.array, config.k_mesh)
-    copy_submit_script(config.script_dir, config.dft_script, output_dir)
-    copy_vdw_if_needed(incar_template, config.input_dir, output_dir)
+    copy_prepared_source(submit_script, output_dir / submit_script.path.name)
+    if template.vdw_source is not None:
+        copy_prepared_source(
+            template.vdw_source,
+            output_dir / template.vdw_source.path.name,
+        )
 
 
 def _ordered_elements(atoms: Atoms) -> list[str]:
     return get_ordered_elements(atoms)
-
-
-def _resolve_rcut(config: DPmoireLiteConfig, top_atoms: Atoms | None, bot_atoms: Atoms | None) -> float:
-    if config.r_cut >= 0:
-        return config.r_cut
-    if top_atoms is None or bot_atoms is None:
-        raise ValueError("Input layer cells are required to resolve default r_cut")
-    max_layer_a = max(
-        float(np.linalg.norm(atoms.cell.array[index]))
-        for atoms in (top_atoms, bot_atoms)
-        for index in (0, 1)
-    )
-    return float(np.sqrt(max_layer_a**2 + config.d**2) * 1.1)
 
 
 def _backup_targets(work_dir: Path, stage: str, targets: list[Path], timestamp: str) -> list[str]:

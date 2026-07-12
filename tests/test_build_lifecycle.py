@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import warnings
 from pathlib import Path
@@ -6,6 +7,8 @@ import pytest
 from ase import Atoms
 
 import dpmoire_lite.build as build_module
+import dpmoire_lite.build_preflight as preflight_module
+import dpmoire_lite.inputs as inputs_module
 from dpmoire_lite.build import run_build
 from dpmoire_lite.config import load_config
 from dpmoire_lite.manifest import read_manifest
@@ -45,12 +48,28 @@ def _fail_once_on_second_relaxation_target(monkeypatch):
     original = build_module._write_vasp_inputs
     failed = False
 
-    def fail_once(config, output_dir, atoms, incar_template, rcut):
+    def fail_once(
+        config,
+        output_dir,
+        atoms,
+        incar_template,
+        rcut,
+        potcars,
+        submit_script,
+    ):
         nonlocal failed
         if output_dir.name == "1_0" and not failed:
             failed = True
             raise RuntimeError("synthetic second-target failure")
-        return original(config, output_dir, atoms, incar_template, rcut)
+        return original(
+            config,
+            output_dir,
+            atoms,
+            incar_template,
+            rcut,
+            potcars,
+            submit_script,
+        )
 
     monkeypatch.setattr(build_module, "_write_vasp_inputs", fail_once)
 
@@ -81,6 +100,14 @@ def _prepare_stage1_lifecycle_case(tmp_path, stackings=((0, 0),)):
         write_converged_relaxation(work, name=f"{i}_{j}")
     write_relaxation_manifest(work, stackings)
     return config, work
+
+
+def _assert_prepared_source_identity(source, path: Path) -> None:
+    path = Path(path)
+    payload = path.read_bytes()
+    assert source.path == path
+    assert source.size == len(payload)
+    assert source.sha256 == hashlib.sha256(payload).hexdigest()
 
 
 def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
@@ -508,8 +535,18 @@ def test_stage0_generation_consumes_preflight_structure_rcut_and_stackings(
 
     monkeypatch.setattr(build_module, "preflight_stage0", observe_preflight)
     monkeypatch.setattr(build_module, "StructureHandler", forbid_reinterpretation)
-    monkeypatch.setattr(build_module, "_resolve_rcut", forbid_reinterpretation)
-    monkeypatch.setattr(build_module, "generate_stackings", forbid_reinterpretation)
+    monkeypatch.setattr(
+        build_module,
+        "_resolve_rcut",
+        forbid_reinterpretation,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        build_module,
+        "generate_stackings",
+        forbid_reinterpretation,
+        raising=False,
+    )
 
     run_build(config, wait=False)
 
@@ -570,7 +607,15 @@ def test_stage1_generation_consumes_preflight_structures_relaxations_and_rcut(
         writer_sources.append(source_atoms)
         return real_writer(source_atoms, *args, **kwargs)
 
-    def observe_inputs(config_value, output_dir, atoms, incar_template, rcut):
+    def observe_inputs(
+        config_value,
+        output_dir,
+        atoms,
+        incar_template,
+        rcut,
+        potcars,
+        submit_script,
+    ):
         observed_rcuts.append(rcut)
         return real_inputs(
             config_value,
@@ -578,11 +623,18 @@ def test_stage1_generation_consumes_preflight_structures_relaxations_and_rcut(
             atoms,
             incar_template,
             rcut,
+            potcars,
+            submit_script,
         )
 
     monkeypatch.setattr(build_module, "preflight_stage1", observe_preflight)
     monkeypatch.setattr(build_module, "StructureHandler", forbid_reinterpretation)
-    monkeypatch.setattr(build_module, "_resolve_rcut", forbid_reinterpretation)
+    monkeypatch.setattr(
+        build_module,
+        "_resolve_rcut",
+        forbid_reinterpretation,
+        raising=False,
+    )
     monkeypatch.setattr(build_module, "_write_md_poscar", observe_writer)
     monkeypatch.setattr(build_module, "_write_vasp_inputs", observe_inputs)
 
@@ -634,6 +686,315 @@ def test_generation_does_not_reparse_written_or_validated_poscars(
     run_build(config, wait=False)
 
     assert (work / "md" / "0_0" / "POSCAR").is_file()
+
+
+def test_preflight_returns_parsed_incar_documents_and_required_vdw_sources(
+    tmp_path,
+):
+    config_path = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    template = tmp_path / "input" / "rlx_INCAR"
+    template.write_text(
+        "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\nLUSE_VDW=T\n",
+        encoding="utf-8",
+    )
+    kernel = tmp_path / "input" / "vdw_kernel.bindat"
+    kernel.write_bytes(b"synthetic vdw kernel\n")
+
+    result = preflight_module.preflight_stage0(load_config(config_path))
+
+    assert isinstance(result.templates, tuple)
+    prepared = next(item for item in result.templates if item.name == "rlx_INCAR")
+    assert prepared.analysis.document.source_name == str(template)
+    assert prepared.analysis.is_effectively_true("LUSE_VDW") is True
+    assert prepared.vdw_source is not None
+    _assert_prepared_source_identity(prepared.vdw_source, kernel)
+
+
+def test_generation_does_not_reparse_preflight_incar_templates(
+    monkeypatch, tmp_path
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    state = {"preflight_complete": False}
+    real_preflight = build_module.preflight_stage0
+    real_parse = inputs_module.parse_incar
+
+    def observe_preflight(config_value):
+        result = real_preflight(config_value)
+        state["preflight_complete"] = True
+        return result
+
+    def forbid_generation_parse(*args, **kwargs):
+        if state["preflight_complete"]:
+            raise AssertionError("generation reparsed a prepared INCAR template")
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(build_module, "preflight_stage0", observe_preflight)
+    monkeypatch.setattr(inputs_module, "parse_incar", forbid_generation_parse)
+
+    run_build(config, wait=False)
+
+    assert (tmp_path / "work" / "init_mlff" / "INCAR").is_file()
+
+
+def test_generation_does_not_reresolve_potcars_or_reread_enmax(
+    monkeypatch, tmp_path
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    state = {"preflight_complete": False}
+    real_preflight = build_module.preflight_stage0
+    real_resolve = inputs_module.resolve_potcar_dir
+    real_read_enmax = inputs_module.read_enmax
+
+    def observe_preflight(config_value):
+        result = real_preflight(config_value)
+        state["preflight_complete"] = True
+        return result
+
+    def forbid_generation_resolve(*args, **kwargs):
+        if state["preflight_complete"]:
+            raise AssertionError("generation re-resolved a prepared POTCAR source")
+        return real_resolve(*args, **kwargs)
+
+    def forbid_generation_enmax(*args, **kwargs):
+        if state["preflight_complete"]:
+            raise AssertionError("generation reread prepared POTCAR ENMAX")
+        return real_read_enmax(*args, **kwargs)
+
+    monkeypatch.setattr(build_module, "preflight_stage0", observe_preflight)
+    monkeypatch.setattr(inputs_module, "resolve_potcar_dir", forbid_generation_resolve)
+    monkeypatch.setattr(inputs_module, "read_enmax", forbid_generation_enmax)
+
+    run_build(config, wait=False)
+
+    assert (tmp_path / "work" / "init_mlff" / "POTCAR").is_file()
+
+
+def test_preflight_records_potcar_script_and_vdw_source_identities(tmp_path):
+    config_path = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    template = tmp_path / "input" / "init_INCAR"
+    template.write_text(
+        "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\nLUSE_VDW=T\n",
+        encoding="utf-8",
+    )
+    kernel = tmp_path / "input" / "vdw_kernel.bindat"
+    kernel.write_bytes(b"synthetic vdw kernel\n")
+    config = load_config(config_path)
+
+    result = preflight_module.preflight_stage0(config)
+
+    assert isinstance(result.potcars, tuple)
+    potcar = next(item for item in result.potcars if item.element == "H")
+    _assert_prepared_source_identity(
+        potcar.source,
+        tmp_path / "potcars" / "H" / "POTCAR",
+    )
+    assert potcar.enmax == 100.0
+    _assert_prepared_source_identity(
+        result.submit_script,
+        tmp_path / "scripts" / "DFT_script.sh",
+    )
+    prepared_template = next(
+        item for item in result.templates if item.name == "init_INCAR"
+    )
+    _assert_prepared_source_identity(prepared_template.source, template)
+    _assert_prepared_source_identity(prepared_template.vdw_source, kernel)
+
+
+def test_generation_copies_only_the_prepared_source_paths(monkeypatch, tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    template = tmp_path / "input" / "init_INCAR"
+    template.write_text(
+        "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\nLUSE_VDW=T\n",
+        encoding="utf-8",
+    )
+    kernel = tmp_path / "input" / "vdw_kernel.bindat"
+    kernel.write_bytes(b"prepared synthetic vdw kernel\n")
+    potcar_source = tmp_path / "potcars" / "H" / "POTCAR"
+    script_source = tmp_path / "scripts" / "DFT_script.sh"
+    expected_potcar = potcar_source.read_bytes()
+    expected_script = script_source.read_bytes()
+    expected_kernel = kernel.read_bytes()
+
+    def write_decoy_potcar(_elements, _potcar_dir, output_file, **_kwargs):
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_bytes(b"decoy POTCAR\n ENMAX = 999;\n")
+        return 999.0
+
+    def copy_decoy_script(_script_dir, dft_script, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / dft_script).write_bytes(b"decoy script\n")
+
+    def copy_decoy_vdw(_template_file, _input_dir, output_dir):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "vdw_kernel.bindat").write_bytes(b"decoy kernel\n")
+
+    monkeypatch.setattr(build_module, "write_potcar", write_decoy_potcar, raising=False)
+    monkeypatch.setattr(build_module, "copy_submit_script", copy_decoy_script, raising=False)
+    monkeypatch.setattr(build_module, "copy_vdw_if_needed", copy_decoy_vdw, raising=False)
+
+    run_build(config, wait=False)
+
+    output = tmp_path / "work" / "init_mlff"
+    assert (output / "POTCAR").read_bytes() == expected_potcar
+    assert (output / "DFT_script.sh").read_bytes() == expected_script
+    assert (output / "vdw_kernel.bindat").read_bytes() == expected_kernel
+
+
+def test_changed_prepared_source_fails_identity_check_before_copy(
+    monkeypatch, tmp_path
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    script_source = tmp_path / "scripts" / "DFT_script.sh"
+    real_preflight = build_module.preflight_stage0
+
+    def mutate_after_preflight(config_value):
+        result = real_preflight(config_value)
+        script_source.write_bytes(b"changed after preflight\n")
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage0", mutate_after_preflight)
+
+    with pytest.raises(RuntimeError, match="changed since preflight|identity"):
+        run_build(config, wait=False)
+
+    output = tmp_path / "work" / "init_mlff"
+    assert not (output / "DFT_script.sh").exists()
+    assert not (output / "manifest.yaml").exists()
+
+
+def test_preflight_returns_the_exact_validated_output_paths(monkeypatch, tmp_path):
+    def prepare_twist(self, _n_min, _n_max, *_extra_args):
+        return ["synthetic-angle"], [self.new_struct.copy()]
+
+    monkeypatch.setattr(
+        preflight_module.StructureHandler,
+        "make_twist_struct",
+        prepare_twist,
+    )
+    stage0_root = tmp_path / "stage0"
+    stage0_config = load_config(
+        write_build_config(
+            stage0_root,
+            stage=0,
+            init_mlff=True,
+            do_relaxation=True,
+            twist_val=True,
+            n_sectors=[2, 1],
+        )
+    )
+    stage0_result = preflight_module.preflight_stage0(stage0_config)
+    stage0_work = stage0_root / "work"
+
+    assert stage0_result.stage_targets == (
+        ("init_mlff", stage0_work / "init_mlff"),
+        ("rlx", stage0_work / "rlx"),
+        ("validation", stage0_work / "validation"),
+    )
+    assert stage0_result.output_dirs == (
+        stage0_work / "init_mlff",
+        stage0_work / "rlx" / "0_0",
+        stage0_work / "rlx" / "1_0",
+        stage0_work / "validation" / "synthetic-angle",
+    )
+
+    stage1_root = tmp_path / "stage1"
+    stage1_config = load_config(
+        write_build_config(
+            stage1_root,
+            stage=1,
+            n_sectors=[1, 1],
+            vasp_ml=False,
+            include_monolayer_md=True,
+        )
+    )
+    stage1_work = stage1_root / "work"
+    write_converged_relaxation(stage1_work)
+    write_relaxation_manifest(stage1_work, [(0, 0)])
+    stage1_result = preflight_module.preflight_stage1(stage1_config)
+
+    assert stage1_result.stage_targets == (("md", stage1_work / "md"),)
+    assert stage1_result.output_dirs == (
+        stage1_work / "md" / "0_0",
+        stage1_work / "md" / "top_layer",
+        stage1_work / "md" / "bot_layer",
+    )
+    for result in (stage0_result, stage1_result):
+        for path in result.output_dirs:
+            path.resolve().relative_to(result.structures.work_dir.resolve())
+
+
+def test_target_conflict_still_precedes_all_domain_preparation(
+    monkeypatch, tmp_path
+):
+    config_path = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    work = tmp_path / "work"
+    marker = _mark_stage(work, "rlx", "conflict sentinel")
+
+    def fail_domain_preparation(*_args, **_kwargs):
+        raise AssertionError("domain preparation ran before the target conflict gate")
+
+    monkeypatch.setattr(preflight_module, "_validate_templates", fail_domain_preparation)
+    monkeypatch.setattr(preflight_module, "_validate_submit_script", fail_domain_preparation)
+    monkeypatch.setattr(preflight_module, "_read_structures", fail_domain_preparation)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        preflight_module.preflight_stage0(load_config(config_path))
+
+    assert marker.read_text(encoding="utf-8") == "conflict sentinel"
 
 
 def test_stage1_missing_relaxation_manifest_fails_without_md_change(tmp_path):

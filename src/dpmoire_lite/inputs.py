@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import shutil
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
 import numpy as np
 from ase import Atoms
 from ase.build import make_supercell, sort
 from ase.io.vasp import read_vasp, write_vasp
 
+from .atomic_io import sha256_file
 from .incar import IncarAnalysis, IncarRenderResult, parse_incar
 from .structures import supercell_matrix
 
@@ -68,6 +71,121 @@ VASP_POTCAR_LINK = {
 
 MINIMAL_VALENCE_EXCLUDED_SUFFIXES = ("_AE", "_GW", "_h", "_s")
 VALID_POTCAR_POLICIES = {"recommend", "minimal"}
+
+
+@dataclass(frozen=True)
+class PreparedSource:
+    path: Path
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PreparedIncarTemplate:
+    name: str
+    source: PreparedSource
+    analysis: IncarAnalysis
+    vdw_source: PreparedSource | None = None
+
+
+@dataclass(frozen=True)
+class PreparedPotcar:
+    element: str
+    source: PreparedSource
+    enmax: float
+
+
+def prepare_source(path: Path) -> PreparedSource:
+    path = Path(path)
+    before = path.stat()
+    digest = sha256_file(path)
+    after = path.stat()
+    if before.st_size != after.st_size:
+        raise RuntimeError(f"Source changed while preparing identity: {path}")
+    return PreparedSource(path=path, size=after.st_size, sha256=digest)
+
+
+def verify_prepared_source(source: PreparedSource) -> None:
+    try:
+        size = source.path.stat().st_size
+        digest = sha256_file(source.path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Prepared source identity changed since preflight for {source.path}: {exc}"
+        ) from exc
+    if size != source.size or digest != source.sha256:
+        raise RuntimeError(
+            "Prepared source identity changed since preflight for "
+            f"{source.path}: expected size={source.size}, sha256={source.sha256}; "
+            f"actual size={size}, sha256={digest}"
+        )
+
+
+def _copy_prepared_source_to_handle(
+    source: PreparedSource,
+    output: BinaryIO,
+) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    with source.path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            output.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    if size != source.size or digest.hexdigest() != source.sha256:
+        raise RuntimeError(
+            f"Prepared source identity changed since preflight while copying {source.path}"
+        )
+
+
+def copy_prepared_source(source: PreparedSource, output_file: Path) -> None:
+    verify_prepared_source(source)
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("wb") as output:
+        _copy_prepared_source_to_handle(source, output)
+    shutil.copystat(source.path, output_file)
+
+
+def write_prepared_potcar(
+    elements: Iterable[str],
+    potcars: tuple[PreparedPotcar, ...],
+    output_file: Path,
+) -> float:
+    by_element = {record.element: record for record in potcars}
+    selected = []
+    for element in elements:
+        record = by_element.get(element)
+        if record is None:
+            raise RuntimeError(f"Preflight did not prepare a POTCAR for {element}")
+        selected.append(record)
+
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    max_enmax = 0.0
+    with output_file.open("wb") as output:
+        for record in selected:
+            verify_prepared_source(record.source)
+            _copy_prepared_source_to_handle(record.source, output)
+            max_enmax = max(max_enmax, record.enmax)
+    return max_enmax
+
+
+def render_prepared_incar(
+    template: PreparedIncarTemplate,
+    output_file: Path,
+    encut: float,
+    rcut1: float,
+    rcut2: float,
+) -> IncarRenderResult:
+    verify_prepared_source(template.source)
+    result = template.analysis.document.render(
+        {"ENCUT": encut, "ML_RCUT1": rcut1, "ML_RCUT2": rcut2}
+    )
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(result.text, encoding="utf-8")
+    return result
 
 
 def validate_incar(

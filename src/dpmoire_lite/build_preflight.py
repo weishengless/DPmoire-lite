@@ -14,9 +14,18 @@ from ase.io.vasp import read_vasp
 
 from .config import DPmoireLiteConfig
 from .incar import IncarAnalysis, parse_incar
-from .inputs import get_ordered_elements, read_enmax, resolve_potcar_dir
+from .inputs import (
+    PreparedIncarTemplate,
+    PreparedPotcar,
+    PreparedSource,
+    get_ordered_elements,
+    prepare_source,
+    read_enmax,
+    resolve_potcar_dir,
+)
 from .mlab import MlabParseResult, parse_mlab
 from .manifest import Manifest, ManifestReadResult, read_manifest
+from .paths import relative_to_workdir, stage_dir
 from .provenance import (
     CELL_ATOL,
     CELL_RTOL,
@@ -69,8 +78,11 @@ class BuildPreflightResult:
     structures: StructureHandler | None
     stackings: tuple[tuple[int, int], ...] = ()
     rcut: float | None = None
-    templates: dict[str, IncarAnalysis] = field(default_factory=dict)
-    potcar_sources: dict[str, Path] = field(default_factory=dict)
+    templates: tuple[PreparedIncarTemplate, ...] = ()
+    potcars: tuple[PreparedPotcar, ...] = ()
+    submit_script: PreparedSource | None = None
+    stage_targets: tuple[tuple[str, Path], ...] = ()
+    output_dirs: tuple[Path, ...] = ()
     initial_seed: MlabParseResult | None = None
     relaxations: tuple[PreparedRelaxation, ...] = ()
     validation_structures: tuple[PreparedValidationStructure, ...] = ()
@@ -81,7 +93,96 @@ class BuildPreflightResult:
     provenance_evidence: dict[str, object] = field(default_factory=dict)
 
 
+def _stage0_target_stages(
+    config: DPmoireLiteConfig,
+) -> tuple[tuple[str, Path], ...]:
+    targets = []
+    if config.init_mlff:
+        targets.append(("init_mlff", stage_dir(config.work_dir, "init_mlff")))
+    if config.do_relaxation:
+        targets.append(("rlx", stage_dir(config.work_dir, "rlx")))
+    if config.twist_val:
+        targets.append(("validation", stage_dir(config.work_dir, "validation")))
+    return tuple(targets)
+
+
+def _stage1_target_stages(
+    config: DPmoireLiteConfig,
+) -> tuple[tuple[str, Path], ...]:
+    return (("md", stage_dir(config.work_dir, "md")),)
+
+
+def _check_target_stages_absent(
+    config: DPmoireLiteConfig,
+    targets: tuple[tuple[str, Path], ...],
+) -> None:
+    conflicts = [(stage, path) for stage, path in targets if path.exists()]
+    if not conflicts:
+        return
+    details = "\n".join(
+        f"- {stage} ({relative_to_workdir(config.work_dir, path)}) already exists"
+        for stage, path in conflicts
+    )
+    raise RuntimeError(
+        "Build target conflict(s):\n"
+        f"{details}\n"
+        "DPmoire-lite does not rebuild stages in place. "
+        "Delete the listed stage directories and rerun the build. "
+        "No files were modified."
+    )
+
+
+def _stage0_output_dirs(
+    config: DPmoireLiteConfig,
+    stackings: tuple[tuple[int, int], ...],
+    validation_structures: tuple[PreparedValidationStructure, ...],
+) -> tuple[Path, ...]:
+    output_dirs = []
+    if config.init_mlff:
+        output_dirs.append(stage_dir(config.work_dir, "init_mlff"))
+    if config.do_relaxation:
+        relaxation_dir = stage_dir(config.work_dir, "rlx")
+        output_dirs.extend(relaxation_dir / f"{i}_{j}" for i, j in stackings)
+    if config.twist_val:
+        validation_dir = stage_dir(config.work_dir, "validation")
+        output_dirs.extend(
+            validation_dir / record.angle for record in validation_structures
+        )
+    return tuple(output_dirs)
+
+
+def _stage1_output_dirs(
+    config: DPmoireLiteConfig,
+    stackings: tuple[tuple[int, int], ...],
+) -> tuple[Path, ...]:
+    md_dir = stage_dir(config.work_dir, "md")
+    output_dirs = [md_dir / f"{i}_{j}" for i, j in stackings]
+    if config.include_monolayer_md:
+        output_dirs.extend((md_dir / "top_layer", md_dir / "bot_layer"))
+    return tuple(output_dirs)
+
+
+def _validate_output_dirs(
+    config: DPmoireLiteConfig,
+    paths: tuple[Path, ...],
+    diagnostics: list[PreflightDiagnostic],
+) -> None:
+    for path in paths:
+        try:
+            relative_to_workdir(config.work_dir, path)
+        except ValueError:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="path",
+                    path=path,
+                    reason="validated output directory must remain inside work_dir",
+                )
+            )
+
+
 def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
+    stage_targets = _stage0_target_stages(config)
+    _check_target_stages_absent(config, stage_targets)
     diagnostics: list[PreflightDiagnostic] = []
     warning_diagnostics: list[PreflightDiagnostic] = []
     templates = _validate_templates(
@@ -90,11 +191,11 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
         diagnostics,
         warning_diagnostics,
     )
-    _validate_submit_script(config, diagnostics)
+    submit_script = _validate_submit_script(config, diagnostics)
 
     structures = _read_structures(config, diagnostics)
     rcut = None
-    potcar_sources: dict[str, Path] = {}
+    potcars: tuple[PreparedPotcar, ...] = ()
     if structures is not None:
         try:
             rcut = _resolve_rcut(config, structures)
@@ -108,7 +209,7 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
             )
 
         elements = get_ordered_elements(structures.new_struct)
-        potcar_sources = _validate_potcars(config, elements, diagnostics)
+        potcars = _validate_potcars(config, elements, diagnostics)
 
     stackings = tuple(generate_stackings(config.n_sectors))
     validation_structures: tuple[PreparedValidationStructure, ...] = ()
@@ -142,6 +243,12 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
                         reason=f"twist validation preparation failed: {exc}",
                     )
                 )
+    output_dirs = _stage0_output_dirs(config, stackings, validation_structures)
+    _validate_output_dirs(
+        config,
+        tuple(path for _stage, path in stage_targets) + output_dirs,
+        diagnostics,
+    )
     _raise_if_failed(diagnostics)
     _emit_warnings(warning_diagnostics)
     return BuildPreflightResult(
@@ -150,13 +257,18 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
         stackings=stackings,
         rcut=rcut,
         templates=templates,
-        potcar_sources=potcar_sources,
+        potcars=potcars,
+        submit_script=submit_script,
+        stage_targets=stage_targets,
+        output_dirs=output_dirs,
         warnings=tuple(warning_diagnostics),
         validation_structures=validation_structures,
     )
 
 
 def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
+    stage_targets = _stage1_target_stages(config)
+    _check_target_stages_absent(config, stage_targets)
     diagnostics: list[PreflightDiagnostic] = []
     warning_diagnostics: list[PreflightDiagnostic] = []
     templates = _validate_templates(
@@ -165,11 +277,11 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
         diagnostics,
         warning_diagnostics,
     )
-    _validate_submit_script(config, diagnostics)
+    submit_script = _validate_submit_script(config, diagnostics)
 
     structures = _read_structures(config, diagnostics)
     rcut = None
-    potcar_sources: dict[str, Path] = {}
+    potcars: tuple[PreparedPotcar, ...] = ()
     if structures is not None:
         try:
             rcut = _resolve_rcut(config, structures)
@@ -182,7 +294,7 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
                 )
             )
         elements = get_ordered_elements(structures.new_struct)
-        potcar_sources = _validate_potcars(config, elements, diagnostics)
+        potcars = _validate_potcars(config, elements, diagnostics)
 
     manifest_result = read_manifest(config.work_dir, "rlx")
     stackings = _stage1_manifest_stackings(manifest_result, diagnostics)
@@ -300,6 +412,12 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
     if config.vasp_ml:
         initial_seed = _validate_initial_seed(config, diagnostics)
 
+    output_dirs = _stage1_output_dirs(config, stackings)
+    _validate_output_dirs(
+        config,
+        tuple(path for _stage, path in stage_targets) + output_dirs,
+        diagnostics,
+    )
     _raise_if_failed(diagnostics)
     _emit_warnings(warning_diagnostics)
     return BuildPreflightResult(
@@ -308,7 +426,10 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
         stackings=tuple(stackings),
         rcut=rcut,
         templates=templates,
-        potcar_sources=potcar_sources,
+        potcars=potcars,
+        submit_script=submit_script,
+        stage_targets=stage_targets,
+        output_dirs=output_dirs,
         initial_seed=initial_seed,
         relaxations=relaxations,
         warnings=tuple(warning_diagnostics),
@@ -1386,9 +1507,9 @@ def _validate_templates(
     config: DPmoireLiteConfig,
     diagnostics: list[PreflightDiagnostic],
     warning_diagnostics: list[PreflightDiagnostic],
-) -> dict[str, IncarAnalysis]:
+) -> tuple[PreparedIncarTemplate, ...]:
     del config
-    analyses: dict[str, IncarAnalysis] = {}
+    prepared_templates = []
     for name, path in templates:
         if not path.is_file():
             diagnostics.append(
@@ -1401,6 +1522,7 @@ def _validate_templates(
             continue
 
         try:
+            source = prepare_source(path)
             analysis = parse_incar(
                 path.read_text(encoding="utf-8"),
                 source_name=str(path),
@@ -1415,7 +1537,6 @@ def _validate_templates(
             )
             continue
 
-        analyses[name] = analysis
         for duplicate in analysis.blocking_conflicts:
             values = ", ".join(
                 f"line {assignment.location.line}: {assignment.value}"
@@ -1443,6 +1564,7 @@ def _validate_templates(
         luse_vdw_conflict = any(
             duplicate.tag == "LUSE_VDW" for duplicate in analysis.blocking_conflicts
         )
+        vdw_source = None
         if not luse_vdw_conflict and analysis.is_effectively_true("LUSE_VDW"):
             kernel = path.parent / "vdw_kernel.bindat"
             if not kernel.is_file():
@@ -1453,14 +1575,33 @@ def _validate_templates(
                         reason=f"required by {path}",
                     )
                 )
+            else:
+                try:
+                    vdw_source = prepare_source(kernel)
+                except Exception as exc:
+                    diagnostics.append(
+                        PreflightDiagnostic(
+                            domain="vdw",
+                            path=kernel,
+                            reason=str(exc),
+                        )
+                    )
+        prepared_templates.append(
+            PreparedIncarTemplate(
+                name=name,
+                source=source,
+                analysis=analysis,
+                vdw_source=vdw_source,
+            )
+        )
 
-    return analyses
+    return tuple(prepared_templates)
 
 
 def _validate_submit_script(
     config: DPmoireLiteConfig,
     diagnostics: list[PreflightDiagnostic],
-) -> None:
+) -> PreparedSource | None:
     path = config.script_dir / config.dft_script
     if not path.is_file():
         diagnostics.append(
@@ -1470,6 +1611,18 @@ def _validate_submit_script(
                 reason="required submit script is missing",
             )
         )
+        return None
+    try:
+        return prepare_source(path)
+    except Exception as exc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="script",
+                path=path,
+                reason=str(exc),
+            )
+        )
+        return None
 
 
 def _read_structures(
@@ -1549,8 +1702,8 @@ def _validate_potcars(
     config: DPmoireLiteConfig,
     elements: list[str],
     diagnostics: list[PreflightDiagnostic],
-) -> dict[str, Path]:
-    sources: dict[str, Path] = {}
+) -> tuple[PreparedPotcar, ...]:
+    potcars = []
     for element in elements:
         try:
             source_dir = resolve_potcar_dir(
@@ -1558,8 +1711,11 @@ def _validate_potcars(
                 config.potcar_dir,
                 potcar_policy=config.potcar_policy,
             )
-            read_enmax(source_dir / "POTCAR")
-            sources[element] = source_dir
+            source = prepare_source(source_dir / "POTCAR")
+            enmax = read_enmax(source.path)
+            potcars.append(
+                PreparedPotcar(element=element, source=source, enmax=enmax)
+            )
         except Exception as exc:
             diagnostics.append(
                 PreflightDiagnostic(
@@ -1568,7 +1724,7 @@ def _validate_potcars(
                     reason=str(exc),
                 )
             )
-    return sources
+    return tuple(potcars)
 
 
 def _validate_relaxation(
