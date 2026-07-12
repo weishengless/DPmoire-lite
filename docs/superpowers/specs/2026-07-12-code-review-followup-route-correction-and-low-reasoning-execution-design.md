@@ -2,8 +2,9 @@
 
 Date: 2026-07-12
 
-Status: approved section by section in discussion; written specification awaiting
-user review before implementation planning
+Status: original sections and the dual-execution amendment approved in
+discussion; written specification awaiting final user review before
+implementation planning
 
 ## Purpose
 
@@ -23,8 +24,9 @@ The design has two equally required outcomes:
 
 1. the completed build path again matches the authoritative scientific and
    no-side-effect contracts; and
-2. a lower-reasoning model can execute exactly one approved green checkpoint
-   without loading the entire historical planning corpus or inventing state.
+2. a lower-cost worker can execute exactly one orchestrator-issued, bounded TDD
+   unit without loading the entire historical planning corpus, inventing state,
+   committing, or advancing the plan.
 
 ## Audit Findings That Require Correction
 
@@ -96,6 +98,12 @@ reliably enforce the green-checkpoint boundary.
 - Introduce scoped, progressively disclosed agent instructions.
 - Separate stable rules, dynamic execution state, and historical evidence.
 - Make the reusable low-reasoning prompt short and state-independent.
+- Separate high-reasoning orchestrator authority from lower-cost worker
+  implementation authority.
+- Configure one project-scoped worker agent with an explicit model, reasoning,
+  and Standard-speed contract.
+- Retain direct lower-cost execution only for proven, low-risk, fully closed
+  units, without granting commit or state-advance authority.
 - Ensure every future commit is a green, independently reviewable checkpoint.
 
 ## Non-goals
@@ -249,7 +257,9 @@ must explicitly delete that target before retrying.
 
 ## Progressive-disclosure AGENTS.md Hierarchy
 
-Exactly four instruction files are introduced.
+Exactly four `AGENTS.md` instruction files are introduced. The project-scoped
+custom-agent TOML described below is a separate execution configuration and does
+not add a fifth `AGENTS.md` layer.
 
 ### Repository root AGENTS.md
 
@@ -300,6 +310,118 @@ but they cannot redefine authoritative scientific decisions. Each instruction
 file has a hard maximum of 120 physical lines and uses links instead of
 duplicated rules.
 
+## Dual Execution Modes and Authority
+
+### Orchestrator mode
+
+The default implementation entry point is a new root task running a
+high-reasoning model. The orchestrator owns all decisions that can change route
+or repository history:
+
+- reconcile git facts with the compact active state;
+- select the unique active execution unit and read its authorities;
+- classify whether the unit is worker-eligible;
+- issue one execution capsule containing the exact unit, fixed decisions,
+  allowed files, pre-existing changes, required RED, RED handoff mode, focused
+  and affected test commands, non-goals, stop conditions, and required evidence;
+- validate that a worker observed an expected RED before accepting production
+  code;
+- inspect the complete worker diff and resolve semantic or scope questions;
+- run the required final verification, explicitly stage files, inspect the
+  cached diff, create the green checkpoint commit, and update active state.
+
+Only the orchestrator may modify the roadmap, specs, leaf plans, or active-state
+snapshot; stage or commit files; or advance to another execution unit. It uses
+one write-capable worker at a time in the shared worktree. Parallel subagents are
+limited to independent read-only exploration, test analysis, or review.
+
+The recommended root launch profile is GPT-5.6 Sol, Max reasoning, and Standard
+speed. The root task must not enable Fast service when it expects `plan_worker`
+to remain on the Standard-speed contract. If Sol is unavailable, the user selects
+the strongest available high-reasoning coding model rather than silently
+downgrading the orchestrator to the worker model.
+
+The launch prompt may name subagent-driven development and TDD, but correctness
+does not depend on those skill labels being installed. The scoped `AGENTS.md`
+files, execution capsule, `plan_worker` configuration, and explicit
+RED-GREEN-REFACTOR evidence are the durable authority.
+
+### Worker mode
+
+The lower-cost worker receives an execution capsule from the orchestrator and
+implements only that capsule. It may edit the allowed tests and production files,
+run read-only git inspection, and execute the specified focused and affected
+suites. For every behavior change it follows RED-GREEN-REFACTOR in order and
+returns the RED command, exit status, expected failure, GREEN evidence, changed
+files, and any ambiguity.
+
+The capsule states whether the worker must return immediately after RED or may
+continue to minimal GREEN after verifying its own expected RED. A worker may not
+infer this handoff mode. The first calibration and every subtle failure boundary
+use a split RED return; an explicitly closed low-risk capsule may authorize a
+single-turn RED-GREEN cycle.
+
+The worker must stop without implementation if the capsule is missing,
+contradictory, disagrees with git/active state, or requires an authority choice.
+It must not select a task, widen allowed files, change plans/specs/state, stage,
+commit, push, or delegate again. Its completed output is an uncommitted working
+tree plus evidence for orchestrator review.
+
+The first worker calibration unit uses an explicit two-step gate: the worker
+returns after establishing RED; the orchestrator validates that failure; then the
+same worker receives authorization for GREEN and REFACTOR.
+
+### Project-scoped worker configuration
+
+Plan 06R governance bootstrap creates `.codex/agents/plan-worker.toml` with the
+custom-agent name `plan_worker`. The preferred verified settings are:
+
+```toml
+name = "plan_worker"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
+```
+
+The file also supplies a narrow description and `developer_instructions` that
+encode the worker authority above. It deliberately omits `service_tier`; with the
+required Standard parent launch, this avoids opting the worker into Fast service.
+Governance bootstrap verifies the agent in the local Codex model catalog and
+with a no-write calibration run.
+
+If Luna is unavailable to the current account or local Codex surface, bootstrap
+uses `gpt-5.6-terra` as the approved lower-cost fallback. If `max` is unavailable
+for the chosen model, bootstrap uses that model's highest supported reasoning
+effort and records the exact choice in implementation evidence. There is no
+silent runtime model fallback: later model-availability failure stops the unit
+for an explicit configuration update. If neither approved lightweight model is
+available, the orchestrator performs the unit itself.
+
+This configuration follows the public Codex custom-agent schema and model
+controls documented in the [Codex subagent guide](https://developers.openai.com/codex/agent-configuration/subagents),
+the [Codex speed guide](https://developers.openai.com/codex/agent-configuration/speed),
+and the [GPT-5.6 Luna model page](https://developers.openai.com/api/docs/models/gpt-5.6-luna).
+
+### Direct lower-cost mode
+
+Pasting the worker prompt into a lower-cost root task remains a fallback, not the
+normal plan-execution path. A unit is eligible only when all of these are true:
+
+- governance bootstrap and the worker calibration drill are green;
+- at least two orchestrated worker units completed without authority, scope, or
+  TDD-protocol violations;
+- the leaf plan or an orchestrator-issued capsule explicitly marks the unit
+  `standalone_eligible`;
+- behavior, allowed files, expected RED, test commands, and stop conditions are
+  fully specified;
+- the unit changes no scientific interpretation, schema, compatibility policy,
+  transaction/recovery boundary, architecture, or cross-plan contract;
+- there are no overlapping unknown changes in the worktree.
+
+Direct mode retains the same worker restrictions. It stops with uncommitted
+changes and evidence; a later high-reasoning orchestrator task must review,
+verify, commit, update state, and choose the next unit. Failure of any eligibility
+condition routes the unit back to orchestrator mode.
+
 ## Active-state Design
 
 The existing local status file is preserved as
@@ -346,40 +468,43 @@ Their status text is normalized as follows:
 
 The authoritative scientific content is unchanged by these status corrections.
 
-## Low-reasoning Execution Prompt
+## Worker Execution Prompt
 
-The reusable prompt becomes a bootstrap of no more than 80 physical lines rather
-than a duplicated policy document. It performs this sequence:
+The existing low-reasoning prompt is rewritten as a worker bootstrap of no more
+than 80 physical lines rather than a duplicated policy document. It performs
+this sequence:
 
 1. enter the fixed worktree;
 2. read root and plan-controller `AGENTS.md` completely;
-3. read the compact active state;
-4. run git status, recent log, unstaged diff, and cached-file checks;
-5. identify the unique active execution unit;
-6. read only its leaf plan, directly linked authoritative sources, and the
+3. require an orchestrator-issued or explicitly standalone-eligible execution
+   capsule;
+4. read active state without modifying it and run git status, recent log,
+   unstaged diff, and cached-file checks;
+5. stop if the capsule, active state, or git facts disagree;
+6. read only the capsule-named leaf plan, directly linked authorities, and
    applicable production/test `AGENTS.md` files;
-7. execute at most one green unit;
-8. stage an explicit file list and commit only after required suites are green;
-9. update active state;
-10. stop without starting the next unit.
+7. follow the capsule's RED handoff mode, execute only the authorized TDD scope,
+   and run the required tests;
+8. report evidence and leave all changes unstaged;
+9. stop without committing, updating state, or starting another unit.
 
-The prompt retains authorization boundaries but removes all hard-coded Plan 02
-state, completed migration exceptions, speculative RED inventories, and copied
-scientific rules.
+The prompt explicitly denies commit and state-advance authority. It removes all
+hard-coded Plan 02 state, completed migration exceptions, speculative RED
+inventories, and copied scientific rules.
 
 ## Execution Context Flow
 
 ```mermaid
 flowchart TD
-    Q["Short reusable prompt"] --> A["Root AGENTS.md"]
-    A --> P["Plan-controller AGENTS.md"]
-    P --> S["Compact active state plus git facts"]
-    S --> L["One active leaf plan and direct authorities"]
-    L --> N["Applicable src/tests AGENTS.md"]
-    N --> U["One execution unit"]
-    U --> T["Focused, affected, and full verification"]
-    T --> C["Exact green commit"]
-    C --> H["Update state and stop"]
+    O["High-reasoning orchestrator"] --> A["AGENTS, active state, and git facts"]
+    A --> X["One bounded execution capsule"]
+    X --> W["plan_worker: Luna Max Standard"]
+    W --> R["RED evidence and uncommitted GREEN diff"]
+    R --> V["Orchestrator diff review and final verification"]
+    V --> C["Exact green commit"]
+    C --> H["Orchestrator updates state and stops"]
+    X -.->|standalone_eligible only| D["Direct lower-cost root task"]
+    D --> R
 ```
 
 ## Implementation and Handoff Sequence
@@ -389,14 +514,21 @@ flowchart TD
 3. Write the Plan 06R leaf implementation plan and roadmap amendment.
 4. Execute a governance-bootstrap unit with a high-reasoning model:
    - create the four `AGENTS.md` files;
+   - create and validate `.codex/agents/plan-worker.toml`;
    - archive and compact local state;
-   - rewrite the reusable prompt;
+   - rewrite the reusable prompt as a no-commit worker prompt;
    - normalize versioned status text;
    - set the active state to the first Plan 06R product unit.
-5. Dry-run one read-only resume using only the new bootstrap path.
-6. Permit a lower-reasoning model to execute later Plan 06R units one at a time.
-7. Keep Plans 07 and 09 closed until Plan 06R is complete.
-8. After Plan 06R passes, set Plan 07 Task 1 as the next active unit.
+5. Dry-run one read-only orchestrator resume using only the new bootstrap path.
+6. Run a no-write `plan_worker` configuration drill, then use the first eligible
+   worker unit to validate the split RED/GREEN handoff.
+7. Permit the orchestrator to delegate later eligible units to one worker at a
+   time; retain high-reasoning execution for architectural or contract-heavy
+   units.
+8. Keep direct lower-cost mode closed until its two-success eligibility threshold
+   is met.
+9. Keep Plans 07 and 09 closed until Plan 06R is complete.
+10. After Plan 06R passes, set Plan 07 Task 1 as the next active unit.
 
 ## Testing and Quality Gates
 
@@ -406,10 +538,16 @@ flowchart TD
 - root/narrow instructions contain no HEAD or active-plan state;
 - prompt and active state each contain no more than 80 physical lines;
 - obsolete Plan 02 migration and RED-inventory language is absent;
+- `.codex/agents/plan-worker.toml` has the verified lightweight model and highest
+  supported configured reasoning effort, without Fast service configuration;
+- the worker prompt and custom-agent instructions deny plan selection, state
+  mutation, staging, commit, push, and nested delegation;
 - active state has one active unit and one exact next action;
 - local status and history files are absent from the staged set;
 - a read-only resume drill reaches the intended active unit without reading
-  historical status.
+  historical status;
+- a worker calibration drill leaves the worktree unchanged, and the first worker
+  implementation demonstrates an orchestrator-validated RED before GREEN.
 
 ### Product correction
 
@@ -432,6 +570,8 @@ The final Plan 06R gate proves:
 
 - State/git disagreement causes state correction and stop, not implementation.
 - Invalid RED, failed tests, or an out-of-scope diff cannot be committed.
+- Worker output is never committed or used to advance state before orchestrator
+  review and final verification.
 - Each green unit is an independent commit and rollback/review boundary.
 - Existing history is not rewritten to hide earlier protocol violations.
 - A new scientific contradiction returns to design/spec review; the execution
@@ -446,10 +586,15 @@ The final Plan 06R gate proves:
 - The preflight result is the single prepared build-input contract.
 - Provenance and preflight responsibilities match their documented ownership.
 - The repository contains exactly four concise, scoped `AGENTS.md` files.
+- The project contains one validated `plan_worker` custom-agent configuration
+  using Luna Max Standard when supported, with the specified explicit fallback.
 - Stable instructions contain no dynamic execution state.
 - Active execution state is compact, unambiguous, local-only, and recoverable
   from git facts.
-- The low-reasoning prompt contains no obsolete migration or duplicated science.
+- The worker prompt contains no obsolete migration or duplicated science and has
+  no commit or state-advance authority.
 - A read-only resume drill selects exactly one intended unit.
+- Orchestrator and worker responsibilities are non-overlapping, and direct
+  lower-cost mode is mechanically identifiable through the eligibility marker.
 - Every new checkpoint commit is full-suite green.
 - Plan 07 does not begin until Plan 06R and its final gate are complete.
