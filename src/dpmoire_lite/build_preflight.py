@@ -61,6 +61,8 @@ class BuildPreflightResult:
     warnings: tuple[PreflightDiagnostic, ...] = ()
     trusted_sc_rlx: bool | None = None
     trusted_sc: tuple[int, int] | None = None
+    provenance_kind: str | None = None
+    provenance_evidence: dict[str, object] = field(default_factory=dict)
 
 
 def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
@@ -142,6 +144,8 @@ def preflight_stage1(
 
     trusted_sc_rlx = None
     trusted_sc = None
+    provenance_kind = None
+    provenance_evidence: dict[str, object] = {}
     manifest_result = read_manifest(config.work_dir, "rlx")
     if manifest_result.kind == "legacy":
         trusted_sc_rlx, trusted_sc = _infer_legacy_stage1_provenance(
@@ -150,6 +154,13 @@ def preflight_stage1(
             structures,
             diagnostics,
         )
+        if trusted_sc_rlx is not None:
+            provenance_kind = "legacy_inference"
+            provenance_evidence = {
+                "manifest": "rlx/manifest.yaml",
+                "method": "atom_count_composition_cell",
+                "stackings": [[i, j] for i, j in stackings],
+            }
     elif manifest_result.kind == "current" and manifest_result.manifest is not None:
         provenance = manifest_result.manifest.structure_provenance
         if provenance:
@@ -160,6 +171,13 @@ def preflight_stage1(
                 structures,
                 diagnostics,
             )
+            if trusted_sc_rlx is not None:
+                provenance_kind = "strict"
+                provenance_evidence = {
+                    "manifest": "rlx/manifest.yaml",
+                    "schema": provenance.get("schema"),
+                    "stackings": [[i, j] for i, j in stackings],
+                }
 
     initial_seed = None
     if config.vasp_ml:
@@ -178,6 +196,8 @@ def preflight_stage1(
         warnings=tuple(warning_diagnostics),
         trusted_sc_rlx=trusted_sc_rlx,
         trusted_sc=trusted_sc,
+        provenance_kind=provenance_kind,
+        provenance_evidence=provenance_evidence,
     )
 
 

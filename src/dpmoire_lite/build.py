@@ -175,8 +175,20 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
             stackings=[[i, j] for i, j in stackings],
+            structure_provenance=_stage1_structure_provenance(preflight),
         ),
     )
+
+
+def _stage1_structure_provenance(preflight) -> dict[str, object]:
+    if preflight.provenance_kind is None:
+        return {}
+    return {
+        "mode": preflight.provenance_kind,
+        "sc_rlx": preflight.trusted_sc_rlx,
+        "sc": list(preflight.trusted_sc) if preflight.trusted_sc is not None else None,
+        "evidence": preflight.provenance_evidence,
+    }
 
 
 def build_stage_all(

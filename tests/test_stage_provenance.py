@@ -528,3 +528,78 @@ def test_legacy_inference_conflict_with_current_config_fails_before_md(tmp_path)
 
     assert "sc_rlx" in str(exc_info.value)
     assert not (tmp_path / "work" / "md").exists()
+
+
+def test_md_manifest_records_strict_provenance_evidence(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+    )
+
+    run_build(config, wait=False)
+
+    manifest = read_manifest(tmp_path / "work", "md").manifest
+    assert manifest is not None
+    provenance = manifest.structure_provenance
+    assert provenance["mode"] == "strict"
+    assert provenance["sc_rlx"] is True
+    assert provenance["sc"] == [2, 1]
+    assert provenance["evidence"] == {
+        "manifest": "rlx/manifest.yaml",
+        "schema": "dpmoire-lite.structure-provenance.v1",
+        "stackings": [[0, 0]],
+    }
+
+
+def test_md_manifest_records_legacy_inference_evidence(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+    )
+
+    run_build(config, wait=False)
+
+    manifest = read_manifest(tmp_path / "work", "md").manifest
+    assert manifest is not None
+    provenance = manifest.structure_provenance
+    assert provenance["mode"] == "legacy_inference"
+    assert provenance["sc_rlx"] is True
+    assert provenance["sc"] == [2, 1]
+    assert provenance["evidence"] == {
+        "manifest": "rlx/manifest.yaml",
+        "method": "atom_count_composition_cell",
+        "stackings": [[0, 0]],
+    }
+
+
+def test_legacy_inference_does_not_rewrite_relaxation_manifest(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [1, 1], "sc_rlx": False},
+    )
+    relaxation_manifest = tmp_path / "work" / "rlx" / "manifest.yaml"
+    before = relaxation_manifest.read_bytes()
+
+    run_build(config, wait=False)
+
+    assert relaxation_manifest.read_bytes() == before
+    manifest = read_manifest(tmp_path / "work", "md").manifest
+    assert manifest is not None
+    assert manifest.structure_provenance["mode"] == "legacy_inference"
+
+
+def test_md_manifest_uses_relaxation_manifest_stackings_only(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [2, 1], "sc": [1, 1], "sc_rlx": False},
+        stage1_overrides={"n_sectors": [1, 1]},
+    )
+
+    run_build(config, wait=False)
+
+    manifest = read_manifest(tmp_path / "work", "md").manifest
+    assert manifest is not None
+    assert manifest.stackings == [[0, 0], [1, 0]]
+    assert manifest.directories == ["md/0_0", "md/1_0"]
+    assert manifest.structure_provenance["mode"] == "legacy_inference"
+    assert manifest.structure_provenance["evidence"]["stackings"] == [[0, 0], [1, 0]]
