@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import warnings
 from collections.abc import Callable
 from datetime import datetime
@@ -13,7 +12,11 @@ from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
 from .atomic_io import sha256_file
-from .build_preflight import preflight_stage0, preflight_stage1
+from .build_preflight import (
+    PreparedValidationStructure,
+    preflight_stage0,
+    preflight_stage1,
+)
 from .config import ConfigError, DPmoireLiteConfig, load_config
 from .inputs import (
     copy_submit_script,
@@ -25,9 +28,9 @@ from .inputs import (
     write_potcar,
     write_supercell_poscar,
 )
-from .manifest import Manifest, read_manifest, write_manifest
+from .manifest import Manifest, write_manifest
 from .mlab import seed_prefix_identity
-from .paths import backup_existing_directory, manifest_path, relative_to_workdir, stage_dir
+from .paths import backup_existing_directory, relative_to_workdir, stage_dir
 from .provenance import structure_identity
 from .slurm import SlurmJob, SlurmRunner
 from .structures import StructureHandler, generate_stackings, supercell_matrix
@@ -83,26 +86,17 @@ def run_build(config_path: Path, wait: bool = False) -> None:
 def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     config.validate_build_mode(wait)
     _check_target_stages_absent(config, _stage0_target_stages(config))
-    preflight_stage0(config)
+    preflight = preflight_stage0(config)
+    if preflight.structures is None or preflight.rcut is None:
+        raise RuntimeError("Stage0 preflight did not return prepared structures and rcut")
+    structures = preflight.structures
+    rcut = preflight.rcut
+    stackings = preflight.stackings
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    structures = StructureHandler(
-        config.input_dir,
-        config.work_dir,
-        config.n_sectors,
-        config.d,
-        config.d_mode,
-        config.d_reference,
-    )
-    rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
-    stackings = (
-        structures.find_sym_reduced_stackings()
-        if config.symm_reduce
-        else generate_stackings(config.n_sectors)
-    )
     if config.symm_reduce:
-        structures.write_sym_reduced_stackings(stackings)
+        structures.write_sym_reduced_stackings(list(stackings))
     runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
 
     if config.init_mlff:
@@ -110,27 +104,28 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     if config.do_relaxation:
         _build_relaxations(config, structures, stackings, rcut, generated_at, timestamp, runner, wait)
     if config.twist_val:
-        _build_validation(config, structures, rcut, generated_at, timestamp, runner, wait)
+        _build_validation(
+            config,
+            preflight.validation_structures,
+            rcut,
+            generated_at,
+            runner,
+            wait,
+        )
 
 
 def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
     config.validate_build_mode(wait)
     _check_target_stages_absent(config, _stage1_target_stages(config))
-    stackings = _stage1_stackings(config)
-    preflight = preflight_stage1(config, stackings)
+    preflight = preflight_stage1(config)
+    if preflight.structures is None or preflight.rcut is None:
+        raise RuntimeError("Stage1 preflight did not return prepared structures and rcut")
+    structures = preflight.structures
+    rcut = preflight.rcut
+    stackings = preflight.stackings
     mlff_seed = _stage1_mlff_seed_identity(config, preflight)
     generated_at = datetime.now().isoformat(timespec="seconds")
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    structures = StructureHandler(
-        config.input_dir,
-        config.work_dir,
-        config.n_sectors,
-        config.d,
-        config.d_mode,
-        config.d_reference,
-    )
-    rcut = _resolve_rcut(config, structures.top_atoms, structures.bot_atoms)
     md_dir = stage_dir(config.work_dir, "md")
     targets = [md_dir / f"{i}_{j}" for i, j in stackings]
     if config.include_monolayer_md:
@@ -144,19 +139,18 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         md_sc = None if config.sc_rlx else config.sc
     else:
         md_sc = None if preflight.trusted_sc_rlx else preflight.trusted_sc
-    for i, j in stackings:
-        source_dir = config.work_dir / "rlx" / f"{i}_{j}"
+    for relaxation in preflight.relaxations:
+        i, j = relaxation.stacking
         target = md_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
-        anchor_records = _write_md_poscar(
-            source_dir / "CONTCAR",
+        atoms, anchor_records = _write_md_poscar(
+            relaxation.atoms.copy(),
             target / "POSCAR",
             md_sc,
             preserve_constraints=config.preserve_grid_shift_md,
         )
         if anchor_records is not None:
             md_anchor_records[relative_to_workdir(config.work_dir, target)] = anchor_records
-        atoms = structures.read_atoms(target / "POSCAR")
         _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
         if config.vasp_ml:
             stage_mlff_files(init_mlff_dir, target)
@@ -165,10 +159,16 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
 
     monolayer_constraint_warning_emitted = False
     if config.include_monolayer_md:
-        for layer_name in ("top_layer", "bot_layer"):
+        layer_sources = {
+            "top_layer": structures.top_atoms,
+            "bot_layer": structures.bot_atoms,
+        }
+        for layer_name, source_atoms in layer_sources.items():
+            if source_atoms is None:
+                raise RuntimeError(f"Stage1 preflight did not return {layer_name} atoms")
             target = md_dir / layer_name
             target.mkdir(parents=True, exist_ok=True)
-            atoms = structures.read_atoms(config.input_dir / f"{layer_name}.poscar")
+            atoms = source_atoms.copy()
             had_constraints = _normalize_stage1_structure(
                 atoms,
                 clear_constraints=True,
@@ -373,8 +373,15 @@ def _build_init_mlff(
     init_dir = stage_dir(config.work_dir, "init_mlff")
     backups = []
     init_dir.mkdir(parents=True, exist_ok=True)
-    write_supercell_poscar(config.input_dir / "bot_layer.poscar", init_dir / "POSCAR", config.sc)
-    atoms = structures.read_atoms(init_dir / "POSCAR")
+    if structures.bot_atoms is None:
+        raise RuntimeError("Stage0 preflight did not return bottom-layer atoms")
+    atoms = sort(
+        make_supercell(
+            prim=structures.bot_atoms.copy(),
+            P=supercell_matrix(config.sc),
+        )
+    )
+    write_vasp(init_dir / "POSCAR", atoms=atoms)
     _write_vasp_inputs(config, init_dir, atoms, config.input_dir / "init_INCAR", rcut)
     jobs = _submit_dirs(config, runner, [init_dir], wait)
     if runner is not None and wait:
@@ -396,7 +403,7 @@ def _build_init_mlff(
 def _build_relaxations(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
-    stackings: list[tuple[int, int]],
+    stackings: tuple[tuple[int, int], ...],
     rcut: float,
     generated_at: str,
     timestamp: str,
@@ -452,24 +459,19 @@ def _build_relaxations(
 
 def _build_validation(
     config: DPmoireLiteConfig,
-    structures: StructureHandler,
+    validation_structures: tuple[PreparedValidationStructure, ...],
     rcut: float,
     generated_at: str,
-    timestamp: str,
     runner: SlurmRunner | None,
     wait: bool,
 ) -> None:
     validation_dir = stage_dir(config.work_dir, "validation")
-    tmp_dir = _make_temp_work_dir(config.work_dir, "validation", timestamp)
-    try:
-        angles, atoms_list = structures.make_twist_struct(config.min_val_n, config.max_val_n, tmp_dir)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    directories = [validation_dir / angle for angle in angles]
+    directories = [validation_dir / record.angle for record in validation_structures]
     backups = []
-    for angle, atoms in zip(angles, atoms_list, strict=True):
-        target = validation_dir / angle
+    for record in validation_structures:
+        target = validation_dir / record.angle
         target.mkdir(parents=True, exist_ok=True)
+        atoms = record.atoms.copy()
         write_vasp(target / "POSCAR", atoms=atoms)
         _write_vasp_inputs(config, target, atoms, config.input_dir / "val_INCAR", rcut)
     jobs = _submit_dirs(config, runner, directories, wait)
@@ -482,54 +484,9 @@ def _build_validation(
             directories=[relative_to_workdir(config.work_dir, path) for path in directories],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
-            angles=list(angles),
+            angles=[record.angle for record in validation_structures],
         ),
     )
-
-
-def _stage1_stackings(config: DPmoireLiteConfig) -> list[tuple[int, int]]:
-    path = manifest_path(config.work_dir, "rlx")
-    result = read_manifest(config.work_dir, "rlx")
-    if result.kind == "missing":
-        raise RuntimeError(
-            f"Missing relaxation manifest at {path}; Stage1 cannot determine its stacking list. "
-            "The relaxation stage may be an incomplete build; rebuild it before Stage1."
-        )
-    if result.kind == "legacy":
-        manifest_data = result.raw_data or {}
-        manifest_stackings = manifest_data.get("stackings")
-        if not manifest_stackings:
-            raise ValueError(
-                f"Invalid legacy relaxation manifest at {path}; stackings must not be empty."
-            )
-    else:
-        manifest = result.manifest
-        if manifest is None:
-            raise RuntimeError(f"Invalid relaxation manifest at {path}; no manifest data was loaded.")
-        manifest_stackings = manifest.stackings
-
-    if not manifest_stackings:
-        raise ValueError(f"Invalid relaxation manifest at {path}; stackings must not be empty.")
-
-    stackings: list[tuple[int, int]] = []
-    for stacking in manifest_stackings:
-        if len(stacking) != 2:
-            raise ValueError(
-                f"Invalid relaxation manifest at {path}; each stacking must contain two indices."
-            )
-        stackings.append((int(stacking[0]), int(stacking[1])))
-    return stackings
-
-
-def _make_temp_work_dir(work_dir: Path, name: str, timestamp: str) -> Path:
-    base = Path(work_dir) / f".{name}-{timestamp}"
-    candidate = base
-    counter = 1
-    while candidate.exists():
-        candidate = Path(f"{base}-{counter}")
-        counter += 1
-    candidate.mkdir(parents=True)
-    return candidate
 
 
 def _check_mlff_files(init_mlff_dir: Path) -> None:
@@ -573,13 +530,13 @@ def _assert_stage1_structure_cleared(atoms: Atoms) -> None:
 
 
 def _write_md_poscar(
-    contcar: Path,
+    source_atoms: Atoms,
     poscar: Path,
     sc: tuple[int, int] | None,
     *,
     preserve_constraints: bool = False,
-) -> list[dict[str, object]] | None:
-    atoms = read_vasp(contcar)
+) -> tuple[Atoms, list[dict[str, object]] | None]:
+    atoms = source_atoms.copy()
     source_anchor_indices = (
         _constraint_indices(atoms) if preserve_constraints else []
     )
@@ -590,8 +547,8 @@ def _write_md_poscar(
         poscar.parent.mkdir(parents=True, exist_ok=True)
         write_vasp(poscar, atoms=atoms, direct=True, sort=False)
         if not preserve_constraints:
-            return None
-        return [
+            return atoms, None
+        return atoms, [
             {
                 "index": index,
                 "source_index": index,
@@ -622,7 +579,7 @@ def _write_md_poscar(
         del atoms_sc.arrays["image_translation"]
         poscar.parent.mkdir(parents=True, exist_ok=True)
         write_vasp(poscar, atoms=atoms_sc, direct=True, sort=False)
-        return None
+        return atoms_sc, None
 
     source_indices = np.asarray(atoms_sc.arrays["source_index"], dtype=int)
     image_translations = np.asarray(atoms_sc.arrays["image_translation"], dtype=int)
@@ -657,7 +614,7 @@ def _write_md_poscar(
     poscar.parent.mkdir(parents=True, exist_ok=True)
     write_vasp(poscar, atoms=atoms_sc, direct=True, sort=False)
     anchor_records.sort(key=lambda record: int(record["index"]))
-    return anchor_records
+    return atoms_sc, anchor_records
 
 
 def _constraint_indices(atoms: Atoms) -> list[int]:

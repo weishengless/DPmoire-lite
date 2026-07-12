@@ -1,3 +1,5 @@
+import tempfile
+
 import pytest
 
 from ase import Atoms
@@ -63,6 +65,40 @@ def test_read_atoms_does_not_clobber_existing_normalized_sibling(tmp_path):
     assert len(atoms) == 1
     assert atoms.get_chemical_symbols() == ["I"]
     assert normalized_sibling.read_text(encoding="utf-8") == sentinel
+
+
+def test_structure_label_compatibility_read_uses_no_temporary_file(
+    tmp_path, monkeypatch
+):
+    poscar = tmp_path / "legacy-label.poscar"
+    poscar.write_text(
+        "\n".join(
+            [
+                "legacy label",
+                "1.0",
+                "3.0 0.0 0.0",
+                "0.0 3.0 0.0",
+                "0.0 0.0 3.0",
+                "I1",
+                "1",
+                "Direct",
+                "0.0 0.0 0.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fail_temporary_file(*_args, **_kwargs):
+        raise AssertionError("compatibility parsing created a temporary file")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", fail_temporary_file)
+
+    handler = object.__new__(StructureHandler)
+    atoms = handler.read_atoms(poscar)
+
+    assert atoms.get_chemical_symbols() == ["I"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [poscar.name]
 
 
 def test_needs_vdw_kernel_detects_nonlocal_vdw():

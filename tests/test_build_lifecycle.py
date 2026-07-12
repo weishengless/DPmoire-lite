@@ -1,10 +1,13 @@
 import shutil
 import warnings
+from pathlib import Path
 
 import pytest
+from ase import Atoms
 
 import dpmoire_lite.build as build_module
 from dpmoire_lite.build import run_build
+from dpmoire_lite.config import load_config
 from dpmoire_lite.manifest import read_manifest
 
 from test_build import write_build_config, write_converged_relaxation, write_relaxation_manifest
@@ -50,6 +53,34 @@ def _fail_once_on_second_relaxation_target(monkeypatch):
         return original(config, output_dir, atoms, incar_template, rcut)
 
     monkeypatch.setattr(build_module, "_write_vasp_inputs", fail_once)
+
+
+def _snapshot_tree(root: Path):
+    root = Path(root)
+    if not root.exists():
+        return None
+    snapshot = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        snapshot.append(
+            (relative, None if path.is_dir() else path.read_bytes())
+        )
+    return tuple(snapshot)
+
+
+def _prepare_stage1_lifecycle_case(tmp_path, stackings=((0, 0),)):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[2, 1],
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    for i, j in stackings:
+        write_converged_relaxation(work, name=f"{i}_{j}")
+    write_relaxation_manifest(work, stackings)
+    return config, work
 
 
 def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
@@ -400,6 +431,209 @@ def test_preflight_warnings_are_deduplicated_per_template_and_tag(tmp_path):
     assert len(matching) == 1
     assert (tmp_path / "work" / "rlx" / "0_0").is_dir()
     assert (tmp_path / "work" / "rlx" / "1_0").is_dir()
+
+
+def test_successful_stage0_preflight_leaves_input_and_absent_work_tree_unchanged(
+    tmp_path,
+):
+    config_path = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        symm_reduce=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    config = load_config(config_path)
+    input_before = _snapshot_tree(config.input_dir)
+    work_before = _snapshot_tree(config.work_dir)
+
+    result = build_module.preflight_stage0(config)
+
+    assert result.structures is not None
+    assert result.rcut is not None
+    assert result.stackings == ((0, 0),)
+    assert _snapshot_tree(config.input_dir) == input_before
+    assert _snapshot_tree(config.work_dir) == work_before is None
+
+
+def test_successful_stage1_preflight_leaves_existing_work_tree_byte_identical(
+    monkeypatch, tmp_path
+):
+    config, work = _prepare_stage1_lifecycle_case(tmp_path)
+    snapshots = []
+    real_preflight = build_module.preflight_stage1
+
+    def observe_preflight(*args, **kwargs):
+        before = _snapshot_tree(work)
+        result = real_preflight(*args, **kwargs)
+        snapshots.append((before, _snapshot_tree(work)))
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage1", observe_preflight)
+
+    run_build(config, wait=False)
+
+    assert len(snapshots) == 1
+    assert snapshots[0][0] == snapshots[0][1]
+
+
+def test_stage0_generation_consumes_preflight_structure_rcut_and_stackings(
+    monkeypatch, tmp_path
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        twist_val=False,
+        symm_reduce=False,
+        n_sectors=[2, 1],
+    )
+    prepared = {}
+    real_preflight = build_module.preflight_stage0
+
+    def observe_preflight(config_value):
+        result = real_preflight(config_value)
+        prepared["result"] = result
+
+        def forbid_read(*_args, **_kwargs):
+            raise AssertionError("generation reparsed a prepared structure")
+
+        result.structures.read_atoms = forbid_read
+        return result
+
+    def forbid_reinterpretation(*_args, **_kwargs):
+        raise AssertionError("generation reconstructed a preflight value")
+
+    monkeypatch.setattr(build_module, "preflight_stage0", observe_preflight)
+    monkeypatch.setattr(build_module, "StructureHandler", forbid_reinterpretation)
+    monkeypatch.setattr(build_module, "_resolve_rcut", forbid_reinterpretation)
+    monkeypatch.setattr(build_module, "generate_stackings", forbid_reinterpretation)
+
+    run_build(config, wait=False)
+
+    result = prepared["result"]
+    manifest = read_manifest(tmp_path / "work", "rlx").manifest
+    assert manifest is not None
+    assert manifest.stackings == [list(stacking) for stacking in result.stackings]
+    assert (tmp_path / "work" / "init_mlff" / "POSCAR").is_file()
+
+
+def test_stage1_preflight_owns_relaxation_manifest_stackings(monkeypatch, tmp_path):
+    config, work = _prepare_stage1_lifecycle_case(
+        tmp_path,
+        stackings=((0, 0), (1, 0)),
+    )
+    observed_extra_args = []
+    observed_stackings = []
+    real_preflight = build_module.preflight_stage1
+
+    def observe_preflight(config_value, *extra_args):
+        observed_extra_args.append(extra_args)
+        result = real_preflight(config_value, *extra_args)
+        observed_stackings.append(result.stackings)
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage1", observe_preflight)
+
+    run_build(config, wait=False)
+
+    manifest = read_manifest(work, "md").manifest
+    assert manifest is not None
+    assert observed_extra_args == [()]
+    assert observed_stackings == [((0, 0), (1, 0))]
+    assert manifest.stackings == [[0, 0], [1, 0]]
+
+
+def test_stage1_generation_consumes_preflight_structures_relaxations_and_rcut(
+    monkeypatch, tmp_path
+):
+    config, work = _prepare_stage1_lifecycle_case(tmp_path)
+    prepared = {}
+    writer_sources = []
+    observed_rcuts = []
+    real_preflight = build_module.preflight_stage1
+    real_writer = build_module._write_md_poscar
+    real_inputs = build_module._write_vasp_inputs
+
+    def observe_preflight(*args, **kwargs):
+        result = real_preflight(*args, **kwargs)
+        prepared["result"] = result
+        return result
+
+    def forbid_reinterpretation(*_args, **_kwargs):
+        raise AssertionError("generation reconstructed a preflight value")
+
+    def observe_writer(source_atoms, *args, **kwargs):
+        assert isinstance(source_atoms, Atoms)
+        writer_sources.append(source_atoms)
+        return real_writer(source_atoms, *args, **kwargs)
+
+    def observe_inputs(config_value, output_dir, atoms, incar_template, rcut):
+        observed_rcuts.append(rcut)
+        return real_inputs(
+            config_value,
+            output_dir,
+            atoms,
+            incar_template,
+            rcut,
+        )
+
+    monkeypatch.setattr(build_module, "preflight_stage1", observe_preflight)
+    monkeypatch.setattr(build_module, "StructureHandler", forbid_reinterpretation)
+    monkeypatch.setattr(build_module, "_resolve_rcut", forbid_reinterpretation)
+    monkeypatch.setattr(build_module, "_write_md_poscar", observe_writer)
+    monkeypatch.setattr(build_module, "_write_vasp_inputs", observe_inputs)
+
+    run_build(config, wait=False)
+
+    result = prepared["result"]
+    assert isinstance(result.relaxations, tuple)
+    assert [record.stacking for record in result.relaxations] == [(0, 0)]
+    assert len(writer_sources) == 1
+    assert writer_sources[0] is not result.relaxations[0].atoms
+    assert observed_rcuts == [result.rcut]
+    assert read_manifest(work, "md").manifest is not None
+
+
+def test_generation_does_not_reparse_written_or_validated_poscars(
+    monkeypatch, tmp_path
+):
+    config, work = _prepare_stage1_lifecycle_case(tmp_path)
+    state = {"preflight_complete": False, "result": None}
+    real_preflight = build_module.preflight_stage1
+    real_read_vasp = build_module.read_vasp
+    handler_type = build_module.StructureHandler
+    real_handler_read = handler_type.read_atoms
+
+    def observe_preflight(*args, **kwargs):
+        result = real_preflight(*args, **kwargs)
+        state["result"] = result
+        state["preflight_complete"] = True
+        return result
+
+    def reuse_preflight_handler(*_args, **_kwargs):
+        return state["result"].structures
+
+    def forbid_build_read_vasp(*args, **kwargs):
+        if state["preflight_complete"]:
+            raise AssertionError("generation reopened a validated CONTCAR")
+        return real_read_vasp(*args, **kwargs)
+
+    def forbid_handler_reparse(self, *args, **kwargs):
+        if state["preflight_complete"]:
+            raise AssertionError("generation reparsed a written or validated POSCAR")
+        return real_handler_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(build_module, "preflight_stage1", observe_preflight)
+    monkeypatch.setattr(build_module, "StructureHandler", reuse_preflight_handler)
+    monkeypatch.setattr(build_module, "read_vasp", forbid_build_read_vasp)
+    monkeypatch.setattr(handler_type, "read_atoms", forbid_handler_reparse)
+
+    run_build(config, wait=False)
+
+    assert (work / "md" / "0_0" / "POSCAR").is_file()
 
 
 def test_stage1_missing_relaxation_manifest_fails_without_md_change(tmp_path):

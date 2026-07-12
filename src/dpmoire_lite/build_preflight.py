@@ -8,6 +8,7 @@ from pathlib import Path
 import warnings as pywarnings
 
 import numpy as np
+from ase import Atoms
 from ase.constraints import FixScaled
 from ase.io.vasp import read_vasp
 
@@ -15,7 +16,7 @@ from .config import DPmoireLiteConfig
 from .incar import IncarAnalysis, parse_incar
 from .inputs import get_ordered_elements, read_enmax, resolve_potcar_dir
 from .mlab import MlabParseResult, parse_mlab
-from .manifest import Manifest, read_manifest
+from .manifest import Manifest, ManifestReadResult, read_manifest
 from .provenance import (
     CELL_ATOL,
     CELL_RTOL,
@@ -51,6 +52,18 @@ class PreflightDiagnostic:
 
 
 @dataclass(frozen=True)
+class PreparedRelaxation:
+    stacking: tuple[int, int]
+    atoms: Atoms
+
+
+@dataclass(frozen=True)
+class PreparedValidationStructure:
+    angle: str
+    atoms: Atoms
+
+
+@dataclass(frozen=True)
 class BuildPreflightResult:
     stage: int | str
     structures: StructureHandler | None
@@ -59,6 +72,8 @@ class BuildPreflightResult:
     templates: dict[str, IncarAnalysis] = field(default_factory=dict)
     potcar_sources: dict[str, Path] = field(default_factory=dict)
     initial_seed: MlabParseResult | None = None
+    relaxations: tuple[PreparedRelaxation, ...] = ()
+    validation_structures: tuple[PreparedValidationStructure, ...] = ()
     warnings: tuple[PreflightDiagnostic, ...] = ()
     trusted_sc_rlx: bool | None = None
     trusted_sc: tuple[int, int] | None = None
@@ -96,6 +111,37 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
         potcar_sources = _validate_potcars(config, elements, diagnostics)
 
     stackings = tuple(generate_stackings(config.n_sectors))
+    validation_structures: tuple[PreparedValidationStructure, ...] = ()
+    if structures is not None:
+        if config.symm_reduce:
+            try:
+                stackings = tuple(structures.find_sym_reduced_stackings())
+            except Exception as exc:
+                diagnostics.append(
+                    PreflightDiagnostic(
+                        domain="symmetry",
+                        path=config.input_dir,
+                        reason=str(exc),
+                    )
+                )
+        if config.twist_val:
+            try:
+                angles, atoms_list = structures.make_twist_struct(
+                    config.min_val_n,
+                    config.max_val_n,
+                )
+                validation_structures = tuple(
+                    PreparedValidationStructure(str(angle), atoms.copy())
+                    for angle, atoms in zip(angles, atoms_list, strict=True)
+                )
+            except Exception as exc:
+                diagnostics.append(
+                    PreflightDiagnostic(
+                        domain="structure",
+                        path=config.input_dir,
+                        reason=f"twist validation preparation failed: {exc}",
+                    )
+                )
     _raise_if_failed(diagnostics)
     _emit_warnings(warning_diagnostics)
     return BuildPreflightResult(
@@ -106,13 +152,11 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
         templates=templates,
         potcar_sources=potcar_sources,
         warnings=tuple(warning_diagnostics),
+        validation_structures=validation_structures,
     )
 
 
-def preflight_stage1(
-    config: DPmoireLiteConfig,
-    stackings: list[tuple[int, int]],
-) -> BuildPreflightResult:
+def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
     diagnostics: list[PreflightDiagnostic] = []
     warning_diagnostics: list[PreflightDiagnostic] = []
     templates = _validate_templates(
@@ -140,19 +184,34 @@ def preflight_stage1(
         elements = get_ordered_elements(structures.new_struct)
         potcar_sources = _validate_potcars(config, elements, diagnostics)
 
+    manifest_result = read_manifest(config.work_dir, "rlx")
+    stackings = _stage1_manifest_stackings(manifest_result, diagnostics)
+    relaxation_records = []
     for stacking in stackings:
-        _validate_relaxation(config.work_dir / "rlx" / f"{stacking[0]}_{stacking[1]}", diagnostics)
+        atoms = _validate_relaxation(
+            config.work_dir / "rlx" / f"{stacking[0]}_{stacking[1]}",
+            diagnostics,
+        )
+        if atoms is not None:
+            relaxation_records.append(
+                PreparedRelaxation(stacking=stacking, atoms=atoms.copy())
+            )
+    relaxations = tuple(relaxation_records)
+    relaxation_atoms = {
+        record.stacking: record.atoms
+        for record in relaxations
+    }
 
     trusted_sc_rlx = None
     trusted_sc = None
     provenance_kind = None
     provenance_evidence: dict[str, object] = {}
-    manifest_result = read_manifest(config.work_dir, "rlx")
     if manifest_result.kind == "legacy":
         trusted_sc_rlx, trusted_sc = _infer_legacy_stage1_provenance(
             config,
             stackings,
             structures,
+            relaxation_atoms,
             diagnostics,
         )
         if trusted_sc_rlx is not None:
@@ -181,6 +240,7 @@ def preflight_stage1(
                 manifest_result.manifest,
                 stackings,
                 structures,
+                relaxation_atoms,
                 diagnostics,
             )
             if trusted_sc_rlx is not None:
@@ -221,6 +281,7 @@ def preflight_stage1(
                     config,
                     manifest_result.manifest,
                     stackings,
+                    relaxation_atoms,
                     diagnostics,
                 )
         else:
@@ -249,12 +310,73 @@ def preflight_stage1(
         templates=templates,
         potcar_sources=potcar_sources,
         initial_seed=initial_seed,
+        relaxations=relaxations,
         warnings=tuple(warning_diagnostics),
         trusted_sc_rlx=trusted_sc_rlx,
         trusted_sc=trusted_sc,
         provenance_kind=provenance_kind,
         provenance_evidence=provenance_evidence,
     )
+
+
+def _stage1_manifest_stackings(
+    manifest_result: ManifestReadResult,
+    diagnostics: list[PreflightDiagnostic],
+) -> tuple[tuple[int, int], ...]:
+    manifest_display_path = Path("rlx") / "manifest.yaml"
+    if manifest_result.kind == "missing":
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="manifest",
+                path=manifest_display_path,
+                reason=(
+                    "Missing relaxation manifest; Stage1 cannot determine its "
+                    "stacking list. Rebuild the relaxation stage before Stage1."
+                ),
+            )
+        )
+        return ()
+
+    if manifest_result.kind == "legacy":
+        manifest_stackings = (manifest_result.raw_data or {}).get("stackings")
+    elif manifest_result.manifest is not None:
+        manifest_stackings = manifest_result.manifest.stackings
+    else:
+        manifest_stackings = None
+
+    if not isinstance(manifest_stackings, list) or not manifest_stackings:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="manifest",
+                path=manifest_display_path,
+                reason="relaxation manifest stackings must be a non-empty list",
+            )
+        )
+        return ()
+
+    stackings = []
+    for value in manifest_stackings:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="manifest",
+                    path=manifest_display_path,
+                    reason="each relaxation manifest stacking must contain two indices",
+                )
+            )
+            return ()
+        try:
+            stackings.append((int(value[0]), int(value[1])))
+        except (TypeError, ValueError):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="manifest",
+                    path=manifest_display_path,
+                    reason="relaxation manifest stacking indices must be integers",
+                )
+            )
+            return ()
+    return tuple(stackings)
 
 
 def _stage0_templates(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
@@ -412,8 +534,9 @@ def _append_identity_mismatch(
 def _validate_strict_stage1_provenance(
     config: DPmoireLiteConfig,
     manifest: Manifest,
-    stackings: list[tuple[int, int]],
+    stackings: tuple[tuple[int, int], ...],
     structures: StructureHandler | None,
+    relaxation_atoms: Mapping[tuple[int, int], Atoms],
     diagnostics: list[PreflightDiagnostic],
 ) -> tuple[bool | None, tuple[int, int] | None]:
     start_diagnostics = len(diagnostics)
@@ -716,10 +839,11 @@ def _validate_strict_stage1_provenance(
                     )
 
         contcar = config.work_dir / f"rlx/{i}_{j}/CONTCAR"
-        if relative_path not in stage0_poscar_identities or not contcar.is_file():
+        contcar_atoms = relaxation_atoms.get((i, j))
+        if relative_path not in stage0_poscar_identities or contcar_atoms is None:
             continue
         try:
-            contcar_identity = structure_identity(contcar)
+            contcar_identity = structure_identity(contcar, contcar_atoms)
         except Exception:
             continue
         topology_differences = tuple(
@@ -901,7 +1025,8 @@ def _source_constraint_set(
 def _validate_preserved_grid_shift_anchors(
     config: DPmoireLiteConfig,
     manifest: Manifest,
-    stackings: list[tuple[int, int]],
+    stackings: tuple[tuple[int, int], ...],
+    relaxation_atoms: Mapping[tuple[int, int], Atoms],
     diagnostics: list[PreflightDiagnostic],
 ) -> None:
     manifest_path = Path("rlx") / "manifest.yaml"
@@ -959,7 +1084,6 @@ def _validate_preserved_grid_shift_anchors(
             diagnostics,
         )
         poscar = config.work_dir / relative_directory / "POSCAR"
-        contcar = config.work_dir / relative_directory / "CONTCAR"
         try:
             poscar_atoms = read_vasp(poscar)
             poscar_identity = structure_identity(poscar, poscar_atoms)
@@ -1003,16 +1127,8 @@ def _validate_preserved_grid_shift_anchors(
                 )
             )
 
-        try:
-            contcar_atoms = read_vasp(contcar)
-        except Exception as exc:
-            diagnostics.append(
-                PreflightDiagnostic(
-                    domain="provenance",
-                    path=display_path / "CONTCAR",
-                    reason=f"could not validate preserved grid-shift anchors: {exc}",
-                )
-            )
+        contcar_atoms = relaxation_atoms.get((i, j))
+        if contcar_atoms is None:
             continue
 
         if len(poscar_atoms) != len(contcar_atoms):
@@ -1133,8 +1249,9 @@ def _legacy_topology_differences(expected, actual) -> tuple[str, ...]:
 
 def _infer_legacy_stage1_provenance(
     config: DPmoireLiteConfig,
-    stackings: list[tuple[int, int]],
+    stackings: tuple[tuple[int, int], ...],
     structures: StructureHandler | None,
+    relaxation_atoms: Mapping[tuple[int, int], Atoms],
     diagnostics: list[PreflightDiagnostic],
 ) -> tuple[bool | None, tuple[int, int] | None]:
     start_diagnostics = len(diagnostics)
@@ -1153,7 +1270,6 @@ def _infer_legacy_stage1_provenance(
     for i, j in stackings:
         directory = Path("rlx") / f"{i}_{j}"
         poscar = config.work_dir / directory / "POSCAR"
-        contcar = config.work_dir / directory / "CONTCAR"
         if not poscar.is_file():
             diagnostics.append(
                 PreflightDiagnostic(
@@ -1186,25 +1302,8 @@ def _infer_legacy_stage1_provenance(
             )
             continue
 
-        if not contcar.is_file():
-            diagnostics.append(
-                PreflightDiagnostic(
-                    domain="provenance",
-                    path=directory / "CONTCAR",
-                    reason="legacy inference requires the converged CONTCAR",
-                )
-            )
-            continue
-        try:
-            contcar_atoms = read_vasp(contcar)
-        except Exception as exc:
-            diagnostics.append(
-                PreflightDiagnostic(
-                    domain="provenance",
-                    path=directory / "CONTCAR",
-                    reason=f"legacy inference could not read CONTCAR: {exc}",
-                )
-            )
+        contcar_atoms = relaxation_atoms.get((i, j))
+        if contcar_atoms is None:
             continue
         topology_differences = _legacy_topology_differences(candidate, contcar_atoms)
         if topology_differences:
@@ -1377,6 +1476,7 @@ def _read_structures(
     config: DPmoireLiteConfig,
     diagnostics: list[PreflightDiagnostic],
 ) -> StructureHandler | None:
+    start_diagnostics = len(diagnostics)
     reader = object.__new__(StructureHandler)
     input_atoms = {}
     for name in ("top_layer", "bot_layer"):
@@ -1407,12 +1507,17 @@ def _read_structures(
                 )
             )
 
+    if len(diagnostics) != start_diagnostics:
+        return None
+
     try:
-        return StructureHandler(
+        return StructureHandler.from_atoms(
             config.input_dir,
             config.work_dir,
             config.n_sectors,
             config.d,
+            input_atoms["top_layer"],
+            input_atoms["bot_layer"],
             config.d_mode,
             config.d_reference,
         )
@@ -1469,7 +1574,7 @@ def _validate_potcars(
 def _validate_relaxation(
     directory: Path,
     diagnostics: list[PreflightDiagnostic],
-) -> None:
+) -> Atoms | None:
     display_directory = Path("rlx") / directory.name
     outcar = directory / "OUTCAR"
     if not outcar.is_file():
@@ -1501,6 +1606,7 @@ def _validate_relaxation(
             )
 
     contcar = directory / "CONTCAR"
+    contcar_atoms = None
     if not contcar.is_file():
         diagnostics.append(
             PreflightDiagnostic(
@@ -1511,7 +1617,7 @@ def _validate_relaxation(
         )
     else:
         try:
-            read_vasp(contcar)
+            contcar_atoms = read_vasp(contcar)
         except Exception as exc:
             diagnostics.append(
                 PreflightDiagnostic(
@@ -1520,6 +1626,7 @@ def _validate_relaxation(
                     reason=f"CONTCAR is not readable by ASE: {exc}",
                 )
             )
+    return contcar_atoms
 
 
 def _validate_initial_seed(

@@ -67,6 +67,68 @@ def test_find_sym_reduced_stackings_reports_missing_optional_dependency(monkeypa
         handler.find_sym_reduced_stackings()
 
 
+def test_symmetry_selection_failure_precedes_workdir_creation(monkeypatch, tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        twist_val=False,
+        symm_reduce=True,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    work = tmp_path / "work"
+
+    def fail_selection(_self):
+        raise RuntimeError("synthetic symmetry selection failure")
+
+    monkeypatch.setattr(
+        build_module.StructureHandler,
+        "find_sym_reduced_stackings",
+        fail_selection,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic symmetry selection failure"):
+        run_build(config, wait=False)
+
+    assert not work.exists()
+
+
+def test_twist_validation_selection_is_prepared_without_a_temporary_workdir(
+    monkeypatch, tmp_path
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=False,
+        twist_val=True,
+        symm_reduce=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    work = tmp_path / "work"
+    observed_extra_args = []
+
+    def prepare_twist(self, _n_min, _n_max, *extra_args):
+        observed_extra_args.append(extra_args)
+        assert extra_args == ()
+        assert not work.exists()
+        return ["synthetic-angle"], [self.new_struct.copy()]
+
+    monkeypatch.setattr(
+        build_module.StructureHandler,
+        "make_twist_struct",
+        prepare_twist,
+    )
+
+    run_build(config, wait=False)
+
+    assert observed_extra_args == [()]
+    assert (work / "validation" / "synthetic-angle" / "POSCAR").is_file()
+
+
 def test_symmetry_auxiliary_file_written_only_after_preflight(monkeypatch, tmp_path):
     config = write_build_config(
         tmp_path,
