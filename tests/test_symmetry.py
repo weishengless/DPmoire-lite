@@ -33,6 +33,7 @@ def test_find_sym_reduced_stackings_is_stable_and_unique(tmp_path):
 
     first = handler.find_sym_reduced_stackings()
     second = handler.find_sym_reduced_stackings()
+    handler.write_sym_reduced_stackings(second)
 
     assert first == [(0, 0), (0, 1), (1, 0), (1, 1)]
     assert second == first
@@ -44,6 +45,7 @@ def test_find_sym_reduced_stackings_supports_rectangular_sectors(tmp_path):
     handler = make_handler(tmp_path, (3, 2))
 
     stackings = handler.find_sym_reduced_stackings()
+    handler.write_sym_reduced_stackings(stackings)
 
     assert stackings == [(0, 0), (0, 1), (1, 0), (1, 1)]
     assert len(stackings) == len(set(stackings))

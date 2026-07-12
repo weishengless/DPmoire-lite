@@ -97,6 +97,8 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
         if config.symm_reduce
         else generate_stackings(config.n_sectors)
     )
+    if config.symm_reduce:
+        structures.write_sym_reduced_stackings(stackings)
     runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
 
     if config.init_mlff:

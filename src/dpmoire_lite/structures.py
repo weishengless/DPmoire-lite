@@ -12,6 +12,8 @@ from ase.build import make_supercell, sort, stack
 from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
+from .atomic_io import atomic_text_publish
+
 
 def generate_stackings(n_sectors: tuple[int, int]) -> list[tuple[int, int]]:
     nx, ny = n_sectors
@@ -290,9 +292,16 @@ class StructureHandler:
             if not matched:
                 unique_structs.append(structure)
                 unique_stackings.append(stacking)
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        np.savetxt(self.work_dir / "sym_reduced_stackings.txt", np.array(unique_stackings), fmt="%d")
         return unique_stackings
+
+    def write_sym_reduced_stackings(self, stackings: list[tuple[int, int]]) -> None:
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        text = "".join(f"{i} {j}\n" for i, j in stackings)
+        atomic_text_publish(
+            self.work_dir / "sym_reduced_stackings.txt",
+            text,
+            encoding="utf-8",
+        )
 
     def build_new_struct(self, d: float) -> tuple[Atoms, list[int], list[int]]:
         top_cell_mat = self.top_atoms.get_cell().array
