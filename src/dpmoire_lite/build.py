@@ -113,7 +113,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
     config.validate_build_mode(wait)
     _check_target_stages_absent(config, _stage1_target_stages(config))
     stackings = _stage1_stackings(config)
-    preflight_stage1(config, stackings)
+    preflight = preflight_stage1(config, stackings)
     generated_at = datetime.now().isoformat(timespec="seconds")
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -134,11 +134,15 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
 
     directories = []
     init_mlff_dir = config.work_dir / "init_mlff"
+    if preflight.trusted_sc_rlx is None:
+        md_sc = None if config.sc_rlx else config.sc
+    else:
+        md_sc = None if preflight.trusted_sc_rlx else preflight.trusted_sc
     for i, j in stackings:
         source_dir = config.work_dir / "rlx" / f"{i}_{j}"
         target = md_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
-        _write_md_poscar(source_dir / "CONTCAR", target / "POSCAR", config.sc if not config.sc_rlx else None)
+        _write_md_poscar(source_dir / "CONTCAR", target / "POSCAR", md_sc)
         atoms = structures.read_atoms(target / "POSCAR")
         _write_vasp_inputs(config, target, atoms, config.input_dir / "MD_INCAR", rcut)
         if config.vasp_ml:

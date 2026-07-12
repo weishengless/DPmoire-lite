@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 import warnings as pywarnings
@@ -11,6 +13,12 @@ from .config import DPmoireLiteConfig
 from .incar import IncarAnalysis, parse_incar
 from .inputs import get_ordered_elements, read_enmax, resolve_potcar_dir
 from .mlab import MlabParseResult, parse_mlab
+from .manifest import Manifest, read_manifest
+from .provenance import (
+    StructureIdentity,
+    structure_identity,
+    structure_identity_differences,
+)
 from .structures import StructureHandler, generate_stackings, validate_cartesian_z_slab_cell
 
 
@@ -47,6 +55,8 @@ class BuildPreflightResult:
     potcar_sources: dict[str, Path] = field(default_factory=dict)
     initial_seed: MlabParseResult | None = None
     warnings: tuple[PreflightDiagnostic, ...] = ()
+    trusted_sc_rlx: bool | None = None
+    trusted_sc: tuple[int, int] | None = None
 
 
 def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
@@ -126,6 +136,20 @@ def preflight_stage1(
     for stacking in stackings:
         _validate_relaxation(config.work_dir / "rlx" / f"{stacking[0]}_{stacking[1]}", diagnostics)
 
+    trusted_sc_rlx = None
+    trusted_sc = None
+    manifest_result = read_manifest(config.work_dir, "rlx")
+    if manifest_result.kind == "current" and manifest_result.manifest is not None:
+        provenance = manifest_result.manifest.structure_provenance
+        if provenance:
+            trusted_sc_rlx, trusted_sc = _validate_strict_stage1_provenance(
+                config,
+                manifest_result.manifest,
+                stackings,
+                structures,
+                diagnostics,
+            )
+
     initial_seed = None
     if config.vasp_ml:
         initial_seed = _validate_initial_seed(config, diagnostics)
@@ -141,6 +165,8 @@ def preflight_stage1(
         potcar_sources=potcar_sources,
         initial_seed=initial_seed,
         warnings=tuple(warning_diagnostics),
+        trusted_sc_rlx=trusted_sc_rlx,
+        trusted_sc=trusted_sc,
     )
 
 
@@ -160,6 +186,480 @@ def _stage1_templates(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
     if config.include_monolayer_md:
         templates.append(("MD_monolayer_INCAR", config.input_dir / "MD_monolayer_INCAR"))
     return templates
+
+
+STRICT_STRUCTURE_PROVENANCE_SCHEMA = "dpmoire-lite.structure-provenance.v1"
+
+
+def _normalized_d_reference(config: DPmoireLiteConfig) -> dict[str, object] | None:
+    if config.d_reference is None:
+        return None
+    return {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in config.d_reference.items()
+    }
+
+
+def _canonical_provenance_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _canonical_provenance_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_canonical_provenance_value(item) for item in value)
+    return value
+
+
+def _provenance_values_equal(left: object, right: object) -> bool:
+    if isinstance(left, (int, float)) and not isinstance(left, bool) and isinstance(right, (int, float)) and not isinstance(right, bool):
+        return math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12)
+    return _canonical_provenance_value(left) == _canonical_provenance_value(right)
+
+
+def _coerce_provenance_pair(
+    value: object,
+    field: str,
+    path: Path,
+    diagnostics: list[PreflightDiagnostic],
+) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason=f"{field} must contain exactly two integer values",
+            )
+        )
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason=f"{field} must contain exactly two integer values",
+            )
+        )
+        return None
+    return int(value[0]), int(value[1])
+
+
+def _identity_from_record(
+    record: object,
+    path: Path,
+    diagnostics: list[PreflightDiagnostic],
+) -> StructureIdentity | None:
+    if not isinstance(record, Mapping):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason="structure identity record must be a mapping",
+            )
+        )
+        return None
+    try:
+        sha256 = record["sha256"]
+        atom_count = record["atom_count"]
+        ordered_elements = record["ordered_elements"]
+        composition = record["composition"]
+        cell = record["cell"]
+        if not isinstance(sha256, str):
+            raise TypeError("sha256 must be a string")
+        if isinstance(atom_count, bool) or not isinstance(atom_count, int):
+            raise TypeError("atom_count must be an integer")
+        if not isinstance(ordered_elements, (list, tuple)):
+            raise TypeError("ordered_elements must be a list")
+        if not isinstance(composition, Mapping):
+            raise TypeError("composition must be a mapping")
+        if not isinstance(cell, (list, tuple)) or len(cell) != 3:
+            raise TypeError("cell must be a 3x3 matrix")
+        parsed_cell = []
+        for row in cell:
+            if not isinstance(row, (list, tuple)) or len(row) != 3:
+                raise TypeError("cell must be a 3x3 matrix")
+            parsed_cell.append(tuple(float(value) for value in row))
+        parsed_composition = []
+        for symbol, count in composition.items():
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise TypeError("composition counts must be integers")
+            parsed_composition.append((str(symbol), int(count)))
+        return StructureIdentity(
+            sha256=sha256,
+            atom_count=atom_count,
+            ordered_elements=tuple(str(value) for value in ordered_elements),
+            composition=tuple(parsed_composition),
+            cell=tuple(parsed_cell),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason=f"invalid structure identity record: {exc}",
+            )
+        )
+        return None
+
+
+def _append_identity_mismatch(
+    expected: StructureIdentity,
+    actual: StructureIdentity,
+    path: Path,
+    diagnostics: list[PreflightDiagnostic],
+    label: str,
+) -> None:
+    differences = structure_identity_differences(expected, actual)
+    if differences:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=path,
+                reason=f"{label} identity mismatch: {', '.join(differences)}",
+            )
+        )
+
+
+def _validate_strict_stage1_provenance(
+    config: DPmoireLiteConfig,
+    manifest: Manifest,
+    stackings: list[tuple[int, int]],
+    structures: StructureHandler | None,
+    diagnostics: list[PreflightDiagnostic],
+) -> tuple[bool | None, tuple[int, int] | None]:
+    start_diagnostics = len(diagnostics)
+    manifest_path = Path("rlx") / "manifest.yaml"
+    provenance = manifest.structure_provenance
+
+    if provenance.get("schema") != STRICT_STRUCTURE_PROVENANCE_SCHEMA:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "unsupported structure provenance schema; expected "
+                    f"{STRICT_STRUCTURE_PROVENANCE_SCHEMA}"
+                ),
+            )
+        )
+    if type(provenance.get("stage")) is not int or provenance.get("stage") != 0:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason="structure provenance stage must be 0",
+            )
+        )
+
+    manifest_stackings = [[int(i), int(j)] for i, j in stackings]
+    if provenance.get("stackings") != manifest_stackings:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "stackings differ between relaxation manifest and structure "
+                    f"provenance: manifest={manifest_stackings!r}, "
+                    f"provenance={provenance.get('stackings')!r}"
+                ),
+            )
+        )
+    expected_directories = [f"rlx/{i}_{j}" for i, j in stackings]
+    if manifest.directories != expected_directories:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "relaxation manifest directories do not match its stacking list: "
+                    f"expected={expected_directories!r}, actual={manifest.directories!r}"
+                ),
+            )
+        )
+
+    manifest_sc_rlx = provenance.get("sc_rlx")
+    if not isinstance(manifest_sc_rlx, bool):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason="sc_rlx must be a boolean in structure provenance",
+            )
+        )
+    elif config.sc_rlx != manifest_sc_rlx:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "sc_rlx conflicts with Stage0 provenance: "
+                    f"manifest={manifest_sc_rlx!r}, current config={config.sc_rlx!r}"
+                ),
+            )
+        )
+
+    manifest_sc = _coerce_provenance_pair(provenance.get("sc"), "sc", manifest_path, diagnostics)
+    manifest_n_sectors = _coerce_provenance_pair(
+        provenance.get("n_sectors"), "n_sectors", manifest_path, diagnostics
+    )
+    if manifest_sc_rlx is True and manifest_sc is not None and tuple(config.sc) != manifest_sc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "sc conflicts with a supercell relaxation: "
+                    f"manifest={list(manifest_sc)!r}, current config={list(config.sc)!r}"
+                ),
+            )
+        )
+    if manifest_n_sectors is not None and tuple(config.n_sectors) != manifest_n_sectors:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "n_sectors differs from Stage0 provenance: "
+                    f"manifest={list(manifest_n_sectors)!r}, "
+                    f"current config={list(config.n_sectors)!r}"
+                ),
+            )
+        )
+
+    immutable_fields = {
+        "symm_reduce": config.symm_reduce,
+        "d": config.d,
+        "d_mode": config.d_mode,
+        "d_reference": _normalized_d_reference(config),
+    }
+    for field_name, current_value in immutable_fields.items():
+        if field_name not in provenance:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=manifest_path,
+                    reason=f"missing immutable field {field_name}",
+                )
+            )
+        elif not _provenance_values_equal(provenance[field_name], current_value):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=manifest_path,
+                    reason=(
+                        f"{field_name} differs from Stage0 provenance: "
+                        f"manifest={provenance[field_name]!r}, current config={current_value!r}"
+                    ),
+                )
+            )
+    if isinstance(manifest_sc_rlx, bool):
+        expected_semantics = (
+            "stage0_relaxation_supercell"
+            if manifest_sc_rlx
+            else "stage0_relaxation_primitive"
+        )
+        if provenance.get("sc_semantics") != expected_semantics:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=manifest_path,
+                    reason=(
+                        "sc_semantics is inconsistent with manifest sc_rlx: "
+                        f"expected={expected_semantics!r}, "
+                        f"actual={provenance.get('sc_semantics')!r}"
+                    ),
+                )
+            )
+
+    expected_inputs = {
+        "input/top_layer.poscar",
+        "input/bot_layer.poscar",
+    }
+    input_records = provenance.get("inputs")
+    if not isinstance(input_records, Mapping):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason="inputs must be a mapping containing both Stage0 layer POSCARs",
+            )
+        )
+    else:
+        for relative_path in sorted(expected_inputs - set(input_records)):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path(relative_path),
+                    reason="missing input identity record",
+                )
+            )
+        for relative_path in sorted(set(input_records) - expected_inputs):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path(relative_path),
+                    reason="unexpected input identity record",
+                )
+            )
+        if structures is not None and structures.top_atoms is not None and structures.bot_atoms is not None:
+            input_sources = {
+                "input/top_layer.poscar": (
+                    config.input_dir / "top_layer.poscar",
+                    structures.top_atoms,
+                ),
+                "input/bot_layer.poscar": (
+                    config.input_dir / "bot_layer.poscar",
+                    structures.bot_atoms,
+                ),
+            }
+            for relative_path, (source_path, atoms) in input_sources.items():
+                record = input_records.get(relative_path)
+                if not isinstance(record, Mapping):
+                    diagnostics.append(
+                        PreflightDiagnostic(
+                            domain="provenance",
+                            path=Path(relative_path),
+                            reason="missing or invalid input identity record",
+                        )
+                    )
+                    continue
+                if record.get("path") != relative_path:
+                    diagnostics.append(
+                        PreflightDiagnostic(
+                            domain="provenance",
+                            path=Path(relative_path),
+                            reason=f"identity record path is {record.get('path')!r}",
+                        )
+                    )
+                expected_identity = _identity_from_record(record, Path(relative_path), diagnostics)
+                try:
+                    actual_identity = structure_identity(source_path, atoms)
+                except Exception as exc:
+                    diagnostics.append(
+                        PreflightDiagnostic(
+                            domain="provenance",
+                            path=Path(relative_path),
+                            reason=f"could not read current input identity: {exc}",
+                        )
+                    )
+                else:
+                    if expected_identity is not None:
+                        _append_identity_mismatch(
+                            expected_identity,
+                            actual_identity,
+                            Path(relative_path),
+                            diagnostics,
+                            "input",
+                        )
+
+    expected_rlx_paths = {f"rlx/{i}_{j}/POSCAR" for i, j in stackings}
+    rlx_records = provenance.get("rlx_poscars")
+    if not isinstance(rlx_records, Mapping):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason="rlx_poscars must be a mapping of every generated POSCAR",
+            )
+        )
+        rlx_records = {}
+    else:
+        for relative_path in sorted(expected_rlx_paths - set(rlx_records)):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path(relative_path),
+                    reason="missing generated POSCAR identity record",
+                )
+            )
+        for relative_path in sorted(set(rlx_records) - expected_rlx_paths):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path(relative_path),
+                    reason="unexpected generated POSCAR identity record",
+                )
+            )
+
+    stage0_poscar_identities: dict[str, StructureIdentity] = {}
+    for i, j in stackings:
+        relative_path = f"rlx/{i}_{j}/POSCAR"
+        display_path = Path(relative_path)
+        record = rlx_records.get(relative_path)
+        if not isinstance(record, Mapping):
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=display_path,
+                    reason="missing or invalid generated POSCAR identity record",
+                )
+            )
+        else:
+            if record.get("path") != relative_path:
+                diagnostics.append(
+                    PreflightDiagnostic(
+                        domain="provenance",
+                        path=display_path,
+                        reason=f"identity record path is {record.get('path')!r}",
+                    )
+                )
+            expected_identity = _identity_from_record(record, display_path, diagnostics)
+            poscar = config.work_dir / relative_path
+            try:
+                actual_identity = structure_identity(poscar)
+            except Exception as exc:
+                diagnostics.append(
+                    PreflightDiagnostic(
+                        domain="provenance",
+                        path=display_path,
+                        reason=f"could not read generated POSCAR identity: {exc}",
+                    )
+                )
+            else:
+                stage0_poscar_identities[relative_path] = actual_identity
+                if expected_identity is not None:
+                    _append_identity_mismatch(
+                        expected_identity,
+                        actual_identity,
+                        display_path,
+                        diagnostics,
+                        "generated POSCAR",
+                    )
+
+        contcar = config.work_dir / f"rlx/{i}_{j}/CONTCAR"
+        if relative_path not in stage0_poscar_identities or not contcar.is_file():
+            continue
+        try:
+            contcar_identity = structure_identity(contcar)
+        except Exception:
+            continue
+        topology_differences = tuple(
+            difference
+            for difference in structure_identity_differences(
+                stage0_poscar_identities[relative_path], contcar_identity
+            )
+            if difference in {"atom_count", "ordered_elements", "composition"}
+        )
+        if topology_differences:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path(f"rlx/{i}_{j}/CONTCAR"),
+                    reason=(
+                        "CONTCAR topology/composition mismatch: "
+                        f"{', '.join(topology_differences)}"
+                    ),
+                )
+            )
+
+    if len(diagnostics) != start_diagnostics:
+        return None, None
+    if not isinstance(manifest_sc_rlx, bool) or manifest_sc is None:
+        return None, None
+    trusted_sc = tuple(config.sc) if not manifest_sc_rlx else manifest_sc
+    return manifest_sc_rlx, trusted_sc
 
 
 def _validate_templates(
