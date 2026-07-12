@@ -330,17 +330,33 @@ def _build_relaxations(
     backups = []
     directories = []
     rlx_poscars = {}
+    grid_shift_anchors = {}
     for i, j in stackings:
         target = rlx_dir / f"{i}_{j}"
         target.mkdir(parents=True, exist_ok=True)
         atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
         write_vasp(target / "POSCAR", atoms=atoms)
         relative_path = relative_to_workdir(config.work_dir, target / "POSCAR")
-        rlx_poscars[relative_path] = _structure_identity_record(target / "POSCAR", relative_path)
+        identity = _structure_identity_record(target / "POSCAR", relative_path)
+        rlx_poscars[relative_path] = identity
+        top_indexes, bot_indexes = structures.find_layer_idx(atoms)
+        anchor_relative_path = relative_to_workdir(config.work_dir, target)
+        grid_shift_anchors[anchor_relative_path] = _grid_shift_anchor_record(
+            target / "POSCAR",
+            identity,
+            top_indexes,
+            bot_indexes,
+        )
         _write_vasp_inputs(config, target, atoms, config.input_dir / "rlx_INCAR", rcut)
         directories.append(target)
     jobs = _submit_dirs(config, runner, directories, wait)
-    provenance = _stage0_structure_provenance(config, structures, stackings, rlx_poscars)
+    provenance = _stage0_structure_provenance(
+        config,
+        structures,
+        stackings,
+        rlx_poscars,
+        grid_shift_anchors,
+    )
     write_manifest(
         config.work_dir,
         Manifest(
@@ -559,11 +575,61 @@ def _structure_identity_record(
     }
 
 
+def _grid_shift_anchor_record(
+    path: Path,
+    identity: dict[str, object],
+    top_indexes: list[int],
+    bot_indexes: list[int],
+) -> dict[str, object]:
+    atoms = read_vasp(path)
+    entries: dict[int, list[bool]] = {}
+    for constraint in atoms.constraints:
+        indexes = np.asarray(getattr(constraint, "index", []), dtype=int).reshape(-1)
+        mask_value = getattr(constraint, "mask", None)
+        if indexes.size == 0 or mask_value is None:
+            raise RuntimeError(
+                f"Stage0 grid-shift constraints in {path} cannot be represented by fixed_masks"
+            )
+        mask = np.asarray(mask_value, dtype=bool).reshape(-1)
+        if mask.shape != (3,) or mask.tolist() != [True, True, False]:
+            raise RuntimeError(
+                f"Stage0 grid-shift constraints in {path} must use fixed mask [true, true, false]"
+            )
+        for index in indexes:
+            index = int(index)
+            if index < 0 or index >= len(atoms) or index in entries:
+                raise RuntimeError(
+                    f"Stage0 grid-shift constraints in {path} contain invalid or duplicate anchor indices"
+                )
+            entries[index] = mask.tolist()
+
+    top_anchors = sorted(set(top_indexes).intersection(entries))
+    bot_anchors = sorted(set(bot_indexes).intersection(entries))
+    if len(entries) != 2 or len(top_anchors) != 1 or len(bot_anchors) != 1:
+        raise RuntimeError(
+            f"Stage0 grid-shift constraints in {path} must contain exactly one top and one bottom anchor"
+        )
+
+    top_index = top_anchors[0]
+    bottom_index = bot_anchors[0]
+    return {
+        "atom_count": int(identity["atom_count"]),
+        "poscar_sha256": str(identity["sha256"]),
+        "top_index": top_index,
+        "bottom_index": bottom_index,
+        "fixed_masks": {
+            top_index: entries[top_index],
+            bottom_index: entries[bottom_index],
+        },
+    }
+
+
 def _stage0_structure_provenance(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
     stackings: list[tuple[int, int]],
     rlx_poscars: dict[str, dict[str, object]],
+    grid_shift_anchors: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     if structures.top_atoms is None or structures.bot_atoms is None:
         raise RuntimeError("Stage0 structure provenance requires loaded top and bottom inputs")
@@ -596,4 +662,5 @@ def _stage0_structure_provenance(
         "stackings": stacking_values,
         "inputs": inputs,
         "rlx_poscars": rlx_poscars,
+        "grid_shift_anchors": grid_shift_anchors,
     }
