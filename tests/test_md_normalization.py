@@ -27,13 +27,24 @@ def build_stage0(tmp_path, **overrides):
     work = tmp_path / "work"
     manifest = read_manifest(work, "rlx").manifest
     assert manifest is not None
-    return work, manifest.structure_provenance
+    return work, manifest
+
+
+def test_stage0_manifest_writes_grid_shift_anchors_at_top_level_only(tmp_path):
+    config = write_build_config(tmp_path, n_sectors=[1, 1])
+
+    run_build(config, wait=False)
+
+    manifest = read_manifest(tmp_path / "work", "rlx").manifest
+    assert manifest is not None
+    assert manifest.grid_shift_anchors
+    assert "grid_shift_anchors" not in manifest.structure_provenance
 
 
 def test_stage0_manifest_records_two_anchor_indices_per_stacking(tmp_path):
-    work, provenance = build_stage0(tmp_path, n_sectors=[2, 1])
+    work, manifest = build_stage0(tmp_path, n_sectors=[2, 1])
+    anchors = manifest.grid_shift_anchors
 
-    anchors = provenance["grid_shift_anchors"]
     assert set(anchors) == {"rlx/0_0", "rlx/1_0"}
     for relative_path in anchors:
         record = anchors[relative_path]
@@ -46,9 +57,10 @@ def test_stage0_manifest_records_two_anchor_indices_per_stacking(tmp_path):
 
 
 def test_anchor_fixed_masks_use_true_equals_fixed(tmp_path):
-    _, provenance = build_stage0(tmp_path, n_sectors=[1, 1])
+    _, manifest = build_stage0(tmp_path, n_sectors=[1, 1])
+    anchors = manifest.grid_shift_anchors
 
-    for record in provenance["grid_shift_anchors"].values():
+    for record in anchors.values():
         for index in (record["top_index"], record["bottom_index"]):
             mask = record["fixed_masks"][index]
             assert all(type(value) is bool for value in mask)
@@ -56,20 +68,24 @@ def test_anchor_fixed_masks_use_true_equals_fixed(tmp_path):
 
 
 def test_ff_t_serializes_as_true_true_false(tmp_path):
-    work, provenance = build_stage0(tmp_path, n_sectors=[1, 1])
+    work, manifest = build_stage0(tmp_path, n_sectors=[1, 1])
+    anchors = manifest.grid_shift_anchors
 
-    for relative_path, record in provenance["grid_shift_anchors"].items():
+    for relative_path, record in anchors.items():
         flags = read_selective_dynamics_flags(work / relative_path / "POSCAR")
         assert flags[record["top_index"]] == ("F", "F", "T")
         assert flags[record["bottom_index"]] == ("F", "F", "T")
 
 
 def test_anchor_record_is_bound_to_poscar_hash_and_atom_count(tmp_path):
-    work, provenance = build_stage0(tmp_path, n_sectors=[1, 1])
+    work, manifest = build_stage0(tmp_path, n_sectors=[1, 1])
+    anchors = manifest.grid_shift_anchors
 
-    for relative_path, record in provenance["grid_shift_anchors"].items():
+    for relative_path, record in anchors.items():
         poscar = work / relative_path / "POSCAR"
-        identity = provenance["rlx_poscars"][f"{relative_path}/POSCAR"]
+        identity = manifest.structure_provenance["rlx_poscars"][
+            f"{relative_path}/POSCAR"
+        ]
         assert record["poscar_sha256"] == identity["sha256"]
         assert record["poscar_sha256"] == hashlib.sha256(poscar.read_bytes()).hexdigest()
         assert record["atom_count"] == identity["atom_count"] == len(read_vasp(poscar))
@@ -100,7 +116,7 @@ Direct
     work = work_root / "work"
     manifest = read_manifest(work, "rlx").manifest
     assert manifest is not None
-    record = manifest.structure_provenance["grid_shift_anchors"]["rlx/0_0"]
+    record = manifest.grid_shift_anchors["rlx/0_0"]
     atoms = read_vasp(work / "rlx/0_0/POSCAR")
     symbols = atoms.get_chemical_symbols()
     assert symbols == ["H", "He"]
@@ -269,7 +285,24 @@ Direct
 def _preserve_anchor_record(tmp_path):
     manifest = read_manifest(tmp_path / "work", "rlx").manifest
     assert manifest is not None
-    return manifest, manifest.structure_provenance["grid_shift_anchors"]["rlx/0_0"]
+    return manifest, manifest.grid_shift_anchors["rlx/0_0"]
+
+
+def _rewrite_rlx_anchor_location(tmp_path, *, top_level):
+    manifest = read_manifest(tmp_path / "work", "rlx").manifest
+    assert manifest is not None
+    anchors = manifest.grid_shift_anchors or manifest.structure_provenance.get(
+        "grid_shift_anchors"
+    )
+    assert anchors
+
+    if top_level:
+        manifest.grid_shift_anchors = anchors
+        manifest.structure_provenance.pop("grid_shift_anchors", None)
+    else:
+        manifest.grid_shift_anchors = {}
+        manifest.structure_provenance["grid_shift_anchors"] = anchors
+    write_manifest(tmp_path / "work", manifest)
 
 
 def _rewrite_constraints(path, constraints):
@@ -288,6 +321,37 @@ def _replace_constraint(path, target_index, replacement):
         else:
             constraints.append(constraint)
     _rewrite_constraints(path, constraints)
+
+
+def test_stage1_preservation_reads_top_level_anchor_records(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    _rewrite_rlx_anchor_location(tmp_path, top_level=True)
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert len(atoms.constraints) == 2
+
+
+def test_nested_only_development_anchors_fail_with_regeneration_diagnostic(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    _rewrite_rlx_anchor_location(tmp_path, top_level=False)
+
+    with pytest.raises(RuntimeError, match="regenerate Stage0"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_nested_only_development_anchors_do_not_block_default_clearing(tmp_path):
+    config = _prepare_three_atom_preserve_stage1(tmp_path)
+    switch_to_stage1(config, preserve_grid_shift_md=False)
+    _rewrite_rlx_anchor_location(tmp_path, top_level=False)
+
+    run_build(config, wait=False)
+
+    atoms = read_vasp(tmp_path / "work" / "md" / "0_0" / "POSCAR")
+    assert not atoms.constraints
 
 
 def test_preserve_true_accepts_exact_two_manifest_anchors(tmp_path):
@@ -369,9 +433,7 @@ def test_preserve_true_rejects_other_constraint_type(tmp_path):
 def test_preserve_true_rejects_atom_order_or_hash_mismatch(tmp_path):
     config = _prepare_three_atom_preserve_stage1(tmp_path)
     manifest, _ = _preserve_anchor_record(tmp_path)
-    manifest.structure_provenance["grid_shift_anchors"]["rlx/0_0"][
-        "poscar_sha256"
-    ] = "0" * 64
+    manifest.grid_shift_anchors["rlx/0_0"]["poscar_sha256"] = "0" * 64
     write_manifest(tmp_path / "work", manifest)
 
     with pytest.raises(RuntimeError, match="anchor|hash|constraint|preserve"):

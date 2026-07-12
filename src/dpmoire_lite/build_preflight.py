@@ -162,6 +162,17 @@ def preflight_stage1(
                 "method": "atom_count_composition_cell",
                 "stackings": [[i, j] for i, j in stackings],
             }
+            warning_diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=Path("rlx") / "manifest.yaml",
+                    reason=(
+                        "Legacy relaxation provenance was inferred from atom count, "
+                        "composition, and in-plane cell; Stage1 is proceeding "
+                        "without strict Stage0 provenance."
+                    ),
+                )
+            )
     elif manifest_result.kind == "current" and manifest_result.manifest is not None:
         provenance = manifest_result.manifest.structure_provenance
         if provenance:
@@ -894,8 +905,7 @@ def _validate_preserved_grid_shift_anchors(
     diagnostics: list[PreflightDiagnostic],
 ) -> None:
     manifest_path = Path("rlx") / "manifest.yaml"
-    provenance = manifest.structure_provenance
-    anchors = provenance.get("grid_shift_anchors")
+    anchors = manifest.grid_shift_anchors
     if not isinstance(anchors, Mapping):
         diagnostics.append(
             PreflightDiagnostic(
@@ -904,6 +914,29 @@ def _validate_preserved_grid_shift_anchors(
                 reason="preserve_grid_shift_md requires grid_shift_anchors mapping",
             )
         )
+        return
+    if not anchors:
+        nested_anchors = manifest.structure_provenance.get("grid_shift_anchors")
+        if isinstance(nested_anchors, Mapping) and nested_anchors:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=manifest_path,
+                    reason=(
+                        "grid_shift_anchors exist only under structure_provenance; "
+                        "regenerate Stage0 to write top-level grid_shift_anchors "
+                        "before enabling preserve_grid_shift_md"
+                    ),
+                )
+            )
+        else:
+            diagnostics.append(
+                PreflightDiagnostic(
+                    domain="provenance",
+                    path=manifest_path,
+                    reason="preserve_grid_shift_md requires grid_shift_anchors mapping",
+                )
+            )
         return
 
     for i, j in stackings:

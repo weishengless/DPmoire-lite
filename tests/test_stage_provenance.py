@@ -1,4 +1,5 @@
 import hashlib
+import warnings
 
 from ase import Atoms
 from ase.build import make_supercell
@@ -420,6 +421,23 @@ def test_legacy_manifest_infers_primitive_from_count_composition_and_cell(tmp_pa
     assert len(atoms) == 2
 
 
+def test_successful_legacy_inference_warns_exactly_once_per_build(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [2, 1], "sc": [1, 1], "sc_rlx": False},
+    )
+
+    with pytest.warns(UserWarning) as caught:
+        run_build(config, wait=False)
+
+    matching = [
+        warning
+        for warning in caught
+        if "Legacy relaxation provenance was inferred" in str(warning.message)
+    ]
+    assert len(matching) == 1
+
+
 def test_legacy_manifest_infers_supercell_and_sc(tmp_path):
     config = prepare_legacy_case(
         tmp_path,
@@ -464,6 +482,28 @@ def test_legacy_manifest_rejects_count_cell_conflict(tmp_path):
 
     assert "cell" in str(exc_info.value).lower()
     assert not (tmp_path / "work" / "md").exists()
+
+
+def test_failed_legacy_inference_emits_no_success_warning(tmp_path):
+    config = prepare_legacy_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [2, 1], "sc_rlx": True},
+    )
+    poscar = tmp_path / "work" / "rlx" / "0_0" / "POSCAR"
+    atoms = read_vasp(poscar)
+    cell = atoms.cell.array.copy()
+    cell[0, 0] *= 0.75
+    rewrite_poscar_cell(poscar, cell)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError, match="cell"):
+            run_build(config, wait=False)
+
+    assert not any(
+        "Legacy relaxation provenance was inferred" in str(warning.message)
+        for warning in caught
+    )
 
 
 def test_legacy_manifest_rejects_inconsistent_stackings(tmp_path):
@@ -549,6 +589,22 @@ def test_md_manifest_records_strict_provenance_evidence(tmp_path):
         "schema": "dpmoire-lite.structure-provenance.v1",
         "stackings": [[0, 0]],
     }
+
+
+def test_strict_stage1_emits_no_legacy_inference_warning(tmp_path):
+    config = prepare_stage1_case(
+        tmp_path,
+        stage0_overrides={"n_sectors": [1, 1], "sc": [1, 1], "sc_rlx": False},
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run_build(config, wait=False)
+
+    assert not any(
+        "Legacy relaxation provenance was inferred" in str(warning.message)
+        for warning in caught
+    )
 
 
 def test_md_manifest_records_legacy_inference_evidence(tmp_path):

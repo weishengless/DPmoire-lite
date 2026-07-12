@@ -433,7 +433,6 @@ def _build_relaxations(
         structures,
         stackings,
         rlx_poscars,
-        grid_shift_anchors,
     )
     write_manifest(
         config.work_dir,
@@ -446,6 +445,7 @@ def _build_relaxations(
             jobs=[job.as_dict() for job in jobs],
             stackings=[[i, j] for i, j in stackings],
             structure_provenance=provenance,
+            grid_shift_anchors=grid_shift_anchors,
         ),
     )
 
@@ -817,7 +817,6 @@ def _stage0_structure_provenance(
     structures: StructureHandler,
     stackings: list[tuple[int, int]],
     rlx_poscars: dict[str, dict[str, object]],
-    grid_shift_anchors: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     if structures.top_atoms is None or structures.bot_atoms is None:
         raise RuntimeError("Stage0 structure provenance requires loaded top and bottom inputs")
@@ -850,5 +849,4 @@ def _stage0_structure_provenance(
         "stackings": stacking_values,
         "inputs": inputs,
         "rlx_poscars": rlx_poscars,
-        "grid_shift_anchors": grid_shift_anchors,
     }
