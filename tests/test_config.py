@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 import pytest
 import yaml
@@ -307,3 +308,98 @@ def test_source_and_bundled_examples_show_false_default():
     for relative_path in ("example/config.yaml", "src/dpmoire_lite/example/config.yaml"):
         data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
         assert data["preserve_grid_shift_md"] is False
+
+
+def test_outcar_patterns_defaults_to_historical_families_then_active(tmp_path):
+    expected = (
+        r"^OUTCAR\d+$",
+        r"^OUT\d+$",
+        r"^out\d+$",
+        r"^OUTCAR$",
+    )
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.outcar_patterns == expected
+    repo_root = Path(__file__).resolve().parents[1]
+    for relative_path in ("example/config.yaml", "src/dpmoire_lite/example/config.yaml"):
+        data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
+        assert data["outcar_patterns"] == list(expected)
+
+
+def test_outcar_patterns_rejects_scalar_string(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=r"^OUTCAR\d+$")
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    message = str(exc_info.value)
+    assert "outcar_patterns must be a non-empty YAML list of non-empty regex strings" in message
+    assert "outcar_patterns:" in message
+    assert "  - '^OUTCAR\\d+$'" in message
+    assert "  - '^OUT\\d+$'" in message
+    assert "  - '^out\\d+$'" in message
+    assert "  - '^OUTCAR$'" in message
+
+
+def test_outcar_patterns_rejects_empty_list(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[])
+
+    with pytest.raises(
+        ConfigError,
+        match="outcar_patterns must be a non-empty YAML list of non-empty regex strings",
+    ):
+        load_config(config_file)
+
+
+def test_outcar_patterns_rejects_empty_string_item(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[r"^OUTCAR$", ""])
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    assert "outcar_patterns[1] must be a non-empty string" in str(exc_info.value)
+
+
+def test_outcar_patterns_rejects_mixed_types(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[r"^OUTCAR$", 7, r"^OUTCAR\d+$"])
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    assert "outcar_patterns[1] must be a non-empty string" in str(exc_info.value)
+
+
+def test_outcar_patterns_rejects_invalid_regex_with_index(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[r"^OUTCAR$", "[", r"^OUTCAR\d+$"])
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    message = str(exc_info.value)
+    assert "Invalid outcar_patterns[1] '[':" in message
+    assert isinstance(exc_info.value.__cause__, re.error)
+
+
+def test_outcar_patterns_deduplicates_exact_text_with_warning(tmp_path):
+    duplicate = r"^OUTCAR\d+$"
+    patterns = [duplicate, r"^OUT\d+$", duplicate, r"^OUTCAR$"]
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=patterns)
+
+    with pytest.warns(UserWarning) as recorded:
+        config = load_config(config_file)
+
+    assert len(recorded) == 1
+    assert str(recorded[0].message) == (
+        "Duplicate outcar_patterns[2] '^OUTCAR\\\\d+$' ignored; "
+        "first occurrence is outcar_patterns[0]."
+    )
+    assert config.outcar_patterns == (duplicate, r"^OUT\d+$", r"^OUTCAR$")

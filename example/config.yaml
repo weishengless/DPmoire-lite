@@ -19,10 +19,10 @@ do_relaxation: true      #In stage0, generate stacking relaxation folders under 
 init_mlff: true         #In stage0, generate the initial init_mlff/ folder.
 include_monolayer_md: true  #In stage1, also generate md/top_layer and md/bot_layer monolayer MD folders.
 outcar_patterns:        #Optional regex list used to discover OUTCAR series during collection. Defaults are kept explicit here for readability.
-  - '^OUTCAR$'
   - '^OUTCAR\d+$'
   - '^OUT\d+$'
   - '^out\d+$'
+  - '^OUTCAR$'
 
 ############################ Calculation and Structure Parameters ##############################################
 k_mesh: 40              #KPOINTS mesh target, using k*a = K-mesh.

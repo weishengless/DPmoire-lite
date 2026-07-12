@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any
+import warnings
 
 from ase.data import atomic_numbers
 import yaml
@@ -13,10 +15,21 @@ class ConfigError(ValueError):
 
 
 DEFAULT_OUTCAR_PATTERNS = (
-    r"^OUTCAR$",
     r"^OUTCAR\d+$",
     r"^OUT\d+$",
     r"^out\d+$",
+    r"^OUTCAR$",
+)
+
+OUTCAR_PATTERNS_SHAPE_ERROR = (
+    "outcar_patterns must be a non-empty YAML list of non-empty regex strings"
+)
+OUTCAR_PATTERNS_EXAMPLE = (
+    "outcar_patterns:\n"
+    "  - '^OUTCAR\\d+$'\n"
+    "  - '^OUT\\d+$'\n"
+    "  - '^out\\d+$'\n"
+    "  - '^OUTCAR$'"
 )
 
 OLD_FIELD_NAMES = {
@@ -135,6 +148,37 @@ def normalize_d_reference(value: Any) -> dict[str, str | tuple[str, ...]] | None
         "top": normalize_reference_selector(value.get("top"), "d_reference.top"),
         "bot": normalize_reference_selector(value.get("bot"), "d_reference.bot"),
     }
+
+
+def _normalize_outcar_patterns(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        message = OUTCAR_PATTERNS_SHAPE_ERROR
+        if isinstance(value, str):
+            message = f"{message}\nUse a YAML list, for example:\n{OUTCAR_PATTERNS_EXAMPLE}"
+        raise ConfigError(message)
+
+    patterns: list[str] = []
+    first_indices: dict[str, int] = {}
+    for index, pattern in enumerate(value):
+        if not isinstance(pattern, str) or pattern == "":
+            raise ConfigError(f"outcar_patterns[{index}] must be a non-empty string")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ConfigError(
+                f"Invalid outcar_patterns[{index}] {pattern!r}: {exc}"
+            ) from exc
+        if pattern in first_indices:
+            warnings.warn(
+                f"Duplicate outcar_patterns[{index}] {pattern!r} ignored; "
+                f"first occurrence is outcar_patterns[{first_indices[pattern]}].",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        first_indices[pattern] = index
+        patterns.append(pattern)
+    return tuple(patterns)
 
 
 @dataclass(frozen=True)
@@ -280,7 +324,10 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         raise ConfigError(f"Missing required config field: {missing[0]}")
 
     base = config_path.parent
-    outcar_patterns = raw.get("outcar_patterns", DEFAULT_OUTCAR_PATTERNS)
+    if "outcar_patterns" in raw:
+        outcar_patterns = _normalize_outcar_patterns(raw["outcar_patterns"])
+    else:
+        outcar_patterns = _normalize_outcar_patterns(list(DEFAULT_OUTCAR_PATTERNS))
     d_mode = normalize_d_mode(raw.get("d_mode", "surface_gap"))
     d_reference = normalize_d_reference(raw.get("d_reference")) if d_mode == "reference_plane_gap" else None
     potcar_policy = normalize_potcar_policy(raw.get("potcar_policy", "recommend"))
@@ -316,5 +363,5 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         max_val_n=_int(_require(raw, "max_val_n"), "max_val_n"),
         include_monolayer_md=_bool(_require(raw, "include_monolayer_md"), "include_monolayer_md"),
         preserve_grid_shift_md=_bool(raw.get("preserve_grid_shift_md", False), "preserve_grid_shift_md"),
-        outcar_patterns=tuple(outcar_patterns),
+        outcar_patterns=outcar_patterns,
     )
