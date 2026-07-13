@@ -11,7 +11,7 @@ from ase.io import write as ase_write
 from ase.units import GPa
 
 from .mlab import MlabConfiguration, MlabParseError, parse_mlab
-from .outcar import read_outcar_frames
+from .outcar import open_outcar_frames
 
 
 def count_ml_ab_configs(path: Path) -> int:
@@ -83,9 +83,10 @@ class Dataset:
         if freq <= 0:
             raise ValueError("freq must be a positive integer")
 
-        for index, structure in enumerate(read_outcar_frames(Path(path))):
-            if index % freq == 0:
-                self.add_atoms(structure)
+        with open_outcar_frames(Path(path)) as frames:
+            for index, structure in enumerate(frames):
+                if index % freq == 0:
+                    self.add_atoms(structure)
 
     def load_extxyz(self, path: Path) -> None:
         for structure in ase_read(Path(path), format="extxyz", index=":"):

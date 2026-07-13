@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import shutil
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 import yaml
 
 import dpmoire_lite.collect as collect_module
+import dpmoire_lite.dataset as dataset_module
 from dpmoire_lite.dataset import Dataset
 from dpmoire_lite.collect import run_collect
 from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
@@ -48,6 +50,30 @@ def write_collect_config(root, **overrides):
     path = root / "config.yaml"
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     return path
+
+
+def install_dataset_stream_spies(monkeypatch, streams, opened):
+    @contextmanager
+    def fake_open_outcar_frames(path):
+        source_path = Path(path)
+        opened.append(source_path)
+        yield iter(streams[source_path])
+
+    def reject_batch_reader(*_args, **_kwargs):
+        raise AssertionError("batch OUTCAR reader used instead of streaming context")
+
+    monkeypatch.setattr(
+        dataset_module,
+        "open_outcar_frames",
+        fake_open_outcar_frames,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dataset_module,
+        "read_outcar_frames",
+        reject_batch_reader,
+        raising=False,
+    )
 
 
 def test_load_ml_abn_sample_counts_frames(tmp_path, sample_dir):
@@ -257,3 +283,124 @@ def test_collect_does_not_scan_validation_directories_without_manifest(tmp_path)
     assert "validation" in message
     assert not (work / "valid.extxyz").exists()
     assert not (work / "validation" / "manifest.yaml").exists()
+
+
+def test_stream_sampling_freq_one_accepts_every_frame(tmp_path, monkeypatch):
+    path = tmp_path / "segment.OUTCAR"
+    frames = ["frame-0", "frame-1", "frame-2", "frame-3"]
+    opened = []
+    install_dataset_stream_spies(monkeypatch, {path: frames}, opened)
+    accepted = []
+    dataset = Dataset()
+    dataset.add_atoms = accepted.append
+
+    dataset.load_outcar(path, freq=1)
+
+    assert accepted == frames
+    assert opened == [path]
+
+
+def test_stream_sampling_accepts_zero_n_2n_per_file(tmp_path, monkeypatch):
+    path = tmp_path / "segment.OUTCAR"
+    frames = [f"frame-{index}" for index in range(6)]
+    opened = []
+    install_dataset_stream_spies(monkeypatch, {path: frames}, opened)
+    accepted = []
+    dataset = Dataset()
+    dataset.add_atoms = accepted.append
+
+    dataset.load_outcar(path, freq=2)
+
+    assert accepted == ["frame-0", "frame-2", "frame-4"]
+    assert opened == [path]
+
+
+def test_sampling_index_resets_for_each_outcar_segment(tmp_path, monkeypatch):
+    first_path = tmp_path / "first.OUTCAR"
+    second_path = tmp_path / "second.OUTCAR"
+    streams = {
+        first_path: ["first-0", "first-1", "first-2"],
+        second_path: ["second-0", "second-1", "second-2"],
+    }
+    opened = []
+    install_dataset_stream_spies(monkeypatch, streams, opened)
+    accepted = []
+    dataset = Dataset()
+    dataset.add_atoms = accepted.append
+
+    dataset.load_outcar(first_path, freq=2)
+    dataset.load_outcar(second_path, freq=2)
+
+    assert accepted == ["first-0", "first-2", "second-0", "second-2"]
+    assert opened == [first_path, second_path]
+
+
+def test_nonpositive_frequency_fails_before_opening_file(monkeypatch):
+    def fail_open(*_args, **_kwargs):
+        raise AssertionError("streaming context opened before frequency validation")
+
+    def fail_batch(*_args, **_kwargs):
+        raise AssertionError("batch reader opened before frequency validation")
+
+    monkeypatch.setattr(
+        dataset_module,
+        "open_outcar_frames",
+        fail_open,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dataset_module,
+        "read_outcar_frames",
+        fail_batch,
+        raising=False,
+    )
+
+    for frequency in (0, -1):
+        with pytest.raises(ValueError, match="freq must be a positive integer"):
+            Dataset().load_outcar(Path("not-opened.OUTCAR"), freq=frequency)
+
+
+def test_unselected_frames_are_not_retained_as_atoms(tmp_path, monkeypatch):
+    path = tmp_path / "streaming.OUTCAR"
+    frames = [f"frame-{index}" for index in range(6)]
+    opened = []
+    accepted = []
+
+    @contextmanager
+    def fake_open_outcar_frames(requested_path):
+        source_path = Path(requested_path)
+        opened.append(source_path)
+
+        def stream():
+            for index, frame in enumerate(frames):
+                assert accepted == [
+                    frames[previous]
+                    for previous in range(index)
+                    if previous % 2 == 0
+                ]
+                yield frame
+
+        yield stream()
+
+    def reject_batch_reader(*_args, **_kwargs):
+        raise AssertionError("batch OUTCAR reader used instead of streaming context")
+
+    monkeypatch.setattr(
+        dataset_module,
+        "open_outcar_frames",
+        fake_open_outcar_frames,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dataset_module,
+        "read_outcar_frames",
+        reject_batch_reader,
+        raising=False,
+    )
+    dataset = Dataset()
+    dataset.add_atoms = accepted.append
+
+    dataset.load_outcar(path, freq=2)
+
+    assert accepted == ["frame-0", "frame-2", "frame-4"]
+    assert opened == [path]
