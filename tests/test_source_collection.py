@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import yaml
 from ase import Atoms
+from ase.io.vasp import read_vasp_out
 from ase.units import GPa
 
 from dpmoire_lite import collect as collect_module
@@ -19,6 +20,7 @@ from dpmoire_lite.mlab import (
     parse_mlab,
     seed_prefix_identity,
 )
+from dpmoire_lite.outcar import OutcarSelection, open_outcar_frames
 from dpmoire_lite.paths import manifest_path, relative_to_workdir
 
 
@@ -880,3 +882,262 @@ def test_legacy_final_prefix_mismatch_fails_source(tmp_path):
     assert expected_identity.sha256 in result.reason
     assert actual_identity.sha256 in result.reason
     assert result.seed_identity == actual_identity
+
+
+def _collect_outcar_source_api():
+    collector = getattr(collect_module, "collect_outcar_source", None)
+    assert callable(collector), "collect_outcar_source is not implemented"
+    return collector
+
+
+def _outcar_fixture_path(name: str) -> Path:
+    return Path(__file__).parent / "data" / "outcar" / name
+
+
+def _runtime_outcar_source(
+    tmp_path: Path,
+    fixture_name: str,
+    *,
+    directory: str = "0_0",
+    name: str = "OUTCAR",
+) -> tuple[Path, Path]:
+    work_dir = tmp_path / "work"
+    source_path = work_dir / "md" / directory / name
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_outcar_fixture_path(fixture_name), source_path)
+    return work_dir, source_path
+
+
+def _outcar_selection(
+    path: Path,
+    *,
+    pattern: str = r"^OUTCAR$",
+    pattern_index: int = 0,
+    order: int = 0,
+) -> OutcarSelection:
+    return OutcarSelection(
+        path=path,
+        pattern=pattern,
+        pattern_index=pattern_index,
+        order=order,
+    )
+
+
+def _outcar_reference_frames(path: Path):
+    with open_outcar_frames(path) as frames:
+        streamed_frames = tuple(frames)
+    batch_frames = read_vasp_out(str(path), index=":")
+    assert len(streamed_frames) == len(batch_frames)
+    return tuple(batch_frames)
+
+
+def _assert_outcar_frame_matches(actual, expected) -> None:
+    assert actual.get_chemical_symbols() == expected.get_chemical_symbols()
+    np.testing.assert_allclose(actual.cell.array, expected.cell.array)
+    np.testing.assert_allclose(actual.positions, expected.positions)
+    assert actual.get_potential_energy() == pytest.approx(
+        expected.get_potential_energy()
+    )
+    assert actual.calc.results["free_energy"] == pytest.approx(
+        expected.calc.results["free_energy"]
+    )
+    np.testing.assert_allclose(actual.get_forces(), expected.get_forces())
+    np.testing.assert_allclose(actual.get_stress(), expected.get_stress())
+
+
+def test_complete_outcar_source_contributes_sampled_frames(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir, source_path = _runtime_outcar_source(
+        tmp_path,
+        "complete_two_frame.OUTCAR",
+    )
+    selection = _outcar_selection(source_path)
+    expected_frames = _outcar_reference_frames(source_path)
+
+    assert "LOOP+" not in source_path.read_text(encoding="utf-8")
+    result = collect_outcar_source(
+        work_dir=work_dir,
+        selection=selection,
+        freq=1,
+    )
+
+    assert result.source_kind is models.SourceKind.OUTCAR
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 2
+    assert result.accepted_count == 2
+    assert len(result.accepted_frames) == 2
+    for actual, expected in zip(
+        result.accepted_frames,
+        expected_frames,
+        strict=True,
+    ):
+        _assert_outcar_frame_matches(actual, expected)
+
+
+def test_tail_truncated_outcar_keeps_prior_sampled_frames_as_partial(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir, source_path = _runtime_outcar_source(
+        tmp_path,
+        "tail_truncated_second_frame.OUTCAR",
+    )
+    selection = _outcar_selection(source_path)
+    expected_first = _outcar_reference_frames(
+        _outcar_fixture_path("complete_two_frame.OUTCAR")
+    )[0]
+
+    result = collect_outcar_source(
+        work_dir=work_dir,
+        selection=selection,
+        freq=1,
+    )
+
+    assert result.source_kind is models.SourceKind.OUTCAR
+    assert result.status is models.SourceStatus.PARTIAL
+    assert result.complete_count == 1
+    assert result.accepted_count == 1
+    assert result.discarded_frame_index == 1
+    assert result.line_number is not None
+    assert result.reason is not None
+    assert any(
+        marker in result.reason.lower()
+        for marker in ("eof", "end-of-file", "incomplete", "trunc")
+    )
+    _assert_outcar_frame_matches(result.accepted_frames[0], expected_first)
+
+
+def test_outcar_first_frame_failure_contributes_zero_frames(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir, source_path = _runtime_outcar_source(
+        tmp_path,
+        "complete_two_frame.OUTCAR",
+    )
+    lines = _outcar_fixture_path("complete_two_frame.OUTCAR").read_text(
+        encoding="utf-8"
+    ).splitlines(keepends=True)
+    source_path.write_text("".join(lines[:11]), encoding="utf-8")
+    selection = _outcar_selection(source_path)
+
+    result = collect_outcar_source(
+        work_dir=work_dir,
+        selection=selection,
+        freq=1,
+    )
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 0
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.discarded_frame_index == 0
+    assert result.reason
+
+
+def test_outcar_internal_corruption_does_not_salvage_prefix(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir, source_path = _runtime_outcar_source(
+        tmp_path,
+        "internal_corruption_second_frame.OUTCAR",
+    )
+    selection = _outcar_selection(source_path)
+
+    result = collect_outcar_source(
+        work_dir=work_dir,
+        selection=selection,
+        freq=1,
+    )
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 1
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.discarded_frame_index == 1
+    assert result.line_number is not None
+    assert result.reason
+
+
+def test_outcar_invalid_utf8_is_failed_not_partial(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir = tmp_path / "work"
+    source_path = work_dir / "md" / "0_0" / "OUTCAR"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"\xff")
+    selection = _outcar_selection(source_path)
+
+    result = collect_outcar_source(
+        work_dir=work_dir,
+        selection=selection,
+        freq=1,
+    )
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 0
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.reason
+    assert any(
+        marker in result.reason.lower() for marker in ("utf", "decode")
+    )
+
+
+def test_each_segment_resets_sampling_and_has_independent_status(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir, first_path = _runtime_outcar_source(
+        tmp_path,
+        "complete_two_frame.OUTCAR",
+        directory="0_0",
+        name="OUTCAR0",
+    )
+    _, second_path = _runtime_outcar_source(
+        tmp_path,
+        "complete_two_frame.OUTCAR",
+        directory="0_1",
+        name="OUTCAR1",
+    )
+    expected_first = _outcar_reference_frames(first_path)[0]
+
+    results = tuple(
+        collect_outcar_source(
+            work_dir=work_dir,
+            selection=_outcar_selection(
+                source_path,
+                pattern=r"^OUTCAR\d+$",
+                pattern_index=0,
+                order=order,
+            ),
+            freq=2,
+        )
+        for order, source_path in enumerate((first_path, second_path))
+    )
+
+    assert tuple(result.status for result in results) == (
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+    )
+    assert tuple(result.complete_count for result in results) == (2, 2)
+    assert tuple(result.accepted_count for result in results) == (1, 1)
+    for result in results:
+        _assert_outcar_frame_matches(result.accepted_frames[0], expected_first)
+
+
+def test_outcar_source_records_pattern_index_and_order(tmp_path):
+    collect_outcar_source = _collect_outcar_source_api()
+    work_dir, source_path = _runtime_outcar_source(
+        tmp_path,
+        "complete_two_frame.OUTCAR",
+    )
+    selection = _outcar_selection(
+        source_path,
+        pattern=r"^OUTCAR$",
+        pattern_index=4,
+        order=9,
+    )
+
+    result = collect_outcar_source(
+        work_dir=work_dir,
+        selection=selection,
+        freq=2,
+    )
+
+    assert result.source_path == "md/0_0/OUTCAR"
+    assert result.pattern == selection.pattern
+    assert result.pattern_index == selection.pattern_index
+    assert result.order == selection.order

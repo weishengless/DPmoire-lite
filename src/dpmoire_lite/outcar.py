@@ -77,5 +77,31 @@ def open_outcar_frames(path: Path):
         yield iread_vasp_out(file_object, index=":")
 
 
+def _find_outcar_tail_evidence(path: Path, complete_count: int) -> int | None:
+    """Find a structural ionic-step start after completed energy chunks."""
+    energy_chunks = 0
+    remaining_energy_lines = 0
+    boundary_reached = complete_count == 0
+    with Path(path).open("r", encoding="utf-8", errors="strict") as file_object:
+        for line_number, line in enumerate(file_object, start=1):
+            if not boundary_reached:
+                if remaining_energy_lines:
+                    remaining_energy_lines -= 1
+                    if remaining_energy_lines == 0:
+                        energy_chunks += 1
+                        if energy_chunks >= complete_count:
+                            boundary_reached = True
+                    continue
+                if "FREE ENERGIE" in line:
+                    remaining_energy_lines = 4
+                continue
+
+            if "Iteration" in line or (
+                "POSITION" in line and "TOTAL-FORCE" in line
+            ):
+                return line_number
+    return None
+
+
 def read_outcar_frames(path: Path):
     return read_vasp_out(str(path), ":")

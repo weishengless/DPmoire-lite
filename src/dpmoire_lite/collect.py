@@ -6,12 +6,19 @@ from datetime import datetime
 from pathlib import Path
 import warnings
 
+from ase.io import ParseError
+
 from .config import DPmoireLiteConfig, load_config
 from .collect_models import SourceKind, SourceResult, SourceStatus
 from .dataset import Dataset, count_ml_ab_configs
 from .manifest import Manifest, ManifestReadResult, read_manifest, write_manifest
 from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
-from .outcar import find_outcar_series
+from .outcar import (
+    OutcarSelection,
+    _find_outcar_tail_evidence,
+    find_outcar_series,
+    open_outcar_frames,
+)
 from .paths import manifest_path, relative_to_workdir
 
 
@@ -177,6 +184,94 @@ def collect_legacy_mlab_source(
         source_path=source_path,
         seed_count=seed_count,
         expected_digest=seed_identity.sha256,
+    )
+
+
+def collect_outcar_source(
+    *,
+    work_dir: Path,
+    selection: OutcarSelection,
+    freq: int,
+) -> SourceResult:
+    if isinstance(freq, bool) or not isinstance(freq, int) or freq <= 0:
+        raise ValueError("freq must be a positive integer")
+    if not isinstance(selection, OutcarSelection):
+        raise TypeError("selection must be an OutcarSelection")
+
+    source_path = Path(selection.path)
+    relative_source_path = relative_to_workdir(work_dir, source_path)
+    complete_count = 0
+    sampled_frames = []
+    iterator_error: ParseError | ValueError | UnicodeDecodeError | None = None
+
+    with open_outcar_frames(source_path) as frames:
+        try:
+            for raw_index, frame in enumerate(frames):
+                complete_count += 1
+                if raw_index % freq == 0:
+                    sampled_frames.append(frame)
+        except (ParseError, ValueError, UnicodeDecodeError) as error:
+            iterator_error = error
+
+    common = {
+        "source_path": relative_source_path,
+        "source_kind": SourceKind.OUTCAR,
+        "complete_count": complete_count,
+        "pattern": selection.pattern,
+        "pattern_index": selection.pattern_index,
+        "order": selection.order,
+    }
+
+    if iterator_error is not None:
+        if isinstance(iterator_error, UnicodeDecodeError):
+            reason = f"OUTCAR UTF-8 decoding failed: {iterator_error}"
+            line_number = None
+        else:
+            reason = (
+                "OUTCAR parser failed after "
+                f"{complete_count} complete frame(s): {iterator_error}"
+            )
+            line_number = _find_outcar_tail_evidence(
+                source_path,
+                complete_count,
+            )
+        return SourceResult(
+            **common,
+            status=SourceStatus.FAILED,
+            accepted_frames=(),
+            discarded_frame_index=complete_count,
+            line_number=line_number,
+            reason=reason,
+        )
+
+    tail_line = _find_outcar_tail_evidence(source_path, complete_count)
+    if tail_line is not None:
+        reason = (
+            "OUTCAR ended at EOF after an incomplete ionic step started; "
+            f"structural evidence at line {tail_line}"
+        )
+        if complete_count == 0:
+            return SourceResult(
+                **common,
+                status=SourceStatus.FAILED,
+                accepted_frames=(),
+                discarded_frame_index=0,
+                line_number=tail_line,
+                reason=reason,
+            )
+        return SourceResult(
+            **common,
+            status=SourceStatus.PARTIAL,
+            accepted_frames=tuple(sampled_frames),
+            discarded_frame_index=complete_count,
+            line_number=tail_line,
+            reason=reason,
+        )
+
+    return SourceResult(
+        **common,
+        status=SourceStatus.COMPLETE,
+        accepted_frames=tuple(sampled_frames),
     )
 
 

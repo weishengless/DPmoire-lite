@@ -33,3 +33,27 @@ files.
 - **Expected parser behavior:** complete; two frames, each with energy, free energy, forces, and stress.
 
 See `outcar/README.md` for the parser-specific compatibility boundary.
+
+### Derived OUTCAR classification fixtures
+
+The following Task 5 fixtures are derived only from the synthetic
+`outcar/complete_two_frame.OUTCAR` above and contain no private calculation
+data:
+
+### `outcar/tail_truncated_second_frame.OUTCAR`
+
+- **Source type:** synthetic OUTCAR stream with a structurally started but incomplete second ionic step.
+- **Reason for cropping:** retain source lines 1–25 inclusive so the second step ends immediately after its single position/force row, exercising acceptable EOF-tail partial classification.
+- **Retained blocks:** both synthetic species declarations, the first complete frame, and the second frame through its `POSITION/TOTAL-FORCE` row.
+- **Removed private data:** no user paths, job or account names, host details, unrelated output, or potential payload was introduced; the source is only the committed synthetic fixture.
+- **Redistribution confirmation:** all values are synthetic; the two `POTCAR: synthetic H` lines are OUTCAR species metadata permitted by the fixture policy, not POTCAR content.
+- **Expected parser behavior:** one complete frame is yielded, then EOF follows a started second frame; the source classifier must retain the first sampled frame as PARTIAL.
+
+### `outcar/internal_corruption_second_frame.OUTCAR`
+
+- **Source type:** synthetic OUTCAR stream with internal corruption after one complete ionic step.
+- **Reason for cropping:** retain the complete two-frame fixture and replace only the numeric second-frame position/force row at source line 25 with the nonnumeric token `BROKEN`, exercising fatal internal-corruption classification.
+- **Retained blocks:** the complete synthetic header, first frame, second-frame cell and position/force block, and all final energy records.
+- **Removed private data:** no private paths, jobs, accounts, host details, unrelated output, or potential payload was introduced.
+- **Redistribution confirmation:** the fixture is a minimal transformation of the committed synthetic file; its `POTCAR: synthetic H` lines remain metadata only and no POTCAR is included.
+- **Expected parser behavior:** the first frame may be observed before the second-frame parse error, but the classifier must return FAILED with zero accepted payload and must not salvage that prefix.
