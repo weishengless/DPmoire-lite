@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
 import importlib
+import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from ase.io import write as ase_write
 
 from dpmoire_lite import atomic_io
 from dpmoire_lite.dataset import Dataset
+from dpmoire_lite.file_lock import CollectFileLock
 from dpmoire_lite.manifest import Manifest, write_manifest
 from dpmoire_lite.paths import manifest_path
 
@@ -37,6 +41,21 @@ def _api():
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         pytest.fail(f"candidate preparation API is incomplete: {missing}")
+    return module
+
+
+def _backup_api():
+    try:
+        module = importlib.import_module("dpmoire_lite.collect_publish")
+    except ModuleNotFoundError as exc:
+        if exc.name == "dpmoire_lite.collect_publish":
+            pytest.fail("backup preparation is not implemented")
+        raise
+
+    required = ("BackupError", "BackupArtifacts", "prepare_backup")
+    missing = [name for name in required if not hasattr(module, name)]
+    if missing:
+        pytest.fail(f"backup preparation API is incomplete: {missing}")
     return module
 
 
@@ -138,6 +157,30 @@ def _request(
         current_manifest=current_manifest,
         compatibility_evidence=compatibility_evidence,
         data_writer=data_writer,
+    )
+
+
+def _backup_case(tmp_path: Path, *, existing: bool = True):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    final_output = work_dir / "MD_data.extxyz"
+    dataset = _dataset()
+    if existing:
+        dataset.save_extxyz(final_output)
+        previous_bytes = final_output.read_bytes()
+        previous_sha256 = atomic_io.sha256_file(final_output)
+    else:
+        previous_bytes = None
+        previous_sha256 = None
+    return work_dir, final_output, dataset, previous_bytes, previous_sha256
+
+
+def _expected_backup_path(work_dir: Path, final_output: Path, transaction_id: str) -> Path:
+    return (
+        work_dir
+        / "backups"
+        / "collect"
+        / f"{final_output.stem}.{transaction_id}{final_output.suffix}"
     )
 
 
@@ -346,3 +389,390 @@ def test_candidate_failure_leaves_final_and_previous_manifest_unchanged(tmp_path
     assert request.target.path.read_bytes() == previous_manifest
     assert not list(request.final_output.parent.glob(f".{request.final_output.name}.*.candidate"))
     assert not list(request.target.path.parent.glob(f".{request.target.path.name}.*.candidate"))
+
+
+def test_backup_prefers_hardlink_and_preserves_final_path(tmp_path, monkeypatch):
+    api = _backup_api()
+    work_dir, final_output, dataset, previous_bytes, previous_sha256 = _backup_case(tmp_path)
+    transaction_id = "collect-task-3-hardlink"
+    link_observations = []
+    real_link = os.link
+
+    def forbid_copyfileobj(*args, **kwargs):
+        raise AssertionError("hardlink backup must not use copyfileobj")
+
+    monkeypatch.setattr(shutil, "copyfileobj", forbid_copyfileobj)
+
+    def recording_link(source, destination, *args, **kwargs):
+        link_observations.append(
+            (Path(source), Path(destination), final_output.exists())
+        )
+        return real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", recording_link)
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        artifacts = api.prepare_backup(
+            work_dir=work_dir,
+            stage="md",
+            final_output=final_output,
+            transaction_id=transaction_id,
+        )
+
+    assert isinstance(artifacts, api.BackupArtifacts)
+    assert final_output.exists()
+    assert final_output.read_bytes() == previous_bytes
+    assert artifacts.previous_output_sha256 == previous_sha256
+    assert artifacts.previous_output_frames == dataset.n_configs
+    assert artifacts.backup_path == _expected_backup_path(
+        work_dir, final_output, transaction_id
+    )
+    assert artifacts.backup_path is not None
+    assert artifacts.backup_path.read_bytes() == previous_bytes
+    assert artifacts.backup_sha256 == previous_sha256
+    assert link_observations
+    assert all(observation[2] for observation in link_observations)
+    assert os.path.samestat(
+        os.stat(final_output), os.stat(artifacts.backup_path)
+    )
+
+
+def test_backup_falls_back_to_copy_when_hardlink_unsupported(tmp_path, monkeypatch):
+    api = _backup_api()
+    work_dir, final_output, dataset, previous_bytes, previous_sha256 = _backup_case(tmp_path)
+    transaction_id = "collect-task-3-copy"
+    link_attempted = []
+    copy_observations = []
+
+    real_copyfileobj = shutil.copyfileobj
+
+    def recording_copyfileobj(source, destination, *args, **kwargs):
+        copy_observations.append(
+            (Path(source.name), Path(destination.name), final_output.exists())
+        )
+        return real_copyfileobj(source, destination, *args, **kwargs)
+
+    def unsupported_link(source, destination, *args, **kwargs):
+        link_attempted.append((Path(source), Path(destination), final_output.exists()))
+        raise OSError(errno.EXDEV, "cross-device hard link")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    monkeypatch.setattr(shutil, "copyfileobj", recording_copyfileobj)
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        artifacts = api.prepare_backup(
+            work_dir=work_dir,
+            stage="md",
+            final_output=final_output,
+            transaction_id=transaction_id,
+        )
+
+    assert final_output.exists()
+    assert final_output.read_bytes() == previous_bytes
+    assert artifacts.previous_output_sha256 == previous_sha256
+    assert artifacts.previous_output_frames == dataset.n_configs
+    assert artifacts.backup_path is not None
+    assert artifacts.backup_path.read_bytes() == previous_bytes
+    assert artifacts.backup_sha256 == previous_sha256
+    assert link_attempted
+    assert all(observation[2] for observation in link_attempted)
+    assert copy_observations
+    assert all(observation[2] for observation in copy_observations)
+    expected_backup = _expected_backup_path(work_dir, final_output, transaction_id)
+    assert all(
+        source.resolve(strict=False) == final_output.resolve(strict=False)
+        for source, _destination, _final_exists in copy_observations
+    )
+    assert all(
+        destination.parent == expected_backup.parent
+        and destination != expected_backup
+        for _source, destination, _final_exists in copy_observations
+    )
+    assert not os.path.samestat(
+        os.stat(final_output), os.stat(artifacts.backup_path)
+    )
+
+
+def test_backup_is_fsynced_and_hash_verified_before_publish(tmp_path, monkeypatch):
+    api = _backup_api()
+    work_dir, final_output, _dataset_value, _previous_bytes, _previous_sha256 = _backup_case(
+        tmp_path
+    )
+    transaction_id = "collect-task-3-order"
+    events = []
+
+    real_ase_read = api.ase_read
+
+    def record(name, **details):
+        events.append(
+            {
+                "name": name,
+                "final_exists": final_output.exists(),
+                **details,
+            }
+        )
+
+    def recording_ase_read(path, *args, **kwargs):
+        path = Path(path)
+        record("frame_read", path=path)
+        return real_ase_read(path, *args, **kwargs)
+
+    real_create_candidate = atomic_io.create_candidate
+
+    def recording_create_candidate(destination):
+        candidate = real_create_candidate(Path(destination))
+        record("candidate", path=candidate)
+        return candidate
+
+    real_fsync_path = atomic_io.fsync_path
+
+    def recording_fsync_path(path):
+        record("fsync", path=Path(path))
+        return real_fsync_path(Path(path))
+
+    real_sha256_file = atomic_io.sha256_file
+
+    def recording_sha256_file(path):
+        path = Path(path)
+        record("hash", path=path)
+        return real_sha256_file(path)
+
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        source = Path(source)
+        destination = Path(destination)
+        record(
+            "replace",
+            source=source,
+            destination=destination,
+            source_exists=source.exists(),
+            destination_absent=not destination.exists(),
+        )
+        return real_replace(source, destination, *args, **kwargs)
+
+    real_fsync_directory = getattr(
+        atomic_io, "fsync_directory", atomic_io._fsync_directory
+    )
+
+    def recording_fsync_directory(directory):
+        record("directory_fsync", path=Path(directory))
+        return real_fsync_directory(Path(directory))
+
+    monkeypatch.setattr(atomic_io, "create_candidate", recording_create_candidate)
+    monkeypatch.setattr(atomic_io, "fsync_path", recording_fsync_path)
+    monkeypatch.setattr(atomic_io, "sha256_file", recording_sha256_file)
+    monkeypatch.setattr(api, "ase_read", recording_ase_read)
+    monkeypatch.setattr(os, "replace", recording_replace)
+    monkeypatch.setattr(
+        atomic_io,
+        "fsync_directory",
+        recording_fsync_directory,
+        raising=False,
+    )
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        artifacts = api.prepare_backup(
+            work_dir=work_dir,
+            stage="md",
+            final_output=final_output,
+            transaction_id=transaction_id,
+        )
+
+    assert artifacts.backup_path is not None
+    assert events
+    assert all(event["final_exists"] for event in events)
+    previous_hash_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["name"] == "hash" and event["path"] == final_output
+    )
+    frame_read_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["name"] == "frame_read"
+    )
+    frame_read_event = events[frame_read_index]
+    assert frame_read_event["path"].resolve(strict=False) == final_output.resolve(
+        strict=False
+    )
+    candidate_index = next(
+        index for index, event in enumerate(events) if event["name"] == "candidate"
+    )
+    fsync_index = next(
+        index for index, event in enumerate(events) if event["name"] == "fsync"
+    )
+    backup_hash_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["name"] == "hash" and event["path"] != final_output
+    )
+    replace_index = next(
+        index for index, event in enumerate(events) if event["name"] == "replace"
+    )
+    directory_fsync_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["name"] == "directory_fsync"
+    )
+    assert (
+        max(previous_hash_index, frame_read_index)
+        < candidate_index
+        < fsync_index
+        < backup_hash_index
+        < replace_index
+        < directory_fsync_index
+    )
+
+
+def test_backup_hash_mismatch_aborts_before_journal(tmp_path, monkeypatch):
+    api = _backup_api()
+    work_dir, final_output, _dataset_value, previous_bytes, previous_sha256 = _backup_case(
+        tmp_path
+    )
+    transaction_id = "collect-task-3-mismatch"
+    older_backup = work_dir / "backups" / "collect" / "MD_data.older.extxyz"
+    older_backup.parent.mkdir(parents=True, exist_ok=True)
+    older_bytes = b"older backup bytes"
+    older_backup.write_bytes(older_bytes)
+
+    real_sha256_file = atomic_io.sha256_file
+
+    def mismatching_sha256_file(path):
+        path = Path(path)
+        digest = real_sha256_file(path)
+        if path != final_output:
+            return "0" * 64
+        return digest
+
+    replace_calls = []
+
+    def forbidden_replace(source, destination, *args, **kwargs):
+        replace_calls.append((Path(source), Path(destination)))
+        raise AssertionError("hash mismatch must abort before os.replace")
+
+    monkeypatch.setattr(atomic_io, "sha256_file", mismatching_sha256_file)
+    monkeypatch.setattr(os, "replace", forbidden_replace)
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        with pytest.raises(api.BackupError, match="hash"):
+            api.prepare_backup(
+                work_dir=work_dir,
+                stage="md",
+                final_output=final_output,
+                transaction_id=transaction_id,
+            )
+
+    assert not replace_calls
+    assert final_output.exists()
+    assert final_output.read_bytes() == previous_bytes
+    assert atomic_io.sha256_file(final_output) == previous_sha256
+    assert older_backup.read_bytes() == older_bytes
+    assert not list(work_dir.rglob("*.candidate"))
+    assert not list(work_dir.rglob("*journal*"))
+
+
+def test_backup_name_published_atomically(tmp_path, monkeypatch):
+    api = _backup_api()
+    work_dir, final_output, _dataset_value, previous_bytes, _previous_sha256 = _backup_case(
+        tmp_path
+    )
+    transaction_id = "collect-task-3-atomic-name"
+    expected_backup = _expected_backup_path(work_dir, final_output, transaction_id)
+    observations = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        source = Path(source)
+        destination = Path(destination)
+        observations.append(
+            {
+                "source": source,
+                "destination": destination,
+                "source_exists": source.exists(),
+                "destination_absent": not destination.exists(),
+                "final_exists": final_output.exists(),
+            }
+        )
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", recording_replace)
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        artifacts = api.prepare_backup(
+            work_dir=work_dir,
+            stage="md",
+            final_output=final_output,
+            transaction_id=transaction_id,
+        )
+
+    matching = [
+        observation
+        for observation in observations
+        if observation["destination"] == expected_backup
+    ]
+    assert matching
+    observation = matching[0]
+    assert observation["source_exists"]
+    assert observation["destination_absent"]
+    assert observation["final_exists"]
+    assert artifacts.backup_path == expected_backup
+    assert expected_backup.exists()
+    assert not observation["source"].exists()
+    assert final_output.exists()
+    assert final_output.read_bytes() == previous_bytes
+
+
+def test_older_backups_are_not_deleted(tmp_path):
+    api = _backup_api()
+    work_dir, final_output, _dataset_value, previous_bytes, _previous_sha256 = _backup_case(
+        tmp_path
+    )
+    older_directory = work_dir / "backups" / "collect"
+    older_directory.mkdir(parents=True, exist_ok=True)
+    older_one = older_directory / "MD_data.older-one.extxyz"
+    older_two = older_directory / "MD_data.older-two.extxyz"
+    older_one.write_bytes(b"older one")
+    older_two.write_bytes(b"older two")
+    transaction_id = "collect-task-3-keep-old"
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        artifacts = api.prepare_backup(
+            work_dir=work_dir,
+            stage="md",
+            final_output=final_output,
+            transaction_id=transaction_id,
+        )
+
+    assert final_output.exists()
+    assert final_output.read_bytes() == previous_bytes
+    assert older_one.read_bytes() == b"older one"
+    assert older_two.read_bytes() == b"older two"
+    assert artifacts.backup_path is not None
+    assert artifacts.backup_path.exists()
+
+
+def test_first_publish_has_null_previous_and_backup_fields(tmp_path):
+    api = _backup_api()
+    work_dir, final_output, _dataset_value, _previous_bytes, _previous_sha256 = _backup_case(
+        tmp_path, existing=False
+    )
+    transaction_id = "collect-task-3-first-publish"
+
+    with CollectFileLock("md", final_output, transaction_id=transaction_id):
+        artifacts = api.prepare_backup(
+            work_dir=work_dir,
+            stage="md",
+            final_output=final_output,
+            transaction_id=transaction_id,
+        )
+
+    assert isinstance(artifacts, api.BackupArtifacts)
+    assert artifacts.previous_output_sha256 is None
+    assert artifacts.previous_output_frames is None
+    assert artifacts.backup_path is None
+    assert artifacts.backup_sha256 is None
+    assert not final_output.exists()
+    assert not (work_dir / "backups" / "collect").exists()
+    assert not list(work_dir.rglob("*.candidate"))
+    assert not list(work_dir.rglob("*journal*"))

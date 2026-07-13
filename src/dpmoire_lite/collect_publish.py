@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import errno
+import os
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -87,6 +90,126 @@ class CandidateArtifacts:
     data_sha256: str
     manifest_candidate_path: Path
     manifest_sha256: str
+
+
+class BackupError(RuntimeError):
+    """Raised when a previous formal output cannot be backed up safely."""
+
+
+@dataclass(frozen=True)
+class BackupArtifacts:
+    previous_output_sha256: str | None
+    previous_output_frames: int | None
+    backup_path: Path | None
+    backup_sha256: str | None
+
+
+def prepare_backup(
+    *,
+    work_dir: Path,
+    stage: str,
+    final_output: Path,
+    transaction_id: str,
+) -> BackupArtifacts:
+    """Prepare and publish a durable backup of an existing formal output."""
+    work_dir = Path(work_dir).resolve(strict=False)
+    final_output = Path(final_output).resolve(strict=False)
+
+    if not isinstance(stage, str) or stage not in _STAGE_OUTPUTS:
+        raise BackupError(f"unsupported backup stage: {stage!r}")
+    expected_output = work_dir / _STAGE_OUTPUTS[stage]
+    if final_output != expected_output:
+        raise BackupError(
+            f"final output does not match the {stage!r} stage output contract"
+        )
+    if not isinstance(transaction_id, str) or not transaction_id:
+        raise BackupError("transaction_id must be a non-empty string")
+
+    backup_directory = work_dir / "backups" / "collect"
+    backup_path = backup_directory / (
+        f"{final_output.stem}.{transaction_id}{final_output.suffix}"
+    )
+    if backup_path.parent.resolve(strict=False) != backup_directory.resolve(
+        strict=False
+    ):
+        raise BackupError("transaction_id must produce a direct backup path")
+
+    if not final_output.exists():
+        return BackupArtifacts(
+            previous_output_sha256=None,
+            previous_output_frames=None,
+            backup_path=None,
+            backup_sha256=None,
+        )
+    if not final_output.is_file():
+        raise BackupError("formal output is not a regular file")
+    if backup_path.exists():
+        raise BackupError(f"backup already exists: {backup_path}")
+
+    candidate: Path | None = None
+    try:
+        previous_output_sha256 = atomic_io.sha256_file(final_output)
+        previous_output_frames = len(
+            ase_read(final_output, format="extxyz", index=":")
+        )
+
+        backup_directory.mkdir(parents=True, exist_ok=True)
+        candidate = atomic_io.create_candidate(backup_path)
+        candidate.unlink(missing_ok=True)
+        try:
+            os.link(final_output, candidate)
+        except OSError as exc:
+            if not _is_hardlink_capability_error(exc):
+                raise
+            candidate.unlink(missing_ok=True)
+            candidate = atomic_io.create_candidate(backup_path)
+            with final_output.open("rb") as source, candidate.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+
+        atomic_io.fsync_path(candidate)
+        backup_sha256 = atomic_io.sha256_file(candidate)
+        if backup_sha256 != previous_output_sha256:
+            raise BackupError("backup hash does not match previous output")
+
+        os.replace(candidate, backup_path)
+        candidate = None
+        atomic_io.fsync_directory(backup_path.parent)
+        return BackupArtifacts(
+            previous_output_sha256=previous_output_sha256,
+            previous_output_frames=previous_output_frames,
+            backup_path=backup_path,
+            backup_sha256=backup_sha256,
+        )
+    except BackupError:
+        _remove_backup_candidate(candidate)
+        raise
+    except Exception as exc:
+        _remove_backup_candidate(candidate)
+        raise BackupError(f"backup preparation failed: {exc}") from exc
+    except BaseException:
+        _remove_backup_candidate(candidate)
+        raise
+
+
+def _is_hardlink_capability_error(exc: OSError) -> bool:
+    supported_errors = {
+        errno.EXDEV,
+        errno.EACCES,
+        errno.EPERM,
+        errno.ENOSYS,
+    }
+    for name in ("ENOTSUP", "EOPNOTSUPP"):
+        value = getattr(errno, name, None)
+        if value is not None:
+            supported_errors.add(value)
+    if exc.errno in supported_errors:
+        return True
+    return getattr(exc, "winerror", None) in {1, 5, 17, 50}
+
+
+def _remove_backup_candidate(candidate: Path | None) -> None:
+    if candidate is not None:
+        Path(candidate).unlink(missing_ok=True)
 
 
 def prepare_candidates(request: CandidateRequest) -> CandidateArtifacts:

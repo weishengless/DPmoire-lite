@@ -110,3 +110,8 @@ def _fsync_directory(directory: Path) -> bool:
     finally:
         os.close(descriptor)
     return True
+
+
+def fsync_directory(directory: Path) -> bool:
+    """Flush a directory entry when the platform supports directory fsync."""
+    return _fsync_directory(Path(directory))
