@@ -1,3 +1,5 @@
+import hashlib
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +11,13 @@ from ase.units import GPa
 from dpmoire_lite import collect as collect_module
 from dpmoire_lite import collect_models as models
 from dpmoire_lite import dataset as dataset_module
-from dpmoire_lite.mlab import MlabConfiguration, MlabIdentity, parse_mlab
+from dpmoire_lite.manifest import Manifest
+from dpmoire_lite.mlab import (
+    MlabConfiguration,
+    MlabIdentity,
+    parse_mlab,
+    seed_prefix_identity,
+)
 from dpmoire_lite.paths import relative_to_workdir
 
 
@@ -365,3 +373,300 @@ def test_mlab_source_ase_properties_match_parsed_values():
     xx, yy, zz, xy, yz, zx = configuration.stress_kbar
     expected_stress = -0.1 * GPa * np.array([xx, yy, zz, yz, zx, xy])
     np.testing.assert_allclose(atoms.get_stress(), expected_stress)
+
+
+def _collect_current_mlab_source_api():
+    collector = getattr(collect_module, "collect_current_mlab_source", None)
+    assert callable(
+        collector
+    ), "collect_current_mlab_source is not implemented"
+    return collector
+
+
+def _mlab_fixture_path(name: str) -> Path:
+    return Path(__file__).parent / "data" / "mlab" / name
+
+
+def _runtime_mlab_source(tmp_path: Path, fixture_name: str) -> tuple[Path, Path]:
+    work_dir = tmp_path / "work"
+    source_path = work_dir / "md" / "0_0" / "ML_ABN"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_mlab_fixture_path(fixture_name), source_path)
+    return work_dir, source_path
+
+
+def _current_manifest_for_seed(
+    configurations: tuple[MlabConfiguration, ...],
+    *,
+    seed_digest: str | None = None,
+) -> Manifest:
+    identity = seed_prefix_identity(configurations)
+    return Manifest(
+        schema_version=2,
+        stage="md",
+        generated_at="2026-07-13T00:00:00+00:00",
+        directories=["md/0_0"],
+        mlff_seed={
+            "source": "init_mlff/ML_ABN",
+            "configurations": len(configurations),
+            "digest_schema": "mlab-seed-v1",
+            "seed_prefix_sha256": seed_digest or identity.sha256,
+            "ml_ab_sha256": hashlib.sha256(b"synthetic-ML_AB").hexdigest(),
+            "ml_ff_sha256": hashlib.sha256(b"synthetic-ML_FF").hexdigest(),
+        },
+    )
+
+
+def _copy_current_ml_ab(work_dir: Path, fixture_name: str) -> Path:
+    ml_ab = work_dir / "md" / "0_0" / "ML_AB"
+    shutil.copy2(_mlab_fixture_path(fixture_name), ml_ab)
+    return ml_ab
+
+
+def _prefix_result_signature(result: models.SourceResult):
+    return (
+        result.status,
+        result.complete_count,
+        result.accepted_count,
+        tuple(
+            configuration.source_configuration_number
+            for configuration in result.parsed_configurations
+        ),
+        result.seed_identity,
+    )
+
+
+def _replace_declared_count(text: str, count: int) -> str:
+    lines = text.splitlines(keepends=True)
+    label_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == "The number of configurations"
+    )
+    value_index = next(
+        index
+        for index in range(label_index + 1, len(lines))
+        if lines[index].strip()
+    )
+    newline = "\n" if lines[value_index].endswith("\n") else ""
+    lines[value_index] = f"{count}{newline}"
+    return "".join(lines)
+
+
+def test_seed_prefix_match_skips_exact_initial_count(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_multi.mlab")
+    parsed = parse_mlab(source_path)
+    manifest = _current_manifest_for_seed(parsed.configurations[:1])
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.source_path == "md/0_0/ML_ABN"
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 2
+    assert result.accepted_count == 1
+    assert result.accepted_frames == ()
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in result.parsed_configurations
+    ) == (2,)
+    assert result.seed_identity == seed_prefix_identity(parsed.configurations[:1])
+
+
+def test_seed_prefix_mismatch_fails_source_with_zero_new_frames(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_multi.mlab")
+    parsed = parse_mlab(source_path)
+    expected_digest = "0" * 64
+    manifest = _current_manifest_for_seed(
+        parsed.configurations[:1], seed_digest=expected_digest
+    )
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    actual_identity = seed_prefix_identity(parsed.configurations[:1])
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 2
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.reason is not None
+    assert "seed prefix mismatch" in result.reason.lower()
+    assert expected_digest in result.reason
+    assert actual_identity.sha256 in result.reason
+    assert result.seed_identity == actual_identity
+
+
+def test_seed_prefix_shorter_than_initial_count_fails(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_vasp_641.mlab")
+    seed_parsed = parse_mlab(_mlab_fixture_path("complete_multi.mlab"))
+    manifest = _current_manifest_for_seed(seed_parsed.configurations[:2])
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 1
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.seed_identity is None
+    assert result.reason is not None
+    assert "shorter" in result.reason.lower()
+    assert "1" in result.reason
+    assert "2" in result.reason
+
+
+def test_seed_prefix_same_count_different_content_fails(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_vasp_651.mlab")
+    seed_source = parse_mlab(_mlab_fixture_path("complete_vasp_641.mlab"))
+    manifest = _current_manifest_for_seed(seed_source.configurations)
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    actual_identity = seed_prefix_identity(parse_mlab(source_path).configurations)
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 1
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.reason is not None
+    assert "seed prefix mismatch" in result.reason.lower()
+    assert result.seed_identity == actual_identity
+
+
+def test_current_md_ml_ab_hash_change_is_ignored_for_restart(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_multi.mlab")
+    parsed = parse_mlab(source_path)
+    manifest = _current_manifest_for_seed(parsed.configurations[:1])
+    _copy_current_ml_ab(work_dir, "complete_vasp_641.mlab")
+
+    first = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    _copy_current_ml_ab(work_dir, "complete_vasp_651.mlab")
+    second = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert _prefix_result_signature(first) == _prefix_result_signature(second)
+    assert first.seed_identity == seed_prefix_identity(parsed.configurations[:1])
+
+
+def test_multiple_restart_growth_still_skips_only_initial_seed(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_multi.mlab")
+    parsed = parse_mlab(source_path)
+    manifest = _current_manifest_for_seed(parsed.configurations[:1])
+    _copy_current_ml_ab(work_dir, "complete_vasp_641.mlab")
+
+    first = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    _copy_current_ml_ab(work_dir, "complete_multi.mlab")
+    second = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in first.parsed_configurations
+    ) == (2,)
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in second.parsed_configurations
+    ) == (2,)
+    assert first.accepted_count == second.accepted_count == 1
+    assert first.seed_identity == second.seed_identity
+
+
+def test_seed_only_source_is_complete_with_zero_new_frames(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_vasp_641.mlab")
+    parsed = parse_mlab(source_path)
+    manifest = _current_manifest_for_seed(parsed.configurations)
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 1
+    assert result.accepted_count == 0
+    assert result.parsed_configurations == ()
+    assert result.accepted_frames == ()
+    assert result.seed_identity == seed_prefix_identity(parsed.configurations)
+
+
+def test_new_data_tail_partial_preserves_complete_new_frames(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_multi.mlab")
+    complete_text = _mlab_fixture_path("complete_multi.mlab").read_text(
+        encoding="utf-8"
+    )
+    tail_text = _mlab_fixture_path("tail_position_crop.mlab").read_text(
+        encoding="utf-8"
+    )
+    tail_block = tail_text[tail_text.index("Configuration num.      2") :].replace(
+        "Configuration num.      2", "Configuration num.      3", 1
+    )
+    source_path.write_text(
+        _replace_declared_count(complete_text, 3).rstrip()
+        + "\n"
+        + tail_block,
+        encoding="utf-8",
+    )
+    parsed_seed = parse_mlab(_mlab_fixture_path("complete_multi.mlab"))
+    manifest = _current_manifest_for_seed(parsed_seed.configurations[:1])
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.status is models.SourceStatus.PARTIAL
+    assert result.complete_count == 2
+    assert result.accepted_count == 1
+    assert result.accepted_frames == ()
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in result.parsed_configurations
+    ) == (2,)
+    assert result.discarded_configuration_number == 3
+    assert result.discarded_block == "positions"
+    assert result.reason is not None
+    assert "end of file" in result.reason.lower()
+    assert result.seed_identity == seed_prefix_identity(
+        parsed_seed.configurations[:1]
+    )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -7,7 +9,7 @@ from .config import DPmoireLiteConfig, load_config
 from .collect_models import SourceKind, SourceResult, SourceStatus
 from .dataset import Dataset, count_ml_ab_configs
 from .manifest import Manifest, read_manifest, write_manifest
-from .mlab import MlabParseError, parse_mlab
+from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
 from .outcar import find_outcar_series
 from .paths import manifest_path, relative_to_workdir
 
@@ -102,6 +104,96 @@ def collect_mlab_source(*, work_dir: Path, source_path: Path) -> SourceResult:
         discarded_configuration_number=parsed.discarded_configuration_number,
         discarded_block=parsed.discarded_block,
     )
+
+
+def collect_current_mlab_source(
+    *,
+    work_dir: Path,
+    source_path: Path,
+    manifest: Manifest,
+) -> SourceResult:
+    seed_count, expected_digest = _current_seed_evidence(manifest)
+    raw_result = collect_mlab_source(work_dir=work_dir, source_path=source_path)
+
+    if raw_result.status is SourceStatus.FAILED:
+        return raw_result
+
+    if raw_result.complete_count < seed_count:
+        reason = (
+            "source is shorter than the initial seed: "
+            f"{raw_result.complete_count} complete configurations available, "
+            f"{seed_count} required"
+        )
+        if raw_result.reason:
+            reason = f"{reason}; {raw_result.reason}"
+        return replace(
+            raw_result,
+            status=SourceStatus.FAILED,
+            accepted_frames=(),
+            parsed_configurations=(),
+            reason=reason,
+            seed_identity=None,
+        )
+
+    actual_identity = seed_prefix_identity(
+        raw_result.parsed_configurations,
+        n_configurations=seed_count,
+    )
+    if actual_identity.sha256 != expected_digest:
+        reason = (
+            "seed prefix mismatch: "
+            f"expected {expected_digest}, actual {actual_identity.sha256}"
+        )
+        if raw_result.reason:
+            reason = f"{reason}; {raw_result.reason}"
+        return replace(
+            raw_result,
+            status=SourceStatus.FAILED,
+            accepted_frames=(),
+            parsed_configurations=(),
+            reason=reason,
+            seed_identity=actual_identity,
+        )
+
+    return replace(
+        raw_result,
+        parsed_configurations=raw_result.parsed_configurations[seed_count:],
+        seed_identity=actual_identity,
+    )
+
+
+def _current_seed_evidence(manifest: Manifest) -> tuple[int, str]:
+    if not isinstance(manifest, Manifest) or manifest.schema_version != 2:
+        raise ValueError("manifest must be a current Manifest v2")
+    if manifest.stage != "md":
+        raise ValueError("manifest.stage must be 'md' for current ML_ABN collection")
+
+    seed = manifest.mlff_seed
+    if not isinstance(seed, Mapping):
+        raise ValueError("manifest.mlff_seed must be a mapping")
+
+    configurations = seed.get("configurations")
+    if (
+        isinstance(configurations, bool)
+        or not isinstance(configurations, int)
+        or configurations <= 0
+    ):
+        raise ValueError("mlff_seed.configurations must be a positive integer")
+
+    if seed.get("digest_schema") != "mlab-seed-v1":
+        raise ValueError("mlff_seed.digest_schema must be 'mlab-seed-v1'")
+
+    digest = seed.get("seed_prefix_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(
+            "mlff_seed.seed_prefix_sha256 must be a 64-character lowercase "
+            "hexadecimal string"
+        )
+    return configurations, digest
 
 
 def _collect_md_ml(config: DPmoireLiteConfig, manifest: Manifest) -> tuple[Dataset, Manifest]:
