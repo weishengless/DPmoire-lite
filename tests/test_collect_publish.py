@@ -16,7 +16,7 @@ from ase.io import write as ase_write
 
 from dpmoire_lite import atomic_io
 from dpmoire_lite.dataset import Dataset
-from dpmoire_lite.file_lock import CollectFileLock
+from dpmoire_lite.file_lock import CollectFileLock, CollectLockError
 from dpmoire_lite.manifest import Manifest, write_manifest
 from dpmoire_lite.paths import manifest_path
 
@@ -56,6 +56,15 @@ def _backup_api():
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         pytest.fail(f"backup preparation API is incomplete: {missing}")
+    return module
+
+
+def _publication_api():
+    module = _api()
+    required = ("PublicationError", "PublicationResult", "PublicationSession")
+    missing = [name for name in required if not hasattr(module, name)]
+    if missing:
+        pytest.fail(f"publication transaction API is incomplete: {missing}")
     return module
 
 
@@ -182,6 +191,50 @@ def _expected_backup_path(work_dir: Path, final_output: Path, transaction_id: st
         / "collect"
         / f"{final_output.stem}.{transaction_id}{final_output.suffix}"
     )
+
+
+def _journal_path(final_output: Path) -> Path:
+    return final_output.parent / f".{final_output.name}.collect-journal.yaml"
+
+
+def _request_for_session(request, session):
+    return replace(
+        request,
+        previous_output_sha256=session.previous_output_sha256,
+        previous_manifest_sha256=session.previous_manifest_sha256,
+        backup_path=None,
+        backup_sha256=None,
+    )
+
+
+def _assert_same_output_lock_is_held(request) -> None:
+    with pytest.raises(CollectLockError):
+        with CollectFileLock(
+            request.stage,
+            request.final_output,
+            transaction_id="contender",
+        ):
+            pass
+
+
+def _publish_request(request):
+    api = _publication_api()
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        result = session.publish(_request_for_session(request, session))
+        journal_path = session.journal_path
+    return api, result, journal_path
+
+
+def _write_previous_output(request) -> bytes:
+    previous = Dataset()
+    previous.add_atoms(_atoms(-0.2))
+    previous.save_extxyz(request.final_output)
+    return request.final_output.read_bytes()
 
 
 def test_data_candidate_written_in_final_directory_and_fsynced(tmp_path, monkeypatch):
@@ -776,3 +829,334 @@ def test_first_publish_has_null_previous_and_backup_fields(tmp_path):
     assert not (work_dir / "backups" / "collect").exists()
     assert not list(work_dir.rglob("*.candidate"))
     assert not list(work_dir.rglob("*journal*"))
+
+
+def test_publish_sequence_matches_authoritative_order(tmp_path, monkeypatch):
+    api = _publication_api()
+    request = _request(tmp_path)
+    _write_previous_output(request)
+    journal_path = _journal_path(request.final_output)
+    events = []
+    state = {"data_replaced": False, "manifest_replaced": False}
+
+    real_sha256_file = atomic_io.sha256_file
+
+    def recording_sha256_file(path):
+        path = Path(path)
+        if (
+            path.parent == request.final_output.parent
+            and path.name.startswith(f".{request.final_output.name}.")
+            and "collect-journal" not in path.name
+        ):
+            events.append("data_candidate_hash")
+        elif (
+            path.parent == request.target.path.parent
+            and path.name.startswith(f".{request.target.path.name}.")
+        ):
+            events.append("manifest_candidate_hash")
+        elif path == request.final_output and state["data_replaced"]:
+            events.append("data_final_hash")
+        elif path == request.target.path and state["manifest_replaced"]:
+            events.append("manifest_final_hash")
+        return real_sha256_file(path)
+
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        source = Path(source)
+        destination = Path(destination)
+        if destination == journal_path:
+            journal = yaml.safe_load(source.read_text(encoding="utf-8"))
+            events.append(f"journal_{journal['state']}")
+        elif destination == request.final_output:
+            events.append("data_replace")
+        elif destination == request.target.path:
+            events.append("manifest_replace")
+        elif destination.parent == request.work_dir / "backups" / "collect":
+            events.append("backup_publish")
+
+        result = real_replace(source, destination, *args, **kwargs)
+        if destination == request.final_output:
+            state["data_replaced"] = True
+        elif destination == request.target.path:
+            state["manifest_replaced"] = True
+        return result
+
+    real_unlink = Path.unlink
+
+    def recording_unlink(path, *args, **kwargs):
+        if Path(path) == journal_path:
+            events.append("journal_unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_io, "sha256_file", recording_sha256_file)
+    monkeypatch.setattr(api.os, "replace", recording_replace)
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+
+    _publish_request(request)
+
+    expected = [
+        "data_candidate_hash",
+        "backup_publish",
+        "manifest_candidate_hash",
+        "journal_pending",
+        "data_replace",
+        "data_final_hash",
+        "manifest_replace",
+        "manifest_final_hash",
+        "journal_committed",
+        "journal_unlink",
+    ]
+    positions = [events.index(name) for name in expected]
+    assert positions == sorted(positions), events
+
+
+def test_pending_journal_precedes_final_output_replace(tmp_path, monkeypatch):
+    api = _publication_api()
+    request = _request(tmp_path)
+    journal_path = _journal_path(request.final_output)
+    observations = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        destination = Path(destination)
+        if destination == request.final_output:
+            assert journal_path.is_file()
+            journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+            observations.append(journal["state"])
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "replace", recording_replace)
+
+    _publish_request(request)
+
+    assert observations == ["pending"]
+
+
+def test_final_data_hash_verified_before_manifest_replace(tmp_path, monkeypatch):
+    api = _publication_api()
+    request = _request(tmp_path)
+    events = []
+    state = {"data_replaced": False}
+    real_sha256_file = atomic_io.sha256_file
+
+    def recording_sha256_file(path):
+        path = Path(path)
+        if path == request.final_output and state["data_replaced"]:
+            events.append("data_final_hash")
+        return real_sha256_file(path)
+
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        destination = Path(destination)
+        result = real_replace(source, destination, *args, **kwargs)
+        if destination == request.final_output:
+            state["data_replaced"] = True
+            events.append("data_replace")
+        elif destination == request.target.path:
+            events.append("manifest_replace")
+        return result
+
+    monkeypatch.setattr(atomic_io, "sha256_file", recording_sha256_file)
+    monkeypatch.setattr(api.os, "replace", recording_replace)
+
+    _publish_request(request)
+
+    assert events.index("data_replace") < events.index("data_final_hash")
+    assert events.index("data_final_hash") < events.index("manifest_replace")
+
+
+def test_manifest_hash_and_internal_transaction_verified(tmp_path, monkeypatch):
+    api = _publication_api()
+    request = _request(tmp_path)
+    journal_path = _journal_path(request.final_output)
+    expected_manifest_hash = {"value": None}
+    manifest_replaced = {"value": False}
+    real_replace = os.replace
+    real_sha256_file = atomic_io.sha256_file
+
+    def tampering_replace(source, destination, *args, **kwargs):
+        source = Path(source)
+        destination = Path(destination)
+        if destination == request.target.path:
+            expected_manifest_hash["value"] = real_sha256_file(source)
+        result = real_replace(source, destination, *args, **kwargs)
+        if destination == request.target.path:
+            data = yaml.safe_load(destination.read_text(encoding="utf-8"))
+            data["collect"]["transaction_id"] = "tampered-transaction"
+            destination.write_text(
+                yaml.safe_dump(data, sort_keys=False),
+                encoding="utf-8",
+                newline="",
+            )
+            manifest_replaced["value"] = True
+        return result
+
+    def preserve_expected_manifest_hash(path):
+        path = Path(path)
+        if path == request.target.path and manifest_replaced["value"]:
+            return expected_manifest_hash["value"]
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(api.os, "replace", tampering_replace)
+    monkeypatch.setattr(atomic_io, "sha256_file", preserve_expected_manifest_hash)
+
+    with pytest.raises(api.PublicationError, match="transaction"):
+        _publish_request(request)
+
+    journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+    assert journal["state"] == "pending"
+
+
+def test_journal_marked_committed_before_unlink(tmp_path, monkeypatch):
+    _publication_api()
+    request = _request(tmp_path)
+    journal_path = _journal_path(request.final_output)
+    observed_states = []
+    real_unlink = Path.unlink
+
+    def recording_unlink(path, *args, **kwargs):
+        path = Path(path)
+        if path == journal_path:
+            journal = yaml.safe_load(path.read_text(encoding="utf-8"))
+            observed_states.append(journal["state"])
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+
+    _publish_request(request)
+
+    assert observed_states == ["committed"]
+    assert not journal_path.exists()
+
+
+def test_lock_held_from_recovery_through_journal_cleanup(tmp_path, monkeypatch):
+    api = _publication_api()
+    request = _request(tmp_path)
+    journal_path = _journal_path(request.final_output)
+    observations = []
+    real_recover = api._recover_existing_journal
+
+    def recording_recover(session):
+        _assert_same_output_lock_is_held(request)
+        observations.append("recovery")
+        return real_recover(session)
+
+    real_unlink = Path.unlink
+
+    def recording_unlink(path, *args, **kwargs):
+        path = Path(path)
+        if path == journal_path:
+            _assert_same_output_lock_is_held(request)
+            observations.append("cleanup")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_recover_existing_journal", recording_recover)
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        session.publish(_request_for_session(request, session))
+
+    with CollectFileLock(
+        request.stage,
+        request.final_output,
+        transaction_id="after-publish",
+    ):
+        observations.append("released")
+
+    assert observations == ["recovery", "cleanup", "released"]
+
+
+def test_normal_publish_returns_matching_paths_and_hashes(tmp_path):
+    api = _publication_api()
+    request = _request(tmp_path)
+
+    returned_api, result, journal_path = _publish_request(request)
+
+    assert returned_api is api
+    assert isinstance(result, api.PublicationResult)
+    assert result.transaction_id == request.transaction_id
+    assert result.final_output == request.final_output
+    assert result.data_sha256 == atomic_io.sha256_file(request.final_output)
+    assert result.result_manifest_target_kind == request.target.kind
+    assert result.result_manifest_path == request.target.path
+    assert result.manifest_sha256 == atomic_io.sha256_file(request.target.path)
+    assert result.previous_output_sha256 is None
+    assert result.backup_path is None
+    assert result.backup_sha256 is None
+    assert not journal_path.exists()
+    assert not list(request.work_dir.rglob("*.candidate"))
+
+
+def test_pending_journal_records_result_manifest_target_kind_and_path(
+    tmp_path, monkeypatch
+):
+    api = _publication_api()
+    request = _request(tmp_path)
+    journal_path = _journal_path(request.final_output)
+    pending_records = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        source = Path(source)
+        destination = Path(destination)
+        if destination == journal_path:
+            record = yaml.safe_load(source.read_text(encoding="utf-8"))
+            if record["state"] == "pending":
+                pending_records.append(record)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "replace", recording_replace)
+
+    _publish_request(request)
+
+    assert len(pending_records) == 1
+    pending = pending_records[0]
+    assert pending == {
+        "transaction_id": request.transaction_id,
+        "state": "pending",
+        "stage": "md",
+        "final_output": "MD_data.extxyz",
+        "data_candidate_path": pending["data_candidate_path"],
+        "data_candidate_sha256": pending["data_candidate_sha256"],
+        "result_manifest_target_kind": "current-stage",
+        "result_manifest_path": "md/manifest.yaml",
+        "manifest_candidate_path": pending["manifest_candidate_path"],
+        "manifest_candidate_sha256": pending["manifest_candidate_sha256"],
+        "previous_output_sha256": None,
+        "previous_manifest_sha256": pending["previous_manifest_sha256"],
+        "backup_path": None,
+        "backup_sha256": None,
+    }
+    assert pending["data_candidate_path"].startswith(".MD_data.extxyz.")
+    assert pending["manifest_candidate_path"].startswith("md/.manifest.yaml.")
+    assert len(pending["data_candidate_sha256"]) == 64
+    assert len(pending["manifest_candidate_sha256"]) == 64
+    assert len(pending["previous_manifest_sha256"]) == 64
+
+
+def test_normal_publish_supports_compatibility_result_manifest(tmp_path):
+    api = _publication_api()
+    request = _request(tmp_path, target_kind="compatibility")
+    legacy_manifest = manifest_path(request.work_dir, "md")
+    legacy_manifest.parent.mkdir(parents=True, exist_ok=True)
+    legacy_bytes = b"stage: md\ndirectories:\n  - run-a\nlegacy_key: keep-me\n"
+    legacy_manifest.write_bytes(legacy_bytes)
+
+    _returned_api, result, journal_path = _publish_request(request)
+
+    assert result.result_manifest_target_kind == api.ResultManifestTargetKind.MD_COMPATIBILITY
+    assert result.result_manifest_path == request.work_dir / "MD_data.collect.yaml"
+    assert result.data_sha256 == atomic_io.sha256_file(request.final_output)
+    assert result.manifest_sha256 == atomic_io.sha256_file(request.target.path)
+    data = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+    assert data["collect"]["transaction_id"] == request.transaction_id
+    assert data["collect"]["output_sha256"] == result.data_sha256
+    assert legacy_manifest.read_bytes() == legacy_bytes
+    assert not journal_path.exists()

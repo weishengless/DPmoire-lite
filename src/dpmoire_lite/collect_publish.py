@@ -5,7 +5,7 @@ import errno
 import os
 import shutil
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from ase.io import read as ase_read
 
 from . import atomic_io
 from .dataset import Dataset
+from .file_lock import CollectFileLock
 from .manifest import (
     Manifest,
     ManifestReadResult,
@@ -90,6 +91,23 @@ class CandidateArtifacts:
     data_sha256: str
     manifest_candidate_path: Path
     manifest_sha256: str
+
+
+class PublicationError(RuntimeError):
+    """A collection transaction could not be published or recovered safely."""
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    transaction_id: str
+    final_output: Path
+    data_sha256: str
+    result_manifest_target_kind: ResultManifestTargetKind
+    result_manifest_path: Path
+    manifest_sha256: str
+    previous_output_sha256: str | None
+    backup_path: Path | None
+    backup_sha256: str | None
 
 
 class BackupError(RuntimeError):
@@ -219,20 +237,10 @@ def prepare_candidates(request: CandidateRequest) -> CandidateArtifacts:
     manifest_candidate: Path | None = None
 
     try:
-        data_candidate = atomic_io.create_candidate(request.final_output)
-        writer = request.data_writer or _write_dataset
-        writer(request.dataset, data_candidate)
-        atomic_io.fsync_path(data_candidate)
-        _validate_data_candidate(request, data_candidate)
-        data_sha256 = atomic_io.sha256_file(data_candidate)
-
-        manifest_text = _build_manifest_text(request, data_sha256)
-        manifest_candidate = atomic_io.create_candidate(request.target.path)
-        manifest_candidate.write_text(manifest_text, encoding="utf-8", newline="")
-        atomic_io.fsync_path(manifest_candidate)
-        reread_text = manifest_candidate.read_text(encoding="utf-8")
-        _validate_manifest_candidate(request, reread_text, manifest_candidate, data_sha256)
-        manifest_sha256 = atomic_io.sha256_file(manifest_candidate)
+        data_candidate, data_sha256 = _prepare_data_candidate(request)
+        manifest_candidate, manifest_sha256 = _prepare_manifest_candidate(
+            request, data_sha256
+        )
 
         return CandidateArtifacts(
             data_candidate_path=data_candidate,
@@ -248,6 +256,35 @@ def prepare_candidates(request: CandidateRequest) -> CandidateArtifacts:
         raise CandidateValidationError(f"candidate preparation failed: {exc}") from exc
     except BaseException:
         _remove_candidates(data_candidate, manifest_candidate)
+        raise
+
+
+def _prepare_data_candidate(request: CandidateRequest) -> tuple[Path, str]:
+    candidate = atomic_io.create_candidate(request.final_output)
+    try:
+        writer = request.data_writer or _write_dataset
+        writer(request.dataset, candidate)
+        atomic_io.fsync_path(candidate)
+        _validate_data_candidate(request, candidate)
+        return candidate, atomic_io.sha256_file(candidate)
+    except BaseException:
+        candidate.unlink(missing_ok=True)
+        raise
+
+
+def _prepare_manifest_candidate(
+    request: CandidateRequest, data_sha256: str
+) -> tuple[Path, str]:
+    candidate = atomic_io.create_candidate(request.target.path)
+    try:
+        manifest_text = _build_manifest_text(request, data_sha256)
+        candidate.write_text(manifest_text, encoding="utf-8", newline="")
+        atomic_io.fsync_path(candidate)
+        reread_text = candidate.read_text(encoding="utf-8")
+        _validate_manifest_candidate(request, reread_text, candidate, data_sha256)
+        return candidate, atomic_io.sha256_file(candidate)
+    except BaseException:
+        candidate.unlink(missing_ok=True)
         raise
 
 
@@ -560,3 +597,314 @@ def _remove_candidates(*paths: Path | None) -> None:
     for path in paths:
         if path is not None:
             Path(path).unlink(missing_ok=True)
+
+
+class PublicationSession:
+    """Hold one collection lock across recovery, collection, and publication."""
+
+    def __init__(
+        self,
+        *,
+        work_dir: Path,
+        stage: str,
+        final_output: Path,
+        target: ResultManifestTarget,
+    ):
+        self.work_dir = Path(work_dir).resolve(strict=False)
+        self.stage = stage
+        self.final_output = Path(final_output).resolve(strict=False)
+        self.target = ResultManifestTarget(
+            kind=target.kind,
+            path=Path(target.path).resolve(strict=False),
+        )
+        _validate_session_target(self)
+
+        self.journal_path = self.final_output.parent / (
+            f".{self.final_output.name}.collect-journal.yaml"
+        )
+        self.previous_output_sha256: str | None = None
+        self.previous_manifest_sha256: str | None = None
+        self.recovered_result: PublicationResult | None = None
+        self._lock: CollectFileLock | None = None
+        self._entered = False
+        self._published = False
+
+    def __enter__(self) -> PublicationSession:
+        if self._entered or self._lock is not None:
+            raise PublicationError("publication session is already open")
+
+        lock = CollectFileLock(self.stage, self.final_output)
+        lock.__enter__()
+        self._lock = lock
+        self._entered = True
+        try:
+            self.previous_output_sha256 = _optional_file_sha256(self.final_output)
+            self.previous_manifest_sha256 = _optional_file_sha256(self.target.path)
+            self.recovered_result = _recover_existing_journal(self)
+            return self
+        except BaseException:
+            self._entered = False
+            self._lock = None
+            lock.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        lock = self._lock
+        self._lock = None
+        self._entered = False
+        if lock is not None:
+            lock.__exit__(exc_type, exc_value, traceback)
+        return False
+
+    def publish(self, request: CandidateRequest) -> PublicationResult:
+        if not self._entered or self._lock is None:
+            raise PublicationError("publication session is not open")
+        if self.recovered_result is not None:
+            raise PublicationError(
+                "a recovered transaction must be returned before new publication"
+            )
+        if self._published:
+            raise PublicationError("publication session already committed a transaction")
+
+        data_candidate: Path | None = None
+        manifest_candidate: Path | None = None
+        pending_published = False
+        backup: BackupArtifacts | None = None
+
+        try:
+            _validate_session_request(self, request)
+            _validate_request(request)
+            self._lock.update_diagnostics(transaction_id=request.transaction_id)
+
+            data_candidate, data_sha256 = _prepare_data_candidate(request)
+            backup = prepare_backup(
+                work_dir=self.work_dir,
+                stage=self.stage,
+                final_output=self.final_output,
+                transaction_id=request.transaction_id,
+            )
+            if backup.previous_output_sha256 != self.previous_output_sha256:
+                raise PublicationError(
+                    "formal output changed after the publication session read it"
+                )
+            if (
+                _optional_file_sha256(self.target.path)
+                != self.previous_manifest_sha256
+            ):
+                raise PublicationError(
+                    "result manifest changed after the publication session read it"
+                )
+
+            backup_relative = (
+                _relative_journal_path(self.work_dir, backup.backup_path)
+                if backup.backup_path is not None
+                else None
+            )
+            publish_request = replace(
+                request,
+                previous_output_sha256=backup.previous_output_sha256,
+                previous_manifest_sha256=self.previous_manifest_sha256,
+                backup_path=backup_relative,
+                backup_sha256=backup.backup_sha256,
+            )
+            manifest_candidate, manifest_sha256 = _prepare_manifest_candidate(
+                publish_request, data_sha256
+            )
+
+            journal = _pending_journal_record(
+                session=self,
+                request=publish_request,
+                data_candidate=data_candidate,
+                data_sha256=data_sha256,
+                manifest_candidate=manifest_candidate,
+                manifest_sha256=manifest_sha256,
+            )
+            _publish_journal(self.journal_path, journal)
+            pending_published = True
+
+            os.replace(data_candidate, self.final_output)
+            atomic_io.fsync_directory(self.final_output.parent)
+            if atomic_io.sha256_file(self.final_output) != data_sha256:
+                raise PublicationError(
+                    "published data hash does not match the pending journal"
+                )
+
+            os.replace(manifest_candidate, self.target.path)
+            atomic_io.fsync_directory(self.target.path.parent)
+            if atomic_io.sha256_file(self.target.path) != manifest_sha256:
+                raise PublicationError(
+                    "published manifest hash does not match the pending journal"
+                )
+            published_manifest_text = self.target.path.read_text(encoding="utf-8")
+            _validate_manifest_candidate(
+                publish_request,
+                published_manifest_text,
+                self.target.path,
+                data_sha256,
+            )
+
+            committed_journal = dict(journal)
+            committed_journal["state"] = "committed"
+            _publish_journal(self.journal_path, committed_journal)
+            self.journal_path.unlink()
+            atomic_io.fsync_directory(self.journal_path.parent)
+
+            result = PublicationResult(
+                transaction_id=request.transaction_id,
+                final_output=self.final_output,
+                data_sha256=data_sha256,
+                result_manifest_target_kind=self.target.kind,
+                result_manifest_path=self.target.path,
+                manifest_sha256=manifest_sha256,
+                previous_output_sha256=backup.previous_output_sha256,
+                backup_path=backup.backup_path,
+                backup_sha256=backup.backup_sha256,
+            )
+            self._published = True
+            return result
+        except PublicationError:
+            if not pending_published:
+                _remove_candidates(data_candidate, manifest_candidate)
+            raise
+        except (CandidateValidationError, BackupError) as exc:
+            if not pending_published:
+                _remove_candidates(data_candidate, manifest_candidate)
+            raise PublicationError(f"publication failed: {exc}") from exc
+        except Exception as exc:
+            if not pending_published:
+                _remove_candidates(data_candidate, manifest_candidate)
+            raise PublicationError(f"publication failed: {exc}") from exc
+        except BaseException:
+            if not pending_published:
+                _remove_candidates(data_candidate, manifest_candidate)
+            raise
+
+
+def _validate_session_target(session: PublicationSession) -> None:
+    output_name = _STAGE_OUTPUTS.get(session.stage)
+    if output_name is None:
+        raise PublicationError(
+            f"publication session does not support stage {session.stage!r}"
+        )
+    if session.final_output != session.work_dir / output_name:
+        raise PublicationError("publication session final output is not stage-owned")
+
+    if session.target.kind == ResultManifestTargetKind.CURRENT_STAGE:
+        expected_target = manifest_path(session.work_dir, session.stage).resolve(
+            strict=False
+        )
+        if session.target.path != expected_target:
+            raise PublicationError(
+                "current publication session target must be the stage manifest"
+            )
+    elif session.target.kind == ResultManifestTargetKind.MD_COMPATIBILITY:
+        if (
+            session.stage != "md"
+            or session.final_output != session.work_dir / "MD_data.extxyz"
+            or session.target.path != session.work_dir / "MD_data.collect.yaml"
+        ):
+            raise PublicationError(
+                "compatibility publication session target is not the closed MD path"
+            )
+    else:
+        raise PublicationError(
+            f"unsupported result-manifest target kind: {session.target.kind!r}"
+        )
+
+
+def _validate_session_request(
+    session: PublicationSession, request: CandidateRequest
+) -> None:
+    if Path(request.work_dir).resolve(strict=False) != session.work_dir:
+        raise PublicationError("publication request work_dir does not match its session")
+    if request.stage != session.stage:
+        raise PublicationError("publication request stage does not match its session")
+    if Path(request.final_output).resolve(strict=False) != session.final_output:
+        raise PublicationError(
+            "publication request final output does not match its session"
+        )
+    if (
+        request.target.kind != session.target.kind
+        or Path(request.target.path).resolve(strict=False) != session.target.path
+    ):
+        raise PublicationError("publication request target does not match its session")
+    if request.previous_output_sha256 != session.previous_output_sha256:
+        raise PublicationError(
+            "publication request previous output identity does not match its session"
+        )
+    if request.previous_manifest_sha256 != session.previous_manifest_sha256:
+        raise PublicationError(
+            "publication request previous manifest identity does not match its session"
+        )
+    if request.backup_path is not None or request.backup_sha256 is not None:
+        raise PublicationError("publication session, not its caller, owns backup identity")
+
+
+def _optional_file_sha256(path: Path) -> str | None:
+    path = Path(path)
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise PublicationError(f"transaction artifact is not a regular file: {path}")
+    return atomic_io.sha256_file(path)
+
+
+def _relative_journal_path(work_dir: Path, path: Path) -> str:
+    work_dir = Path(work_dir).resolve(strict=False)
+    resolved = Path(path).resolve(strict=False)
+    try:
+        return resolved.relative_to(work_dir).as_posix()
+    except ValueError as exc:
+        raise PublicationError(
+            f"transaction artifact is outside the work directory: {resolved}"
+        ) from exc
+
+
+def _pending_journal_record(
+    *,
+    session: PublicationSession,
+    request: CandidateRequest,
+    data_candidate: Path,
+    data_sha256: str,
+    manifest_candidate: Path,
+    manifest_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "transaction_id": request.transaction_id,
+        "state": "pending",
+        "stage": session.stage,
+        "final_output": _relative_journal_path(
+            session.work_dir, session.final_output
+        ),
+        "data_candidate_path": _relative_journal_path(
+            session.work_dir, data_candidate
+        ),
+        "data_candidate_sha256": data_sha256,
+        "result_manifest_target_kind": session.target.kind.value,
+        "result_manifest_path": _relative_journal_path(
+            session.work_dir, session.target.path
+        ),
+        "manifest_candidate_path": _relative_journal_path(
+            session.work_dir, manifest_candidate
+        ),
+        "manifest_candidate_sha256": manifest_sha256,
+        "previous_output_sha256": request.previous_output_sha256,
+        "previous_manifest_sha256": request.previous_manifest_sha256,
+        "backup_path": request.backup_path,
+        "backup_sha256": request.backup_sha256,
+    }
+
+
+def _publish_journal(path: Path, record: Mapping[str, Any]) -> None:
+    text = yaml.safe_dump(dict(record), sort_keys=False)
+    atomic_io.atomic_text_publish(path, text)
+
+
+def _recover_existing_journal(
+    session: PublicationSession,
+) -> PublicationResult | None:
+    if session.journal_path.exists():
+        raise PublicationError(
+            "an existing collection journal requires deterministic recovery"
+        )
+    return None
