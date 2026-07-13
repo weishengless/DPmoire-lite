@@ -105,6 +105,21 @@ class CandidateRequest:
 
 
 @dataclass(frozen=True)
+class ManifestOnlyRequest:
+    work_dir: Path
+    stage: str
+    final_output: Path
+    target: ResultManifestTarget
+    transaction_id: str
+    status: str
+    source_diagnostics: tuple[Mapping[str, Any], ...] = ()
+    previous_output_sha256: str | None = None
+    previous_manifest_sha256: str | None = None
+    current_manifest: Manifest | ManifestReadResult | None = None
+    compatibility_evidence: CompatibilityManifestEvidence | None = None
+
+
+@dataclass(frozen=True)
 class CandidateArtifacts:
     data_candidate_path: Path
     data_sha256: str
@@ -120,7 +135,7 @@ class PublicationError(RuntimeError):
 class PublicationResult:
     transaction_id: str
     final_output: Path
-    data_sha256: str
+    data_sha256: str | None
     result_manifest_target_kind: ResultManifestTargetKind
     result_manifest_path: Path
     manifest_sha256: str
@@ -132,6 +147,7 @@ class PublicationResult:
 @dataclass(frozen=True)
 class _PendingJournal:
     record: Mapping[str, Any]
+    state: str
     transaction_id: str
     final_output: Path
     data_candidate_path: Path
@@ -324,7 +340,26 @@ def _prepare_manifest_candidate(
         raise
 
 
-def _validate_request(request: CandidateRequest) -> None:
+def _prepare_manifest_only_candidate(
+    request: ManifestOnlyRequest,
+    collect: Mapping[str, Any],
+) -> tuple[Path, str]:
+    candidate = atomic_io.create_candidate(request.target.path)
+    try:
+        manifest_text = _build_manifest_text_from_collect(request, collect)
+        candidate.write_text(manifest_text, encoding="utf-8", newline="")
+        atomic_io.fsync_path(candidate)
+        reread_text = candidate.read_text(encoding="utf-8")
+        _validate_manifest_only_candidate(request, reread_text, candidate, collect)
+        return candidate, atomic_io.sha256_file(candidate)
+    except BaseException:
+        candidate.unlink(missing_ok=True)
+        raise
+
+
+def _validate_result_request_target(
+    request: CandidateRequest | ManifestOnlyRequest,
+) -> None:
     work_dir = Path(request.work_dir).resolve()
     final_output = Path(request.final_output).resolve()
     target_path = Path(request.target.path).resolve()
@@ -369,6 +404,13 @@ def _validate_request(request: CandidateRequest) -> None:
 
     if not isinstance(request.transaction_id, str) or not request.transaction_id:
         raise CandidateValidationError("transaction_id must be a non-empty string")
+
+    Path(request.final_output).parent.mkdir(parents=True, exist_ok=True)
+    Path(request.target.path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def _validate_request(request: CandidateRequest) -> None:
+    _validate_result_request_target(request)
     if (
         isinstance(request.expected_frame_count, bool)
         or not isinstance(request.expected_frame_count, int)
@@ -386,8 +428,13 @@ def _validate_request(request: CandidateRequest) -> None:
     if (request.backup_path is None) != (request.backup_sha256 is None):
         raise CandidateValidationError("backup path and hash must both be set or both be null")
 
-    Path(request.final_output).parent.mkdir(parents=True, exist_ok=True)
-    Path(request.target.path).parent.mkdir(parents=True, exist_ok=True)
+
+def _validate_manifest_only_request(request: ManifestOnlyRequest) -> None:
+    _validate_result_request_target(request)
+    if request.status != "no_data":
+        raise CandidateValidationError(
+            "manifest-only publication status must be 'no_data'"
+        )
 
 
 def _write_dataset(dataset: Dataset, path: Path) -> None:
@@ -469,7 +516,16 @@ def _validate_frame(index: int, expected: Atoms, observed: Atoms) -> None:
 
 
 def _build_manifest_text(request: CandidateRequest, data_sha256: str) -> str:
-    collect = _collect_record(request, data_sha256)
+    return _build_manifest_text_from_collect(
+        request,
+        _collect_record(request, data_sha256),
+    )
+
+
+def _build_manifest_text_from_collect(
+    request: CandidateRequest | ManifestOnlyRequest,
+    collect: Mapping[str, Any],
+) -> str:
     if request.target.kind == ResultManifestTargetKind.CURRENT_STAGE:
         current = _current_manifest(request.current_manifest)
         if current is None:
@@ -517,6 +573,30 @@ def _collect_record(request: CandidateRequest, data_sha256: str) -> dict[str, An
     }
 
 
+def _manifest_only_collect_record(
+    request: ManifestOnlyRequest,
+    *,
+    previous_output_frames: int | None,
+) -> dict[str, Any]:
+    return {
+        "transaction_id": request.transaction_id,
+        "status": request.status,
+        "frames": 0,
+        "written": False,
+        "preserved_previous_output": request.previous_output_sha256 is not None,
+        "previous_output_frames": previous_output_frames,
+        "output": Path(request.final_output).resolve().relative_to(
+            Path(request.work_dir).resolve()
+        ).as_posix(),
+        "output_sha256": request.previous_output_sha256,
+        "previous_sha256": request.previous_output_sha256,
+        "previous_manifest_sha256": request.previous_manifest_sha256,
+        "backup": None,
+        "backup_sha256": None,
+        "sources": [copy.deepcopy(dict(source)) for source in request.source_diagnostics],
+    }
+
+
 def _validate_manifest_candidate(
     request: CandidateRequest,
     text: str,
@@ -543,8 +623,45 @@ def _validate_manifest_candidate(
         raise CandidateValidationError("manifest candidate data hash does not match")
 
 
+def _validate_manifest_only_candidate(
+    request: ManifestOnlyRequest,
+    text: str,
+    path: Path,
+    expected_collect: Mapping[str, Any],
+) -> None:
+    if request.target.kind == ResultManifestTargetKind.CURRENT_STAGE:
+        try:
+            candidate = validate_current_manifest_text(
+                text,
+                work_dir=request.work_dir,
+                stage=request.stage,
+                path=path,
+            )
+        except ValueError as exc:
+            raise CandidateValidationError(
+                f"invalid current manifest-only candidate: {exc}"
+            ) from exc
+        collect = candidate.collect
+    else:
+        collect = _validate_compatibility_manifest_text(
+            request,
+            text,
+            path,
+            expected_collect=expected_collect,
+        )
+
+    if not isinstance(collect, Mapping) or dict(collect) != dict(expected_collect):
+        raise CandidateValidationError(
+            "manifest-only candidate collect record does not match the request"
+        )
+
+
 def _validate_compatibility_manifest_text(
-    request: CandidateRequest, text: str, path: Path
+    request: CandidateRequest | ManifestOnlyRequest,
+    text: str,
+    path: Path,
+    *,
+    expected_collect: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     try:
         data = yaml.safe_load(text)
@@ -599,7 +716,16 @@ def _validate_compatibility_manifest_text(
         raise CandidateValidationError(
             "compatibility manifest candidate collect must be a mapping"
         )
-    expected_collect_fields = set(_collect_record(request, collect.get("output_sha256", "")))
+    if expected_collect is None:
+        if not isinstance(request, CandidateRequest):
+            raise CandidateValidationError(
+                "compatibility manifest candidate lacks an expected collect record"
+            )
+        expected_collect_fields = set(
+            _collect_record(request, collect.get("output_sha256", ""))
+        )
+    else:
+        expected_collect_fields = set(expected_collect)
     if set(collect) != expected_collect_fields:
         raise CandidateValidationError(
             "compatibility manifest candidate collect fields do not match schema version 1"
@@ -608,9 +734,16 @@ def _validate_compatibility_manifest_text(
         raise CandidateValidationError(
             "compatibility manifest candidate output must be MD_data.extxyz"
         )
-    if collect.get("frames") != request.expected_frame_count or collect.get("written") is not True:
+    if expected_collect is None and (
+        collect.get("frames") != request.expected_frame_count
+        or collect.get("written") is not True
+    ):
         raise CandidateValidationError(
             "compatibility manifest candidate frame metadata does not match"
+        )
+    if expected_collect is not None and dict(collect) != dict(expected_collect):
+        raise CandidateValidationError(
+            "compatibility manifest-only collect record does not match the request"
         )
     if not isinstance(collect.get("sources"), list) or not all(
         isinstance(source, Mapping) for source in collect["sources"]
@@ -815,6 +948,94 @@ class PublicationSession:
                 _remove_candidates(data_candidate, manifest_candidate)
             raise
 
+    def publish_manifest_only(
+        self, request: ManifestOnlyRequest
+    ) -> PublicationResult:
+        if not self._entered or self._lock is None:
+            raise PublicationError("publication session is not open")
+        if self.recovered_result is not None:
+            raise PublicationError(
+                "a recovered transaction must be returned before new publication"
+            )
+        if self._published:
+            raise PublicationError("publication session already committed a transaction")
+
+        manifest_candidate: Path | None = None
+        try:
+            _validate_session_request(self, request)
+            _validate_manifest_only_request(request)
+            self._lock.update_diagnostics(transaction_id=request.transaction_id)
+
+            if (
+                _optional_file_sha256(self.final_output)
+                != self.previous_output_sha256
+            ):
+                raise PublicationError(
+                    "formal output changed after the publication session read it"
+                )
+            if (
+                _optional_file_sha256(self.target.path)
+                != self.previous_manifest_sha256
+            ):
+                raise PublicationError(
+                    "result manifest changed after the publication session read it"
+                )
+
+            previous_output_frames = _safe_output_frame_count(self.final_output)
+            collect = _manifest_only_collect_record(
+                request,
+                previous_output_frames=previous_output_frames,
+            )
+            manifest_candidate, manifest_sha256 = _prepare_manifest_only_candidate(
+                request,
+                collect,
+            )
+
+            if (
+                _optional_file_sha256(self.final_output)
+                != self.previous_output_sha256
+            ):
+                raise PublicationError(
+                    "formal output changed during manifest-only publication"
+                )
+            if (
+                _optional_file_sha256(self.target.path)
+                != self.previous_manifest_sha256
+            ):
+                raise PublicationError(
+                    "result manifest changed during manifest-only publication"
+                )
+
+            os.replace(manifest_candidate, self.target.path)
+            manifest_candidate = None
+            atomic_io.fsync_directory(self.target.path.parent)
+
+            result = PublicationResult(
+                transaction_id=request.transaction_id,
+                final_output=self.final_output,
+                data_sha256=self.previous_output_sha256,
+                result_manifest_target_kind=self.target.kind,
+                result_manifest_path=self.target.path,
+                manifest_sha256=manifest_sha256,
+                previous_output_sha256=self.previous_output_sha256,
+                backup_path=None,
+                backup_sha256=None,
+            )
+            self._published = True
+            return result
+        except PublicationError:
+            _remove_candidates(manifest_candidate)
+            raise
+        except CandidateValidationError as exc:
+            _remove_candidates(manifest_candidate)
+            raise PublicationError(f"manifest-only publication failed: {exc}") from exc
+        except Exception as exc:
+            _remove_candidates(manifest_candidate)
+            raise PublicationError(f"manifest-only publication failed: {exc}") from exc
+        except BaseException:
+            _remove_candidates(manifest_candidate)
+            raise
+
 
 def _validate_session_target(session: PublicationSession) -> None:
     output_name = _STAGE_OUTPUTS.get(session.stage)
@@ -849,7 +1070,8 @@ def _validate_session_target(session: PublicationSession) -> None:
 
 
 def _validate_session_request(
-    session: PublicationSession, request: CandidateRequest
+    session: PublicationSession,
+    request: CandidateRequest | ManifestOnlyRequest,
 ) -> None:
     if Path(request.work_dir).resolve(strict=False) != session.work_dir:
         raise PublicationError("publication request work_dir does not match its session")
@@ -872,7 +1094,9 @@ def _validate_session_request(
         raise PublicationError(
             "publication request previous manifest identity does not match its session"
         )
-    if request.backup_path is not None or request.backup_sha256 is not None:
+    if isinstance(request, CandidateRequest) and (
+        request.backup_path is not None or request.backup_sha256 is not None
+    ):
         raise PublicationError("publication session, not its caller, owns backup identity")
 
 
@@ -883,6 +1107,19 @@ def _optional_file_sha256(path: Path) -> str | None:
     if not path.is_file():
         raise PublicationError(f"transaction artifact is not a regular file: {path}")
     return atomic_io.sha256_file(path)
+
+
+def _safe_output_frame_count(path: Path) -> int | None:
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        frames = ase_read(path, format="extxyz", index=":")
+    except Exception:
+        return None
+    if isinstance(frames, list):
+        return len(frames)
+    return len(list(frames))
 
 
 def _relative_journal_path(work_dir: Path, path: Path) -> str:
@@ -998,11 +1235,7 @@ def _load_pending_journal(session: PublicationSession) -> _PendingJournal:
         raise PublicationError("pending journal fields do not match the publication schema")
 
     state = data.get("state")
-    if state == "committed":
-        raise PublicationError(
-            "committed collection journal recovery is not a pending recovery"
-        )
-    if state != "pending":
+    if state not in {"pending", "committed"}:
         raise PublicationError(f"unsupported collection journal state: {state!r}")
 
     transaction_id = data.get("transaction_id")
@@ -1100,6 +1333,7 @@ def _load_pending_journal(session: PublicationSession) -> _PendingJournal:
 
     return _PendingJournal(
         record=dict(data),
+        state=state,
         transaction_id=transaction_id,
         final_output=final_output,
         data_candidate_path=data_candidate_path,
@@ -1290,6 +1524,34 @@ def _commit_pending_recovery(
     )
 
 
+def _recover_committed_journal(
+    session: PublicationSession,
+    journal: _PendingJournal,
+) -> None:
+    if session.previous_output_sha256 != journal.data_candidate_sha256:
+        raise PublicationError(
+            "committed transaction data hash does not match the journal"
+        )
+    if session.previous_manifest_sha256 != journal.manifest_candidate_sha256:
+        raise PublicationError(
+            "committed transaction manifest hash does not match the journal"
+        )
+
+    _validate_recovery_manifest(
+        session,
+        journal,
+        journal.result_manifest_path,
+        label="committed manifest",
+    )
+    try:
+        session.journal_path.unlink()
+        atomic_io.fsync_directory(session.journal_path.parent)
+    except Exception as exc:
+        raise PublicationError(
+            f"could not remove matching committed collection journal: {exc}"
+        ) from exc
+
+
 def _recover_existing_journal(
     session: PublicationSession,
 ) -> PublicationResult | None:
@@ -1297,6 +1559,10 @@ def _recover_existing_journal(
         return None
 
     journal = _load_pending_journal(session)
+    if journal.state == "committed":
+        _recover_committed_journal(session, journal)
+        return None
+
     _validate_pending_backup(journal)
     data_state = _classify_pending_data(session, journal)
     manifest_state = _classify_pending_manifest(session, journal)

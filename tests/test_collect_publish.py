@@ -351,6 +351,84 @@ def _interrupt_pending_transaction(
     return case
 
 
+def _interrupt_committed_transaction(tmp_path: Path, monkeypatch):
+    api = _publication_api()
+    request = _request(tmp_path)
+    previous_bytes = _write_previous_output(request)
+    journal_path = _journal_path(request.final_output)
+    real_unlink = Path.unlink
+
+    def interrupting_unlink(path, *args, **kwargs):
+        path = Path(path)
+        if path == journal_path:
+            record = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if record["state"] == "committed":
+                raise OSError("synthetic interruption before committed journal unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", interrupting_unlink)
+        with pytest.raises(api.PublicationError, match="committed journal unlink"):
+            _publish_request(request)
+
+    journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+    assert journal["state"] == "committed"
+    case = {
+        "api": api,
+        "request": request,
+        "journal_path": journal_path,
+        "journal": journal,
+        "data_candidate": _journal_artifact_path(
+            request.work_dir, journal["data_candidate_path"]
+        ),
+        "manifest_candidate": _journal_artifact_path(
+            request.work_dir, journal["manifest_candidate_path"]
+        ),
+        "backup_path": _journal_artifact_path(
+            request.work_dir, journal["backup_path"]
+        ),
+        "previous_bytes": previous_bytes,
+    }
+    assert case["data_candidate"] is not None
+    assert case["manifest_candidate"] is not None
+    assert case["backup_path"] is not None
+    assert not case["data_candidate"].exists()
+    assert not case["manifest_candidate"].exists()
+    assert case["backup_path"].read_bytes() == previous_bytes
+    return case
+
+
+def _manifest_only_request(api, request, session, *, transaction_id: str):
+    request_type = getattr(api, "ManifestOnlyRequest", None)
+    if request_type is None:
+        pytest.fail("manifest-only publication is not implemented")
+    return request_type(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+        transaction_id=transaction_id,
+        status="no_data",
+        source_diagnostics=(
+            {"path": "md/run-a/ML_ABN", "status": "failed", "frames": 0},
+        ),
+        previous_output_sha256=session.previous_output_sha256,
+        previous_manifest_sha256=session.previous_manifest_sha256,
+        current_manifest=request.current_manifest,
+        compatibility_evidence=request.compatibility_evidence,
+    )
+
+
+def _manifest_only_candidate(path: Path, target: Path) -> bool:
+    path = Path(path)
+    target = Path(target)
+    return (
+        path.parent == target.parent
+        and path.name.startswith(f".{target.name}.")
+        and path.name.endswith(".candidate")
+    )
+
+
 def _arrange_recovery_row(case, mutation: str | None) -> None:
     if mutation is None:
         return
@@ -1616,3 +1694,538 @@ def test_recovery_rejects_changed_manifest_target_kind_or_path(
     _write_case_journal(case, journal)
 
     _assert_recovery_fatal(case, error_pattern)
+
+
+def test_committed_journal_with_matching_files_is_removed(tmp_path, monkeypatch):
+    case = _interrupt_committed_transaction(tmp_path, monkeypatch)
+    api = case["api"]
+    request = case["request"]
+    original_backup = case["backup_path"]
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        assert session.recovered_result is None
+        assert not case["journal_path"].exists()
+        _assert_same_output_lock_is_held(request)
+
+        followup = replace(
+            request,
+            transaction_id="collect-task-6-after-committed-cleanup",
+        )
+        result = session.publish(_request_for_session(followup, session))
+
+    assert result.transaction_id == followup.transaction_id
+    assert result.data_sha256 == atomic_io.sha256_file(request.final_output)
+    assert result.manifest_sha256 == atomic_io.sha256_file(request.target.path)
+    assert original_backup.is_file()
+    assert original_backup.read_bytes() == case["previous_bytes"]
+    assert not case["journal_path"].exists()
+
+
+@pytest.mark.parametrize(
+    "mismatch,error_pattern",
+    (
+        pytest.param("final-hash", "committed.*data", id="final-hash"),
+        pytest.param("manifest-hash", "committed.*manifest", id="manifest-hash"),
+        pytest.param(
+            "internal-transaction",
+            "transaction ID",
+            id="internal-transaction",
+        ),
+        pytest.param("internal-data-hash", "data hash", id="internal-data-hash"),
+        pytest.param("target-kind", "target kind", id="target-kind"),
+        pytest.param("target-path", "target path", id="target-path"),
+    ),
+)
+def test_committed_journal_hash_or_transaction_mismatch_is_fatal(
+    tmp_path, monkeypatch, mismatch, error_pattern
+):
+    case = _interrupt_committed_transaction(tmp_path, monkeypatch)
+    request = case["request"]
+    journal = dict(case["journal"])
+
+    if mismatch == "final-hash":
+        _replace_test_bytes(request.final_output, b"changed committed data\n")
+    elif mismatch == "manifest-hash":
+        _replace_test_bytes(request.target.path, b"changed committed manifest\n")
+    elif mismatch in {"internal-transaction", "internal-data-hash"}:
+        manifest = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+        if mismatch == "internal-transaction":
+            manifest["collect"]["transaction_id"] = "changed-transaction"
+        else:
+            manifest["collect"]["output_sha256"] = "0" * 64
+        request.target.path.write_text(
+            yaml.safe_dump(manifest, sort_keys=False),
+            encoding="utf-8",
+            newline="",
+        )
+        journal["manifest_candidate_sha256"] = atomic_io.sha256_file(
+            request.target.path
+        )
+        _write_case_journal(case, journal)
+    elif mismatch == "target-kind":
+        journal["result_manifest_target_kind"] = "md-compatibility"
+        _write_case_journal(case, journal)
+    elif mismatch == "target-path":
+        journal["result_manifest_path"] = "MD_data.collect.yaml"
+        _write_case_journal(case, journal)
+    else:
+        raise AssertionError(f"unknown committed mismatch: {mismatch}")
+
+    snapshot = _case_snapshot(case)
+    with pytest.raises(case["api"].PublicationError, match=error_pattern):
+        with case["api"].PublicationSession(
+            work_dir=request.work_dir,
+            stage=request.stage,
+            final_output=request.final_output,
+            target=request.target,
+        ):
+            pass
+
+    _assert_case_unchanged(snapshot)
+    assert yaml.safe_load(case["journal_path"].read_text(encoding="utf-8"))[
+        "state"
+    ] == "committed"
+    assert case["backup_path"].read_bytes() == case["previous_bytes"]
+
+
+@pytest.mark.parametrize(
+    "existing_output,expected_previous_frames",
+    (
+        pytest.param(True, 1, id="preserve-existing-output"),
+        pytest.param(False, None, id="first-no-data"),
+    ),
+)
+def test_manifest_only_publish_is_atomic_under_same_lock(
+    tmp_path,
+    monkeypatch,
+    existing_output,
+    expected_previous_frames,
+):
+    api = _publication_api()
+    request = _request(tmp_path)
+    previous_bytes = _write_previous_output(request) if existing_output else None
+    previous_sha256 = (
+        atomic_io.sha256_file(request.final_output) if existing_output else None
+    )
+    previous_manifest_bytes = request.target.path.read_bytes()
+    previous_manifest_sha256 = atomic_io.sha256_file(request.target.path)
+    replacements = []
+    real_replace = os.replace
+
+    def recording_replace(source, destination, *args, **kwargs):
+        destination = Path(destination)
+        if destination == request.target.path:
+            _assert_same_output_lock_is_held(request)
+            assert not _journal_path(request.final_output).exists()
+            if previous_bytes is None:
+                assert not request.final_output.exists()
+            else:
+                assert request.final_output.read_bytes() == previous_bytes
+            replacements.append(destination)
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(api.os, "replace", recording_replace)
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        manifest_request = _manifest_only_request(
+            api,
+            request,
+            session,
+            transaction_id="collect-task-6-no-data",
+        )
+        publish_manifest_only = getattr(session, "publish_manifest_only", None)
+        if publish_manifest_only is None:
+            pytest.fail("manifest-only publication is not implemented")
+        result = publish_manifest_only(manifest_request)
+
+    assert replacements == [request.target.path]
+    assert result.transaction_id == manifest_request.transaction_id
+    assert result.final_output == request.final_output
+    assert result.data_sha256 == previous_sha256
+    assert result.result_manifest_target_kind == request.target.kind
+    assert result.result_manifest_path == request.target.path
+    assert result.manifest_sha256 == atomic_io.sha256_file(request.target.path)
+    assert result.previous_output_sha256 == previous_sha256
+    assert result.backup_path is None
+    assert result.backup_sha256 is None
+    assert request.target.path.read_bytes() != previous_manifest_bytes
+    if previous_bytes is None:
+        assert not request.final_output.exists()
+    else:
+        assert request.final_output.read_bytes() == previous_bytes
+
+    manifest = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+    assert manifest["collect"] == {
+        "transaction_id": manifest_request.transaction_id,
+        "status": "no_data",
+        "frames": 0,
+        "written": False,
+        "preserved_previous_output": existing_output,
+        "previous_output_frames": expected_previous_frames,
+        "output": "MD_data.extxyz",
+        "output_sha256": previous_sha256,
+        "previous_sha256": previous_sha256,
+        "previous_manifest_sha256": previous_manifest_sha256,
+        "backup": None,
+        "backup_sha256": None,
+        "sources": [
+            {"path": "md/run-a/ML_ABN", "status": "failed", "frames": 0}
+        ],
+    }
+    assert not _journal_path(request.final_output).exists()
+    assert not list(request.work_dir.rglob("*.candidate"))
+
+
+def test_compatibility_manifest_only_publish_does_not_create_stage_manifest(tmp_path):
+    api = _publication_api()
+    request = _request(tmp_path, target_kind="compatibility")
+    previous_bytes = _write_previous_output(request)
+    previous_sha256 = atomic_io.sha256_file(request.final_output)
+    legacy_manifest = manifest_path(request.work_dir, "md")
+    legacy_manifest.parent.mkdir(parents=True, exist_ok=True)
+    legacy_bytes = b"stage: md\ndirectories:\n  - run-a\nlegacy_key: preserve-me\n"
+    legacy_manifest.write_bytes(legacy_bytes)
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        manifest_request = _manifest_only_request(
+            api,
+            request,
+            session,
+            transaction_id="collect-task-6-compatibility-no-data",
+        )
+        publish_manifest_only = getattr(session, "publish_manifest_only", None)
+        if publish_manifest_only is None:
+            pytest.fail("manifest-only publication is not implemented")
+        result = publish_manifest_only(manifest_request)
+
+    assert result.result_manifest_target_kind == api.ResultManifestTargetKind.MD_COMPATIBILITY
+    assert result.result_manifest_path == request.work_dir / "MD_data.collect.yaml"
+    assert result.data_sha256 == previous_sha256
+    assert request.final_output.read_bytes() == previous_bytes
+    assert legacy_manifest.read_bytes() == legacy_bytes
+    data = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+    assert data["kind"] == "dpmoire-lite-collect-result"
+    assert data["collect"]["status"] == "no_data"
+    assert data["collect"]["written"] is False
+    assert data["collect"]["output_sha256"] == previous_sha256
+    assert not _journal_path(request.final_output).exists()
+    assert not list(request.work_dir.rglob("*.candidate"))
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        pytest.param("candidate-write", id="candidate-write"),
+        pytest.param("candidate-read", id="candidate-read"),
+        pytest.param("replace", id="replace"),
+    ),
+)
+def test_manifest_only_failure_preserves_old_manifest_and_data(
+    tmp_path, monkeypatch, failure
+):
+    api = _publication_api()
+    request = _request(tmp_path)
+    previous_data = _write_previous_output(request)
+    previous_manifest = request.target.path.read_bytes()
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        manifest_request = _manifest_only_request(
+            api,
+            request,
+            session,
+            transaction_id=f"collect-task-6-no-data-{failure}",
+        )
+        publish_manifest_only = getattr(session, "publish_manifest_only", None)
+        if publish_manifest_only is None:
+            pytest.fail("manifest-only publication is not implemented")
+
+        with monkeypatch.context() as patch:
+            if failure == "candidate-write":
+                real_write_text = Path.write_text
+
+                def failing_write_text(path, *args, **kwargs):
+                    if _manifest_only_candidate(path, request.target.path):
+                        raise OSError("synthetic manifest-only candidate write")
+                    return real_write_text(path, *args, **kwargs)
+
+                patch.setattr(Path, "write_text", failing_write_text)
+            elif failure == "candidate-read":
+                real_read_text = Path.read_text
+
+                def failing_read_text(path, *args, **kwargs):
+                    if _manifest_only_candidate(path, request.target.path):
+                        raise OSError("synthetic manifest-only candidate read")
+                    return real_read_text(path, *args, **kwargs)
+
+                patch.setattr(Path, "read_text", failing_read_text)
+            elif failure == "replace":
+                real_replace = os.replace
+
+                def failing_replace(source, destination, *args, **kwargs):
+                    if Path(destination) == request.target.path:
+                        raise OSError("synthetic manifest-only replace")
+                    return real_replace(source, destination, *args, **kwargs)
+
+                patch.setattr(api.os, "replace", failing_replace)
+            else:
+                raise AssertionError(f"unknown manifest-only failure: {failure}")
+
+            with pytest.raises(api.PublicationError, match="synthetic manifest-only"):
+                publish_manifest_only(manifest_request)
+
+    assert request.final_output.read_bytes() == previous_data
+    assert request.target.path.read_bytes() == previous_manifest
+    assert not _journal_path(request.final_output).exists()
+    assert not list(request.work_dir.rglob("*.candidate"))
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        pytest.param("candidate-write", id="candidate-write"),
+        pytest.param("candidate-read", id="candidate-read"),
+        pytest.param("backup", id="backup"),
+        pytest.param("journal-write", id="journal-write"),
+    ),
+)
+def test_failure_before_pending_cleans_unneeded_candidates(
+    tmp_path, monkeypatch, boundary
+):
+    api = _publication_api()
+    request = _request(tmp_path)
+    previous_data = _write_previous_output(request)
+    previous_sha256 = atomic_io.sha256_file(request.final_output)
+    previous_manifest = request.target.path.read_bytes()
+    journal_path = _journal_path(request.final_output)
+
+    if boundary == "candidate-write":
+        def failing_writer(_dataset_value, _path):
+            raise OSError("synthetic candidate write")
+
+        request = replace(request, data_writer=failing_writer)
+
+    with monkeypatch.context() as patch:
+        if boundary == "candidate-read":
+            real_ase_read = api.ase_read
+
+            def failing_candidate_read(path, *args, **kwargs):
+                path = Path(path)
+                if (
+                    path.parent == request.final_output.parent
+                    and path.name.startswith(f".{request.final_output.name}.")
+                    and path.name.endswith(".candidate")
+                ):
+                    raise OSError("synthetic candidate read")
+                return real_ase_read(path, *args, **kwargs)
+
+            patch.setattr(api, "ase_read", failing_candidate_read)
+        elif boundary == "backup":
+            def failing_link(_source, _destination):
+                raise OSError(errno.EIO, "synthetic backup")
+
+            patch.setattr(api.os, "link", failing_link)
+        elif boundary == "journal-write":
+            real_atomic_text_publish = atomic_io.atomic_text_publish
+
+            def failing_journal_write(destination, text, **kwargs):
+                if Path(destination) == journal_path:
+                    raise OSError("synthetic journal write")
+                return real_atomic_text_publish(destination, text, **kwargs)
+
+            patch.setattr(atomic_io, "atomic_text_publish", failing_journal_write)
+        elif boundary != "candidate-write":
+            raise AssertionError(f"unknown pre-pending boundary: {boundary}")
+
+        with pytest.raises(api.PublicationError, match="synthetic"):
+            _publish_request(request)
+
+    assert request.final_output.read_bytes() == previous_data
+    assert request.target.path.read_bytes() == previous_manifest
+    assert not journal_path.exists()
+    assert not list(request.work_dir.rglob("*.candidate"))
+
+    backup_directory = request.work_dir / "backups" / "collect"
+    backups = list(backup_directory.glob("*.extxyz")) if backup_directory.exists() else []
+    if boundary == "journal-write":
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == previous_data
+        assert atomic_io.sha256_file(backups[0]) == previous_sha256
+    else:
+        assert backups == []
+
+
+@pytest.mark.parametrize(
+    "boundary,error_pattern",
+    (
+        pytest.param("data-replace", "synthetic data replace", id="data-replace"),
+        pytest.param("data-verify", "published data hash", id="data-verify"),
+        pytest.param(
+            "manifest-replace",
+            "synthetic manifest replace",
+            id="manifest-replace",
+        ),
+        pytest.param(
+            "manifest-verify",
+            "published manifest hash",
+            id="manifest-verify",
+        ),
+        pytest.param(
+            "committed-update",
+            "synthetic committed update",
+            id="committed-update",
+        ),
+        pytest.param("unlink", "synthetic unlink", id="unlink"),
+    ),
+)
+def test_failure_after_pending_preserves_recovery_evidence(
+    tmp_path, monkeypatch, boundary, error_pattern
+):
+    api = _publication_api()
+    request = _request(tmp_path)
+    previous_data = _write_previous_output(request)
+    previous_sha256 = atomic_io.sha256_file(request.final_output)
+    previous_manifest = request.target.path.read_bytes()
+    journal_path = _journal_path(request.final_output)
+    state = {"data_replaced": False, "manifest_replaced": False}
+    real_replace = os.replace
+    real_sha256_file = atomic_io.sha256_file
+
+    with monkeypatch.context() as patch:
+        if boundary in {"data-replace", "manifest-replace"}:
+            blocked = (
+                request.final_output if boundary == "data-replace" else request.target.path
+            )
+
+            def failing_replace(source, destination, *args, **kwargs):
+                if Path(destination) == blocked:
+                    raise OSError(f"synthetic {boundary.replace('-', ' ')}")
+                return real_replace(source, destination, *args, **kwargs)
+
+            patch.setattr(api.os, "replace", failing_replace)
+        elif boundary in {"data-verify", "manifest-verify"}:
+            verified_path = (
+                request.final_output if boundary == "data-verify" else request.target.path
+            )
+            state_key = (
+                "data_replaced" if boundary == "data-verify" else "manifest_replaced"
+            )
+
+            def recording_replace(source, destination, *args, **kwargs):
+                destination = Path(destination)
+                result = real_replace(source, destination, *args, **kwargs)
+                if destination == verified_path:
+                    state[state_key] = True
+                return result
+
+            def failing_verification(path):
+                if Path(path) == verified_path and state[state_key]:
+                    return "0" * 64
+                return real_sha256_file(path)
+
+            patch.setattr(api.os, "replace", recording_replace)
+            patch.setattr(atomic_io, "sha256_file", failing_verification)
+        elif boundary == "committed-update":
+            real_atomic_text_publish = atomic_io.atomic_text_publish
+
+            def failing_committed_update(destination, text, **kwargs):
+                if Path(destination) == journal_path:
+                    record = yaml.safe_load(text)
+                    if record["state"] == "committed":
+                        raise OSError("synthetic committed update")
+                return real_atomic_text_publish(destination, text, **kwargs)
+
+            patch.setattr(atomic_io, "atomic_text_publish", failing_committed_update)
+        elif boundary == "unlink":
+            real_unlink = Path.unlink
+
+            def failing_unlink(path, *args, **kwargs):
+                path = Path(path)
+                if path == journal_path and path.exists():
+                    record = yaml.safe_load(path.read_text(encoding="utf-8"))
+                    if record["state"] == "committed":
+                        raise OSError("synthetic unlink")
+                return real_unlink(path, *args, **kwargs)
+
+            patch.setattr(Path, "unlink", failing_unlink)
+        else:
+            raise AssertionError(f"unknown post-pending boundary: {boundary}")
+
+        with pytest.raises(api.PublicationError, match=error_pattern):
+            _publish_request(request)
+
+    journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+    expected_state = "committed" if boundary == "unlink" else "pending"
+    assert journal["state"] == expected_state
+
+    backup_path = _journal_artifact_path(request.work_dir, journal["backup_path"])
+    data_candidate = _journal_artifact_path(
+        request.work_dir, journal["data_candidate_path"]
+    )
+    manifest_candidate = _journal_artifact_path(
+        request.work_dir, journal["manifest_candidate_path"]
+    )
+    assert backup_path is not None
+    assert data_candidate is not None
+    assert manifest_candidate is not None
+    assert backup_path.read_bytes() == previous_data
+    assert journal["backup_sha256"] == previous_sha256
+    assert atomic_io.sha256_file(backup_path) == previous_sha256
+
+    expected_candidate_existence = {
+        "data-replace": (True, True),
+        "data-verify": (False, True),
+        "manifest-replace": (False, True),
+        "manifest-verify": (False, False),
+        "committed-update": (False, False),
+        "unlink": (False, False),
+    }[boundary]
+    assert data_candidate.exists() is expected_candidate_existence[0]
+    assert manifest_candidate.exists() is expected_candidate_existence[1]
+    if data_candidate.exists():
+        assert atomic_io.sha256_file(data_candidate) == journal["data_candidate_sha256"]
+    if manifest_candidate.exists():
+        assert (
+            atomic_io.sha256_file(manifest_candidate)
+            == journal["manifest_candidate_sha256"]
+        )
+
+    available_candidates = set(request.work_dir.rglob("*.candidate"))
+    expected_candidates = {
+        path for path in (data_candidate, manifest_candidate) if path.exists()
+    }
+    assert available_candidates == expected_candidates
+
+    if boundary == "data-replace":
+        assert request.final_output.read_bytes() == previous_data
+    else:
+        assert (
+            atomic_io.sha256_file(request.final_output)
+            == journal["data_candidate_sha256"]
+        )
+    if boundary in {"data-replace", "data-verify", "manifest-replace"}:
+        assert request.target.path.read_bytes() == previous_manifest
+    else:
+        assert (
+            atomic_io.sha256_file(request.target.path)
+            == journal["manifest_candidate_sha256"]
+        )
