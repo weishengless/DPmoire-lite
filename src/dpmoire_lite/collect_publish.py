@@ -36,6 +36,25 @@ _STAGE_OUTPUTS = {
 _COMPATIBILITY_SCHEMA_VERSION = 1
 _COMPATIBILITY_KIND = "dpmoire-lite-collect-result"
 
+_PUBLISH_JOURNAL_FIELDS = frozenset(
+    {
+        "transaction_id",
+        "state",
+        "stage",
+        "final_output",
+        "data_candidate_path",
+        "data_candidate_sha256",
+        "result_manifest_target_kind",
+        "result_manifest_path",
+        "manifest_candidate_path",
+        "manifest_candidate_sha256",
+        "previous_output_sha256",
+        "previous_manifest_sha256",
+        "backup_path",
+        "backup_sha256",
+    }
+)
+
 
 class CandidateValidationError(RuntimeError):
     """A candidate could not be proven complete and safe to publish."""
@@ -108,6 +127,23 @@ class PublicationResult:
     previous_output_sha256: str | None
     backup_path: Path | None
     backup_sha256: str | None
+
+
+@dataclass(frozen=True)
+class _PendingJournal:
+    record: Mapping[str, Any]
+    transaction_id: str
+    final_output: Path
+    data_candidate_path: Path
+    data_candidate_sha256: str
+    result_manifest_path: Path
+    manifest_candidate_path: Path
+    manifest_candidate_sha256: str
+    previous_output_sha256: str | None
+    previous_manifest_sha256: str | None
+    backup_path: Path | None
+    backup_sha256: str | None
+    first_publish: bool
 
 
 class BackupError(RuntimeError):
@@ -900,11 +936,458 @@ def _publish_journal(path: Path, record: Mapping[str, Any]) -> None:
     atomic_io.atomic_text_publish(path, text)
 
 
+def _journal_sha256(
+    value: Any, *, field: str, allow_none: bool = False
+) -> str | None:
+    if value is None and allow_none:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise PublicationError(f"pending journal {field} is not a SHA-256 hash")
+    return value
+
+
+def _journal_artifact_path(
+    session: PublicationSession, value: Any, *, field: str
+) -> Path:
+    if not isinstance(value, str) or not value:
+        raise PublicationError(f"pending journal {field} must be a relative path")
+    raw = Path(value)
+    if raw.is_absolute() or raw.drive or raw.root:
+        raise PublicationError(f"pending journal {field} must be a relative path")
+
+    resolved = (session.work_dir / raw).resolve(strict=False)
+    try:
+        relative = resolved.relative_to(session.work_dir).as_posix()
+    except ValueError as exc:
+        raise PublicationError(
+            f"pending journal {field} is outside the work directory"
+        ) from exc
+    if relative != value:
+        raise PublicationError(f"pending journal {field} is not normalized")
+    return resolved
+
+
+def _validate_journal_candidate_path(
+    candidate: Path, destination: Path, *, label: str
+) -> None:
+    expected_prefix = f".{destination.name}."
+    if (
+        candidate.parent != destination.parent
+        or candidate == destination
+        or not candidate.name.startswith(expected_prefix)
+        or not candidate.name.endswith(".candidate")
+    ):
+        raise PublicationError(
+            f"pending journal {label} path is not beside its formal destination"
+        )
+
+
+def _load_pending_journal(session: PublicationSession) -> _PendingJournal:
+    try:
+        text = session.journal_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(text)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise PublicationError(f"could not read pending journal: {exc}") from exc
+    if not isinstance(data, Mapping):
+        raise PublicationError("pending journal top-level data must be a mapping")
+    if set(data) != _PUBLISH_JOURNAL_FIELDS:
+        raise PublicationError("pending journal fields do not match the publication schema")
+
+    state = data.get("state")
+    if state == "committed":
+        raise PublicationError(
+            "committed collection journal recovery is not a pending recovery"
+        )
+    if state != "pending":
+        raise PublicationError(f"unsupported collection journal state: {state!r}")
+
+    transaction_id = data.get("transaction_id")
+    if not isinstance(transaction_id, str) or not transaction_id:
+        raise PublicationError("pending journal transaction_id must be non-empty")
+    if data.get("stage") != session.stage:
+        raise PublicationError("pending journal stage does not match the publication session")
+
+    final_output = _journal_artifact_path(
+        session, data.get("final_output"), field="final output path"
+    )
+    if final_output != session.final_output:
+        raise PublicationError(
+            "pending journal final output path does not match the publication session"
+        )
+
+    target_kind = data.get("result_manifest_target_kind")
+    if target_kind != session.target.kind.value:
+        raise PublicationError(
+            "pending journal result manifest target kind does not match the publication session"
+        )
+    result_manifest_path = _journal_artifact_path(
+        session,
+        data.get("result_manifest_path"),
+        field="result manifest target path",
+    )
+    if result_manifest_path != session.target.path:
+        raise PublicationError(
+            "pending journal result manifest target path does not match the publication session"
+        )
+
+    data_candidate_path = _journal_artifact_path(
+        session, data.get("data_candidate_path"), field="data candidate path"
+    )
+    manifest_candidate_path = _journal_artifact_path(
+        session,
+        data.get("manifest_candidate_path"),
+        field="manifest candidate path",
+    )
+    _validate_journal_candidate_path(
+        data_candidate_path, final_output, label="data candidate"
+    )
+    _validate_journal_candidate_path(
+        manifest_candidate_path,
+        result_manifest_path,
+        label="manifest candidate",
+    )
+
+    data_candidate_sha256 = _journal_sha256(
+        data.get("data_candidate_sha256"), field="data candidate hash"
+    )
+    manifest_candidate_sha256 = _journal_sha256(
+        data.get("manifest_candidate_sha256"), field="manifest candidate hash"
+    )
+    previous_output_sha256 = _journal_sha256(
+        data.get("previous_output_sha256"),
+        field="previous output hash",
+        allow_none=True,
+    )
+    previous_manifest_sha256 = _journal_sha256(
+        data.get("previous_manifest_sha256"),
+        field="previous manifest hash",
+        allow_none=True,
+    )
+    backup_sha256 = _journal_sha256(
+        data.get("backup_sha256"), field="backup hash", allow_none=True
+    )
+    backup_value = data.get("backup_path")
+    backup_path = (
+        None
+        if backup_value is None
+        else _journal_artifact_path(session, backup_value, field="backup path")
+    )
+
+    backup_identity = (
+        previous_output_sha256,
+        backup_path,
+        backup_sha256,
+    )
+    first_publish = all(value is None for value in backup_identity)
+    if not first_publish and any(value is None for value in backup_identity):
+        raise PublicationError("pending journal backup identity is incomplete")
+    if not first_publish:
+        expected_backup_directory = session.work_dir / "backups" / "collect"
+        expected_backup = expected_backup_directory / (
+            f"{session.final_output.stem}.{transaction_id}{session.final_output.suffix}"
+        )
+        if (
+            expected_backup.parent != expected_backup_directory
+            or backup_path != expected_backup
+        ):
+            raise PublicationError(
+                "pending journal backup path does not match its transaction"
+            )
+
+    return _PendingJournal(
+        record=dict(data),
+        transaction_id=transaction_id,
+        final_output=final_output,
+        data_candidate_path=data_candidate_path,
+        data_candidate_sha256=data_candidate_sha256,
+        result_manifest_path=result_manifest_path,
+        manifest_candidate_path=manifest_candidate_path,
+        manifest_candidate_sha256=manifest_candidate_sha256,
+        previous_output_sha256=previous_output_sha256,
+        previous_manifest_sha256=previous_manifest_sha256,
+        backup_path=backup_path,
+        backup_sha256=backup_sha256,
+        first_publish=first_publish,
+    )
+
+
+def _recovery_artifact_sha256(path: Path, *, label: str) -> str | None:
+    try:
+        return _optional_file_sha256(path)
+    except (OSError, PublicationError) as exc:
+        raise PublicationError(f"could not verify recovery {label}: {exc}") from exc
+
+
+def _validate_pending_backup(journal: _PendingJournal) -> None:
+    if journal.first_publish:
+        return
+    if journal.backup_sha256 != journal.previous_output_sha256:
+        raise PublicationError(
+            "pending transaction backup hash does not match previous output"
+        )
+    assert journal.backup_path is not None
+    observed = _recovery_artifact_sha256(journal.backup_path, label="backup")
+    if observed != journal.previous_output_sha256:
+        raise PublicationError(
+            "pending transaction backup is missing or its bytes have changed"
+        )
+
+
+def _classify_pending_data(
+    session: PublicationSession, journal: _PendingJournal
+) -> str:
+    observed = session.previous_output_sha256
+    previous = journal.previous_output_sha256
+    candidate = journal.data_candidate_sha256
+    if observed == previous:
+        if previous == candidate:
+            candidate_observed = _recovery_artifact_sha256(
+                journal.data_candidate_path, label="data candidate"
+            )
+            if candidate_observed is None:
+                return "candidate"
+            if candidate_observed != candidate:
+                raise PublicationError(
+                    "pending transaction data candidate hash does not match the journal"
+                )
+        return "previous"
+    if observed == candidate:
+        return "candidate"
+    return "external"
+
+
+def _classify_pending_manifest(
+    session: PublicationSession, journal: _PendingJournal
+) -> str:
+    observed = session.previous_manifest_sha256
+    previous = journal.previous_manifest_sha256
+    candidate = journal.manifest_candidate_sha256
+    if observed == previous and observed == candidate:
+        raise PublicationError(
+            "pending transaction manifest state is ambiguous between previous and candidate"
+        )
+    if observed == previous:
+        return "previous"
+    if observed == candidate:
+        return "candidate"
+    return "external"
+
+
+def _require_recovery_candidate(
+    path: Path, expected_sha256: str, *, label: str
+) -> None:
+    observed = _recovery_artifact_sha256(path, label=label)
+    if observed != expected_sha256:
+        raise PublicationError(
+            f"pending transaction {label} is missing or its hash does not match"
+        )
+
+
+def _recovery_manifest_collect(
+    session: PublicationSession, path: Path, *, label: str
+) -> Mapping[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise PublicationError(f"could not read recovery {label}: {exc}") from exc
+
+    if session.target.kind == ResultManifestTargetKind.CURRENT_STAGE:
+        try:
+            manifest = validate_current_manifest_text(
+                text,
+                work_dir=session.work_dir,
+                stage=session.stage,
+                path=path,
+            )
+        except ValueError as exc:
+            raise PublicationError(f"invalid recovery {label}: {exc}") from exc
+        collect = manifest.collect
+    else:
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise PublicationError(f"invalid recovery {label}: {exc}") from exc
+        if not isinstance(data, Mapping):
+            raise PublicationError(f"recovery {label} data must be a mapping")
+        if (
+            data.get("schema_version") != _COMPATIBILITY_SCHEMA_VERSION
+            or data.get("kind") != _COMPATIBILITY_KIND
+            or data.get("stage") != "md"
+        ):
+            raise PublicationError(
+                f"recovery {label} compatibility identity does not match"
+            )
+        collect = data.get("collect")
+
+    if not isinstance(collect, Mapping):
+        raise PublicationError(f"recovery {label} collect data must be a mapping")
+    return collect
+
+
+def _validate_recovery_manifest(
+    session: PublicationSession,
+    journal: _PendingJournal,
+    path: Path,
+    *,
+    label: str,
+) -> None:
+    collect = _recovery_manifest_collect(session, path, label=label)
+    if collect.get("transaction_id") != journal.transaction_id:
+        raise PublicationError(
+            f"recovery {label} transaction ID does not match the pending journal"
+        )
+    if collect.get("output_sha256") != journal.data_candidate_sha256:
+        raise PublicationError(
+            f"recovery {label} data hash does not match the pending journal"
+        )
+
+
+def _replace_recovery_candidate(
+    candidate: Path,
+    destination: Path,
+    expected_sha256: str,
+    *,
+    label: str,
+) -> None:
+    try:
+        os.replace(candidate, destination)
+        atomic_io.fsync_directory(destination.parent)
+        observed = atomic_io.sha256_file(destination)
+    except Exception as exc:
+        raise PublicationError(f"recovery {label} replacement failed: {exc}") from exc
+    if observed != expected_sha256:
+        raise PublicationError(
+            f"recovery {label} hash does not match after replacement"
+        )
+
+
+def _commit_pending_recovery(
+    session: PublicationSession, journal: _PendingJournal
+) -> PublicationResult:
+    committed = dict(journal.record)
+    committed["state"] = "committed"
+    try:
+        _publish_journal(session.journal_path, committed)
+        session.journal_path.unlink()
+        atomic_io.fsync_directory(session.journal_path.parent)
+    except Exception as exc:
+        raise PublicationError(f"could not commit recovered transaction: {exc}") from exc
+
+    return PublicationResult(
+        transaction_id=journal.transaction_id,
+        final_output=journal.final_output,
+        data_sha256=journal.data_candidate_sha256,
+        result_manifest_target_kind=session.target.kind,
+        result_manifest_path=journal.result_manifest_path,
+        manifest_sha256=journal.manifest_candidate_sha256,
+        previous_output_sha256=journal.previous_output_sha256,
+        backup_path=journal.backup_path,
+        backup_sha256=journal.backup_sha256,
+    )
+
+
 def _recover_existing_journal(
     session: PublicationSession,
 ) -> PublicationResult | None:
-    if session.journal_path.exists():
+    if not session.journal_path.exists():
+        return None
+
+    journal = _load_pending_journal(session)
+    _validate_pending_backup(journal)
+    data_state = _classify_pending_data(session, journal)
+    manifest_state = _classify_pending_manifest(session, journal)
+
+    if data_state == "external":
         raise PublicationError(
-            "an existing collection journal requires deterministic recovery"
+            "pending recovery found external data or an invalid empty output state"
         )
-    return None
+    if manifest_state == "external":
+        raise PublicationError(
+            "pending recovery found an external manifest or invalid manifest absence"
+        )
+
+    if data_state == "previous" and manifest_state == "previous":
+        _require_recovery_candidate(
+            journal.data_candidate_path,
+            journal.data_candidate_sha256,
+            label="data candidate",
+        )
+        _require_recovery_candidate(
+            journal.manifest_candidate_path,
+            journal.manifest_candidate_sha256,
+            label="manifest candidate",
+        )
+        _validate_recovery_manifest(
+            session,
+            journal,
+            journal.manifest_candidate_path,
+            label="manifest candidate",
+        )
+        _replace_recovery_candidate(
+            journal.data_candidate_path,
+            journal.final_output,
+            journal.data_candidate_sha256,
+            label="data",
+        )
+        _replace_recovery_candidate(
+            journal.manifest_candidate_path,
+            journal.result_manifest_path,
+            journal.manifest_candidate_sha256,
+            label="manifest",
+        )
+        _validate_recovery_manifest(
+            session,
+            journal,
+            journal.result_manifest_path,
+            label="published manifest",
+        )
+        return _commit_pending_recovery(session, journal)
+
+    if data_state == "candidate" and manifest_state == "previous":
+        _require_recovery_candidate(
+            journal.manifest_candidate_path,
+            journal.manifest_candidate_sha256,
+            label="manifest candidate",
+        )
+        _validate_recovery_manifest(
+            session,
+            journal,
+            journal.manifest_candidate_path,
+            label="manifest candidate",
+        )
+        _replace_recovery_candidate(
+            journal.manifest_candidate_path,
+            journal.result_manifest_path,
+            journal.manifest_candidate_sha256,
+            label="manifest",
+        )
+        _validate_recovery_manifest(
+            session,
+            journal,
+            journal.result_manifest_path,
+            label="published manifest",
+        )
+        return _commit_pending_recovery(session, journal)
+
+    if data_state == "candidate" and manifest_state == "candidate":
+        _validate_recovery_manifest(
+            session,
+            journal,
+            journal.result_manifest_path,
+            label="published manifest",
+        )
+        return _commit_pending_recovery(session, journal)
+
+    if data_state == "previous" and manifest_state == "candidate":
+        raise PublicationError(
+            "pending recovery found an impossible manifest-before-data state"
+        )
+
+    raise PublicationError(
+        f"pending recovery state is unsupported: data={data_state}, "
+        f"manifest={manifest_state}"
+    )

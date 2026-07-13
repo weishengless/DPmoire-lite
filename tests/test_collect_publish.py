@@ -237,6 +237,173 @@ def _write_previous_output(request) -> bytes:
     return request.final_output.read_bytes()
 
 
+def _journal_artifact_path(work_dir: Path, value: str | None) -> Path | None:
+    return None if value is None else work_dir / Path(value)
+
+
+def _write_case_journal(case, journal) -> None:
+    case["journal"] = journal
+    case["journal_path"].write_text(
+        yaml.safe_dump(journal, sort_keys=False),
+        encoding="utf-8",
+        newline="",
+    )
+
+
+def _replace_test_bytes(path: Path, payload: bytes) -> None:
+    replacement = path.parent / f".{path.name}.test-replacement"
+    replacement.write_bytes(payload)
+    os.replace(replacement, path)
+
+
+def _case_snapshot(case):
+    paths = {
+        case["request"].final_output,
+        case["request"].target.path,
+        case["journal_path"],
+        case["data_candidate"],
+        case["manifest_candidate"],
+    }
+    if case["backup_path"] is not None:
+        paths.add(case["backup_path"])
+    return {
+        path: path.read_bytes() if path.exists() else None
+        for path in paths
+        if path is not None
+    }
+
+
+def _assert_case_unchanged(snapshot) -> None:
+    for path, expected in snapshot.items():
+        observed = path.read_bytes() if path.exists() else None
+        assert observed == expected, path
+
+
+def _interrupt_pending_transaction(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    boundary: str,
+    first_publish: bool,
+    target_kind: str = "current",
+):
+    api = _publication_api()
+    request = _request(tmp_path, target_kind=target_kind)
+    if not first_publish:
+        _write_previous_output(request)
+
+    with monkeypatch.context() as patch:
+        if boundary in {"before_data_replace", "before_manifest_replace"}:
+            real_replace = os.replace
+            blocked_destination = (
+                request.final_output
+                if boundary == "before_data_replace"
+                else request.target.path
+            )
+
+            def interrupting_replace(source, destination, *args, **kwargs):
+                if Path(destination) == blocked_destination:
+                    raise OSError(f"synthetic interruption at {boundary}")
+                return real_replace(source, destination, *args, **kwargs)
+
+            patch.setattr(api.os, "replace", interrupting_replace)
+        elif boundary == "before_committed":
+            real_publish_journal = api._publish_journal
+
+            def interrupting_publish_journal(path, record):
+                if record["state"] == "committed":
+                    raise OSError("synthetic interruption at before_committed")
+                return real_publish_journal(path, record)
+
+            patch.setattr(api, "_publish_journal", interrupting_publish_journal)
+        else:
+            raise AssertionError(f"unknown interruption boundary: {boundary}")
+
+        with pytest.raises(api.PublicationError, match="synthetic interruption"):
+            with api.PublicationSession(
+                work_dir=request.work_dir,
+                stage=request.stage,
+                final_output=request.final_output,
+                target=request.target,
+            ) as session:
+                session.publish(_request_for_session(request, session))
+
+    journal_path = _journal_path(request.final_output)
+    journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+    case = {
+        "api": api,
+        "request": request,
+        "journal_path": journal_path,
+        "journal": journal,
+        "data_candidate": _journal_artifact_path(
+            request.work_dir, journal["data_candidate_path"]
+        ),
+        "manifest_candidate": _journal_artifact_path(
+            request.work_dir, journal["manifest_candidate_path"]
+        ),
+        "backup_path": _journal_artifact_path(
+            request.work_dir, journal["backup_path"]
+        ),
+        "first_publish": first_publish,
+    }
+    assert case["data_candidate"] is not None
+    assert case["manifest_candidate"] is not None
+    return case
+
+
+def _arrange_recovery_row(case, mutation: str | None) -> None:
+    if mutation is None:
+        return
+    request = case["request"]
+    if mutation == "restore_previous_data":
+        if case["first_publish"]:
+            request.final_output.unlink()
+        else:
+            assert case["backup_path"] is not None
+            _replace_test_bytes(
+                request.final_output, case["backup_path"].read_bytes()
+            )
+    elif mutation == "external_data":
+        _replace_test_bytes(request.final_output, b"external data mutation\n")
+    elif mutation == "external_manifest":
+        _replace_test_bytes(request.target.path, b"external manifest mutation\n")
+    elif mutation == "remove_data_candidate":
+        case["data_candidate"].unlink()
+    elif mutation == "remove_manifest_candidate":
+        case["manifest_candidate"].unlink()
+    else:
+        raise AssertionError(f"unknown recovery mutation: {mutation}")
+
+
+def _recover_case(case):
+    api = case["api"]
+    request = case["request"]
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        result = session.recovered_result
+        assert isinstance(result, api.PublicationResult)
+        with pytest.raises(api.PublicationError, match="recovered transaction"):
+            session.publish(_request_for_session(request, session))
+
+    assert result.transaction_id == case["journal"]["transaction_id"]
+    assert result.final_output == request.final_output
+    assert result.data_sha256 == case["journal"]["data_candidate_sha256"]
+    assert result.result_manifest_target_kind == request.target.kind
+    assert result.result_manifest_path == request.target.path
+    assert result.manifest_sha256 == case["journal"]["manifest_candidate_sha256"]
+    assert atomic_io.sha256_file(request.final_output) == result.data_sha256
+    assert atomic_io.sha256_file(request.target.path) == result.manifest_sha256
+    manifest = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+    assert manifest["collect"]["transaction_id"] == result.transaction_id
+    assert manifest["collect"]["output_sha256"] == result.data_sha256
+    assert not case["journal_path"].exists()
+    return result
+
+
 def test_data_candidate_written_in_final_directory_and_fsynced(tmp_path, monkeypatch):
     api = _api()
     request = _request(tmp_path)
@@ -1160,3 +1327,292 @@ def test_normal_publish_supports_compatibility_result_manifest(tmp_path):
     assert data["collect"]["output_sha256"] == result.data_sha256
     assert legacy_manifest.read_bytes() == legacy_bytes
     assert not journal_path.exists()
+
+
+def _assert_recovery_fatal(case, match: str) -> None:
+    api = case["api"]
+    request = case["request"]
+    snapshot = _case_snapshot(case)
+    with pytest.raises(api.PublicationError, match=match):
+        with api.PublicationSession(
+            work_dir=request.work_dir,
+            stage=request.stage,
+            final_output=request.final_output,
+            target=request.target,
+        ):
+            pass
+    _assert_case_unchanged(snapshot)
+
+
+@pytest.mark.parametrize(
+    "boundary,first_publish,mutation,error_pattern",
+    (
+        pytest.param(
+            "before_data_replace",
+            False,
+            None,
+            None,
+            id="previous_previous_candidates_complete",
+        ),
+        pytest.param(
+            "before_manifest_replace",
+            False,
+            None,
+            None,
+            id="candidate_previous_manifest_candidate_complete",
+        ),
+        pytest.param(
+            "before_committed",
+            False,
+            None,
+            None,
+            id="candidate_candidate_manifest_verify_commit",
+        ),
+        pytest.param(
+            "before_committed",
+            False,
+            "restore_previous_data",
+            "impossible",
+            id="previous_candidate_manifest_impossible_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            False,
+            "external_data",
+            "external data",
+            id="external_data_x_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            False,
+            "external_manifest",
+            "external manifest",
+            id="external_manifest_x_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            False,
+            "remove_data_candidate",
+            "data candidate",
+            id="missing_required_candidate_before_data_replace_fatal",
+        ),
+        pytest.param(
+            "before_manifest_replace",
+            False,
+            "remove_manifest_candidate",
+            "manifest candidate",
+            id="missing_manifest_candidate_after_data_replace_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            True,
+            None,
+            None,
+            id="first_empty_previous_candidates_complete",
+        ),
+        pytest.param(
+            "before_manifest_replace",
+            True,
+            None,
+            None,
+            id="first_candidate_previous_manifest_candidate_complete",
+        ),
+        pytest.param(
+            "before_committed",
+            True,
+            None,
+            None,
+            id="first_candidate_candidate_manifest_verify_commit",
+        ),
+        pytest.param(
+            "before_committed",
+            True,
+            "restore_previous_data",
+            "impossible",
+            id="first_empty_candidate_manifest_impossible_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            True,
+            "external_data",
+            "external data",
+            id="first_external_data_x_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            True,
+            "external_manifest",
+            "external manifest",
+            id="first_external_manifest_x_fatal",
+        ),
+        pytest.param(
+            "before_data_replace",
+            True,
+            "remove_data_candidate",
+            "data candidate",
+            id="first_missing_required_candidate_before_data_replace_fatal",
+        ),
+        pytest.param(
+            "before_manifest_replace",
+            True,
+            "remove_manifest_candidate",
+            "manifest candidate",
+            id="first_missing_manifest_candidate_after_data_replace_fatal",
+        ),
+    ),
+)
+def test_pending_recovery_state_table(
+    tmp_path,
+    monkeypatch,
+    boundary,
+    first_publish,
+    mutation,
+    error_pattern,
+):
+    case = _interrupt_pending_transaction(
+        tmp_path,
+        monkeypatch,
+        boundary=boundary,
+        first_publish=first_publish,
+    )
+    _arrange_recovery_row(case, mutation)
+
+    if error_pattern is None:
+        _recover_case(case)
+    else:
+        _assert_recovery_fatal(case, error_pattern)
+
+
+@pytest.mark.parametrize("damage", ("missing", "journal-hash", "changed-bytes"))
+def test_nonfirst_pending_requires_valid_backup(tmp_path, monkeypatch, damage):
+    case = _interrupt_pending_transaction(
+        tmp_path,
+        monkeypatch,
+        boundary="before_data_replace",
+        first_publish=False,
+    )
+    backup_path = case["backup_path"]
+    assert backup_path is not None
+    if damage == "missing":
+        backup_path.unlink()
+    elif damage == "journal-hash":
+        journal = dict(case["journal"])
+        journal["backup_sha256"] = "f" * 64
+        _write_case_journal(case, journal)
+    elif damage == "changed-bytes":
+        _replace_test_bytes(backup_path, b"changed backup bytes\n")
+    else:
+        raise AssertionError(damage)
+
+    _assert_recovery_fatal(case, "backup")
+
+
+def test_recovery_never_guesses_rollback_or_continue(tmp_path, monkeypatch):
+    case = _interrupt_pending_transaction(
+        tmp_path,
+        monkeypatch,
+        boundary="before_committed",
+        first_publish=True,
+    )
+    manifest = yaml.safe_load(
+        case["request"].target.path.read_text(encoding="utf-8")
+    )
+    manifest["collect"]["transaction_id"] = "tampered-transaction"
+    tampered = yaml.safe_dump(manifest, sort_keys=False).encode("utf-8")
+    _replace_test_bytes(case["request"].target.path, tampered)
+    journal = dict(case["journal"])
+    journal["manifest_candidate_sha256"] = atomic_io.sha256_file(
+        case["request"].target.path
+    )
+    _write_case_journal(case, journal)
+
+    _assert_recovery_fatal(case, "transaction")
+
+
+def test_fatal_recovery_preserves_journal_and_backup(tmp_path, monkeypatch):
+    case = _interrupt_pending_transaction(
+        tmp_path,
+        monkeypatch,
+        boundary="before_data_replace",
+        first_publish=False,
+    )
+    assert case["backup_path"] is not None
+    assert case["backup_path"].is_file()
+    case["data_candidate"].write_bytes(b"corrupt candidate bytes\n")
+
+    _assert_recovery_fatal(case, "data candidate")
+
+
+@pytest.mark.parametrize(
+    "target_kind,boundary",
+    (
+        pytest.param("current", "before_data_replace", id="current-before-data"),
+        pytest.param("current", "before_manifest_replace", id="current-before-manifest"),
+        pytest.param("current", "before_committed", id="current-before-commit"),
+        pytest.param(
+            "compatibility", "before_data_replace", id="compatibility-before-data"
+        ),
+        pytest.param(
+            "compatibility",
+            "before_manifest_replace",
+            id="compatibility-before-manifest",
+        ),
+        pytest.param(
+            "compatibility", "before_committed", id="compatibility-before-commit"
+        ),
+    ),
+)
+def test_recovery_state_table_is_identical_for_both_manifest_targets(
+    tmp_path, monkeypatch, target_kind, boundary
+):
+    case = _interrupt_pending_transaction(
+        tmp_path,
+        monkeypatch,
+        boundary=boundary,
+        first_publish=True,
+        target_kind=target_kind,
+    )
+
+    result = _recover_case(case)
+
+    assert result.result_manifest_target_kind == case["request"].target.kind
+    assert result.result_manifest_path == case["request"].target.path
+
+
+@pytest.mark.parametrize(
+    "field,value,error_pattern",
+    (
+        pytest.param(
+            "result_manifest_target_kind",
+            "md-compatibility",
+            "target kind",
+            id="changed-kind",
+        ),
+        pytest.param(
+            "result_manifest_path",
+            "MD_data.collect.yaml",
+            "target path",
+            id="changed-path",
+        ),
+        pytest.param(
+            "result_manifest_path",
+            "../outside.yaml",
+            "target path|outside",
+            id="escaping-path",
+        ),
+    ),
+)
+def test_recovery_rejects_changed_manifest_target_kind_or_path(
+    tmp_path, monkeypatch, field, value, error_pattern
+):
+    case = _interrupt_pending_transaction(
+        tmp_path,
+        monkeypatch,
+        boundary="before_data_replace",
+        first_publish=True,
+    )
+    journal = dict(case["journal"])
+    journal[field] = value
+    _write_case_journal(case, journal)
+
+    _assert_recovery_fatal(case, error_pattern)
