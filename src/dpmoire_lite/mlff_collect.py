@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+import re
 
 from ase import Atoms
 
 from .collect_models import (
     DedupStats,
+    MLFFCollectMode,
+    SourceInventory,
     SourceDedupStats,
     _validate_relative_source_path,
 )
 from .dataset import atoms_from_mlab_configuration
+from .manifest import MANIFEST_SCHEMA_VERSION, Manifest, ManifestReadResult
 from .mlab import MlabConfiguration, MlabIdentity, config_identity
+from .paths import relative_to_workdir
+
+
+_MISSING_SCAN_WARNING = (
+    "MD manifest is missing; full-dedup used a bounded direct-child legacy scan "
+    "with unknown source coverage."
+)
+_NATURAL_TOKEN_RE = re.compile(r"(\d+)")
 
 
 @dataclass(frozen=True)
@@ -121,6 +135,134 @@ def fold_exact_configurations(sources) -> ExactDedupFoldResult:
         accepted_configurations=tuple(accepted_configurations),
         accepted_frames=tuple(accepted_frames),
         stats=stats,
+    )
+
+
+def build_mlff_source_inventory(
+    *,
+    work_dir: Path,
+    mode: MLFFCollectMode,
+    manifest: ManifestReadResult,
+) -> SourceInventory:
+    if not isinstance(mode, MLFFCollectMode):
+        raise TypeError("mode must be an MLFFCollectMode")
+
+    _validate_manifest_wrapper(manifest)
+
+    if manifest.kind == "current":
+        current_manifest = manifest.manifest
+        if not isinstance(current_manifest, Manifest):
+            raise ValueError("current manifest result must contain a Manifest")
+        return SourceInventory(
+            manifest_kind="current",
+            directory_discovery="declared",
+            directories=current_manifest.directories,
+            coverage_known=True,
+        )
+
+    if manifest.kind == "legacy":
+        raw_data = manifest.raw_data
+        if not isinstance(raw_data, Mapping):
+            raise ValueError("legacy manifest result must contain raw mapping data")
+        directories = raw_data.get("directories", ())
+        if not isinstance(directories, (list, tuple)):
+            raise ValueError(
+                "legacy manifest directories must be a sequence"
+            )
+        return SourceInventory(
+            manifest_kind="legacy",
+            directory_discovery="declared",
+            directories=directories,
+            coverage_known=True,
+        )
+
+    if mode is MLFFCollectMode.SEED_AWARE:
+        raise ValueError("missing MD manifest cannot be used for seed-aware")
+    return _scan_missing_inventory(Path(work_dir))
+
+
+def _validate_manifest_wrapper(manifest: ManifestReadResult) -> None:
+    if not isinstance(manifest, ManifestReadResult):
+        raise TypeError("manifest must be a ManifestReadResult")
+
+    if manifest.kind not in {"current", "legacy", "missing"}:
+        raise ValueError("manifest has an unknown kind")
+
+    if manifest.kind == "current":
+        if not isinstance(manifest.manifest, Manifest):
+            raise ValueError("current manifest result must contain a Manifest")
+        if not isinstance(manifest.raw_data, Mapping):
+            raise ValueError("current manifest result must contain raw mapping data")
+        if manifest.manifest.schema_version != MANIFEST_SCHEMA_VERSION:
+            raise ValueError("current manifest must use the current schema")
+        if manifest.manifest.stage != "md":
+            raise ValueError("current manifest stage must be md")
+        if manifest.raw_data.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+            raise ValueError("current manifest raw schema is inconsistent")
+        if manifest.raw_data.get("stage") != "md":
+            raise ValueError("current manifest raw stage is inconsistent")
+        return
+
+    if manifest.kind == "legacy":
+        if manifest.manifest is not None:
+            raise ValueError("legacy manifest result must not contain a Manifest")
+        if not isinstance(manifest.raw_data, Mapping):
+            raise ValueError("legacy manifest result must contain raw mapping data")
+        if "stage" in manifest.raw_data and manifest.raw_data["stage"] != "md":
+            raise ValueError("legacy manifest stage must be md")
+        return
+
+    if manifest.manifest is not None or manifest.raw_data is not None:
+        raise ValueError("missing manifest result must contain no manifest data")
+
+
+def _scan_missing_inventory(work_dir: Path) -> SourceInventory:
+    md_root = work_dir / "md"
+    _inventory_relative_path(work_dir, md_root)
+
+    if not md_root.exists():
+        return _missing_scan_inventory(())
+    if not md_root.is_dir():
+        raise NotADirectoryError(md_root)
+
+    selected: list[tuple[str, str]] = []
+    for child in md_root.iterdir():
+        _inventory_relative_path(work_dir, child)
+        if not child.is_dir():
+            continue
+
+        candidate = child / "ML_ABN"
+        _inventory_relative_path(work_dir, candidate)
+        if candidate.is_file():
+            selected.append(
+                (child.name, _inventory_relative_path(work_dir, child))
+            )
+
+    selected.sort(key=lambda item: (_natural_name_key(item[0]), item[0]))
+    return _missing_scan_inventory(tuple(relative_path for _, relative_path in selected))
+
+
+def _missing_scan_inventory(directories: tuple[str, ...]) -> SourceInventory:
+    return SourceInventory(
+        manifest_kind="missing",
+        directory_discovery="legacy-scan",
+        directories=directories,
+        coverage_known=False,
+        warnings=(_MISSING_SCAN_WARNING,),
+    )
+
+
+def _inventory_relative_path(work_dir: Path, path: Path) -> str:
+    try:
+        return relative_to_workdir(work_dir, path)
+    except ValueError as exc:
+        raise ValueError(f"path escapes work_dir: {path}") from exc
+
+
+def _natural_name_key(name: str):
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in _NATURAL_TOKEN_RE.split(name)
     )
 
 

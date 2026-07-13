@@ -4,10 +4,18 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from dpmoire_lite import collect_models as models
 from dpmoire_lite import dataset as dataset_module
+from dpmoire_lite.manifest import (
+    Manifest,
+    ManifestReadResult,
+    read_manifest,
+    write_manifest,
+)
 from dpmoire_lite.mlab import config_identity, parse_mlab
+from dpmoire_lite.paths import manifest_path
 
 
 def _require(name):
@@ -25,11 +33,44 @@ def _exact_fold_api():
     return module, fold
 
 
+def _inventory_api():
+    module = import_module("dpmoire_lite.mlff_collect")
+    builder = getattr(module, "build_mlff_source_inventory", None)
+    assert callable(builder), "build_mlff_source_inventory is not implemented"
+    return builder
+
+
 _MLAB_FIXTURE_DIR = Path(__file__).parent / "data" / "mlab"
+_MISSING_SCAN_WARNING = (
+    "MD manifest is missing; full-dedup used a bounded direct-child legacy scan "
+    "with unknown source coverage."
+)
 
 
 def _fixture_configuration(name: str):
     return parse_mlab(_MLAB_FIXTURE_DIR / name).configurations[0]
+
+
+def _write_legacy_md_manifest(work_dir: Path, directories: list[str]) -> Path:
+    path = manifest_path(work_dir, "md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "stage": "md",
+                "generated_at": "2026-07-13T12:00:00",
+                "directories": directories,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_placeholder_mlabn(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("synthetic inventory placeholder\n", encoding="utf-8")
 
 
 def test_mlff_collect_mode_values_are_stable():
@@ -414,3 +455,294 @@ def test_identity_called_once_per_accepted_complete_configuration(monkeypatch):
     assert result.stats.unique == 2
     assert result.stats.duplicates_removed == 1
     assert len(result.accepted_frames) == 2
+
+
+def test_current_manifest_inventory_uses_declared_order(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    directories = ["md/0_10", "md/0_2", "md/0_2", "md/0_1"]
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="md",
+            generated_at="2026-07-13T12:00:00",
+            directories=directories,
+        ),
+    )
+    manifest_file = manifest_path(work_dir, "md")
+    original_bytes = manifest_file.read_bytes()
+    _write_placeholder_mlabn(work_dir / "md" / "decoy" / "ML_ABN")
+
+    manifest = read_manifest(work_dir, "md")
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.SEED_AWARE,
+        manifest=manifest,
+    )
+
+    assert manifest.kind == "current"
+    assert inventory.manifest_kind == "current"
+    assert inventory.directory_discovery == "declared"
+    assert inventory.coverage_known is True
+    assert inventory.directories == tuple(directories)
+    assert inventory.warnings == ()
+    assert "md/decoy" not in inventory.directories
+    assert manifest_file.read_bytes() == original_bytes
+
+
+def test_legacy_manifest_inventory_uses_validated_declared_order(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    directories = ["md/0_10", "md/0_2", "md/0_2", "md/0_1"]
+    manifest_file = _write_legacy_md_manifest(work_dir, directories)
+    original_bytes = manifest_file.read_bytes()
+    _write_placeholder_mlabn(work_dir / "md" / "scan-decoy" / "ML_ABN")
+
+    manifest = read_manifest(work_dir, "md")
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.SEED_AWARE,
+        manifest=manifest,
+    )
+
+    assert manifest.kind == "legacy"
+    assert manifest.manifest is None
+    assert inventory.manifest_kind == "legacy"
+    assert inventory.directory_discovery == "declared"
+    assert inventory.coverage_known is True
+    assert inventory.directories == tuple(directories)
+    assert inventory.warnings == ()
+    assert "md/scan-decoy" not in inventory.directories
+    assert manifest_file.read_bytes() == original_bytes
+
+
+def test_missing_manifest_is_rejected_for_seed_aware(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    _write_placeholder_mlabn(work_dir / "md" / "0_0" / "ML_ABN")
+    manifest = read_manifest(work_dir, "md")
+
+    assert manifest.kind == "missing"
+    with pytest.raises(ValueError):
+        build_inventory(
+            work_dir=work_dir,
+            mode=models.MLFFCollectMode.SEED_AWARE,
+            manifest=manifest,
+        )
+    assert not manifest_path(work_dir, "md").exists()
+
+
+def test_missing_manifest_full_dedup_scans_direct_md_children(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    for name in ("0_10", "0_2", "0_1"):
+        _write_placeholder_mlabn(work_dir / "md" / name / "ML_ABN")
+    manifest = read_manifest(work_dir, "md")
+
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+
+    assert inventory.manifest_kind == "missing"
+    assert inventory.directory_discovery == "legacy-scan"
+    assert inventory.coverage_known is False
+    assert inventory.directories == ("md/0_1", "md/0_2", "md/0_10")
+    assert not manifest_path(work_dir, "md").exists()
+
+
+def test_legacy_scan_uses_natural_order(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    for name in ("0_10", "0_2", "0_1"):
+        _write_placeholder_mlabn(work_dir / "md" / name / "ML_ABN")
+    manifest = read_manifest(work_dir, "md")
+
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+
+    assert inventory.directories == ("md/0_1", "md/0_2", "md/0_10")
+
+
+def test_legacy_scan_accepts_named_monolayer_directory(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    _write_placeholder_mlabn(work_dir / "md" / "monolayer" / "ML_ABN")
+    manifest = read_manifest(work_dir, "md")
+
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+
+    assert inventory.directories == ("md/monolayer",)
+
+
+def test_legacy_scan_requires_exact_mlabn_filename(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    md_root = work_dir / "md"
+    _write_placeholder_mlabn(md_root / "only-ml-ab" / "ML_AB")
+    _write_placeholder_mlabn(md_root / "suffix-zero" / "ML_ABN0")
+    _write_placeholder_mlabn(md_root / "suffix-one" / "ML_ABN1")
+    _write_placeholder_mlabn(md_root / "backup" / "ML_ABN.bak")
+    (md_root / "mlabn-directory" / "ML_ABN").mkdir(parents=True)
+    _write_placeholder_mlabn(md_root / "legal" / "ML_ABN")
+    manifest = read_manifest(work_dir, "md")
+
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+
+    assert inventory.directories == ("md/legal",)
+
+
+def test_legacy_scan_ignores_files_backups_and_nested_descendants(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    md_root = work_dir / "md"
+    md_root.mkdir(parents=True, exist_ok=True)
+    (md_root / "root-ML_ABN").write_text("not a directory\n", encoding="utf-8")
+    (md_root / "backup.extxyz").write_text("backup\n", encoding="utf-8")
+    _write_placeholder_mlabn(md_root / "outer" / "nested" / "ML_ABN")
+    _write_placeholder_mlabn(md_root / "legal" / "ML_ABN")
+    manifest = read_manifest(work_dir, "md")
+
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+
+    assert inventory.directories == ("md/legal",)
+
+
+def test_legacy_scan_rejects_resolved_path_escape(tmp_path, monkeypatch):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    escaped_directory = work_dir / "md" / "escaped"
+    escaped_mlabn = escaped_directory / "ML_ABN"
+    _write_placeholder_mlabn(escaped_mlabn)
+    manifest = read_manifest(work_dir, "md")
+    outside = (tmp_path / "outside").resolve()
+    real_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        if path in {escaped_directory, escaped_mlabn}:
+            return outside / path.name
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    with pytest.raises(ValueError, match="work_dir|escape"):
+        build_inventory(
+            work_dir=work_dir,
+            mode=models.MLFFCollectMode.FULL_DEDUP,
+            manifest=manifest,
+        )
+
+
+def test_invalid_or_unsupported_manifest_never_falls_back_to_scan(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "work"
+    _write_placeholder_mlabn(work_dir / "md" / "direct" / "ML_ABN")
+    manifest_file = manifest_path(work_dir, "md")
+    manifest_file.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest_file.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "stage": "md",
+                "directories": "md/direct",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        read_manifest(work_dir, "md")
+
+    manifest_file.write_text(
+        yaml.safe_dump(
+            {"schema_version": 99, "stage": "md", "directories": []},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        read_manifest(work_dir, "md")
+
+    with pytest.raises(ValueError):
+        build_inventory(
+            work_dir=work_dir,
+            mode=models.MLFFCollectMode.FULL_DEDUP,
+            manifest=ManifestReadResult(kind="unknown"),
+        )
+    with pytest.raises(ValueError):
+        build_inventory(
+            work_dir=work_dir,
+            mode=models.MLFFCollectMode.FULL_DEDUP,
+            manifest=ManifestReadResult(
+                kind="current",
+                manifest=None,
+                raw_data={"schema_version": 2, "stage": "md"},
+            ),
+        )
+    with pytest.raises(ValueError, match="directories.*sequence"):
+        build_inventory(
+            work_dir=work_dir,
+            mode=models.MLFFCollectMode.FULL_DEDUP,
+            manifest=ManifestReadResult(
+                kind="legacy",
+                manifest=None,
+                raw_data={
+                    "stage": "md",
+                    "directories": {"md/direct": True},
+                },
+            ),
+        )
+
+
+def test_missing_scan_marks_coverage_unknown_and_records_warning(tmp_path):
+    build_inventory = _inventory_api()
+
+    work_dir = tmp_path / "missing-work"
+    manifest = read_manifest(work_dir, "md")
+    before = tuple(
+        sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    )
+
+    inventory = build_inventory(
+        work_dir=work_dir,
+        mode=models.MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+
+    after = tuple(
+        sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    )
+    assert inventory.directories == ()
+    assert inventory.manifest_kind == "missing"
+    assert inventory.directory_discovery == "legacy-scan"
+    assert inventory.coverage_known is False
+    assert inventory.warnings == (_MISSING_SCAN_WARNING,)
+    assert not manifest_path(work_dir, "md").exists()
+    assert before == after
