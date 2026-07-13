@@ -9,8 +9,14 @@ import warnings
 from ase.io import ParseError
 
 from .config import DPmoireLiteConfig, load_config
-from .collect_models import SourceKind, SourceResult, SourceStatus
-from .dataset import Dataset, count_ml_ab_configs
+from .collect_models import (
+    CollectionCandidate,
+    SourceKind,
+    SourceResult,
+    SourceStatus,
+    _validate_relative_source_path,
+)
+from .dataset import Dataset, atoms_from_mlab_configuration, count_ml_ab_configs
 from .manifest import Manifest, ManifestReadResult, read_manifest, write_manifest
 from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
 from .outcar import (
@@ -272,6 +278,196 @@ def collect_outcar_source(
         **common,
         status=SourceStatus.COMPLETE,
         accepted_frames=tuple(sampled_frames),
+    )
+
+
+def build_seed_aware_candidate(
+    *,
+    config: DPmoireLiteConfig,
+    stage: str,
+    manifest: ManifestReadResult,
+) -> CollectionCandidate:
+    if not isinstance(config, DPmoireLiteConfig):
+        raise TypeError("config must be a DPmoireLiteConfig")
+    if not isinstance(stage, str) or stage not in COLLECT_OUTPUTS:
+        raise ValueError(f"Unknown collect stage: {stage!r}")
+
+    expected_directories = _candidate_manifest_directories(
+        manifest,
+        stage=stage,
+    )
+    is_mlab_mode = stage == "md" and config.vasp_ml
+    if is_mlab_mode and manifest.kind == "current":
+        current_manifest = manifest.manifest
+        if current_manifest is None:
+            raise ValueError("current manifest result has no Manifest")
+        _current_seed_evidence(current_manifest)
+
+    work_dir = Path(config.work_dir)
+    source_results: list[SourceResult] = []
+    accepted_frames = []
+    source_kind = SourceKind.MLAB if is_mlab_mode else SourceKind.OUTCAR
+    outcar_freq = 1 if stage == "validation" else config.outcar_collect_freq
+
+    for declared_directory in expected_directories:
+        directory = _candidate_directory_path(work_dir, declared_directory)
+        if not directory.is_dir():
+            source_results.append(
+                _skipped_candidate_source(
+                    declared_directory,
+                    source_kind,
+                    f"Missing declared directory: {declared_directory}",
+                )
+            )
+            continue
+
+        if is_mlab_mode:
+            source_path = directory / "ML_ABN"
+            relative_source_path = f"{declared_directory}/ML_ABN"
+            if not source_path.is_file():
+                source_results.append(
+                    _skipped_candidate_source(
+                        relative_source_path,
+                        SourceKind.MLAB,
+                        f"Missing ML_ABN source: {relative_source_path}",
+                    )
+                )
+                continue
+
+            if manifest.kind == "current":
+                current_manifest = manifest.manifest
+                if current_manifest is None:
+                    raise ValueError("current manifest result has no Manifest")
+                source_result = collect_current_mlab_source(
+                    work_dir=work_dir,
+                    source_path=source_path,
+                    manifest=current_manifest,
+                )
+            else:
+                source_result = collect_legacy_mlab_source(
+                    work_dir=work_dir,
+                    source_path=source_path,
+                    manifest=manifest,
+                )
+            source_results.append(source_result)
+            _append_candidate_payload(source_result, accepted_frames)
+            continue
+
+        selections = find_outcar_series(directory, config.outcar_patterns)
+        if not selections:
+            source_results.append(
+                _skipped_candidate_source(
+                    declared_directory,
+                    SourceKind.OUTCAR,
+                    "No configured OUTCAR match in declared directory: "
+                    f"{declared_directory}",
+                )
+            )
+            continue
+
+        for selection in selections:
+            source_result = collect_outcar_source(
+                work_dir=work_dir,
+                selection=selection,
+                freq=outcar_freq,
+            )
+            source_results.append(source_result)
+            _append_candidate_payload(source_result, accepted_frames)
+
+    return CollectionCandidate(
+        source_results=tuple(source_results),
+        accepted_frames=tuple(accepted_frames),
+        expected_directories=expected_directories,
+    )
+
+
+def _candidate_manifest_directories(
+    manifest: ManifestReadResult,
+    *,
+    stage: str,
+) -> tuple[str, ...]:
+    if not isinstance(manifest, ManifestReadResult):
+        raise TypeError("manifest must be a ManifestReadResult")
+
+    if manifest.kind == "current":
+        current_manifest = manifest.manifest
+        if not isinstance(current_manifest, Manifest):
+            raise ValueError("current manifest result has no valid Manifest")
+        if not isinstance(manifest.raw_data, Mapping):
+            raise ValueError("current manifest result has no raw manifest data")
+        if current_manifest.schema_version != 2:
+            raise ValueError("current manifest must use schema_version 2")
+        if current_manifest.stage != stage:
+            raise ValueError(
+                f"current manifest stage {current_manifest.stage!r} does not "
+                f"match requested stage {stage!r}"
+            )
+        raw_schema_version = manifest.raw_data.get("schema_version")
+        raw_stage = manifest.raw_data.get("stage")
+        if raw_schema_version != 2 or raw_stage != current_manifest.stage:
+            raise ValueError("current manifest result is internally inconsistent")
+        directories = current_manifest.directories
+    elif manifest.kind == "legacy":
+        if manifest.manifest is not None or not isinstance(
+            manifest.raw_data,
+            Mapping,
+        ):
+            raise ValueError("legacy manifest result is internally inconsistent")
+        raw_stage = manifest.raw_data.get("stage")
+        if raw_stage is not None and raw_stage != stage:
+            raise ValueError(
+                f"legacy manifest stage {raw_stage!r} does not match "
+                f"requested stage {stage!r}"
+            )
+        directories = manifest.raw_data.get("directories", [])
+    else:
+        raise ValueError(
+            "manifest must be a current or legacy ManifestReadResult"
+        )
+
+    if not isinstance(directories, (list, tuple)):
+        raise ValueError("manifest directories must be a sequence")
+    normalized_directories = tuple(directories)
+    for directory in normalized_directories:
+        _validate_relative_source_path(directory)
+    return normalized_directories
+
+
+def _candidate_directory_path(work_dir: Path, relative_directory: str) -> Path:
+    directory = Path(work_dir) / relative_directory
+    relative_to_workdir(work_dir, directory)
+    return directory
+
+
+def _skipped_candidate_source(
+    source_path: str,
+    source_kind: SourceKind,
+    reason: str,
+) -> SourceResult:
+    return SourceResult(
+        source_path=source_path,
+        source_kind=source_kind,
+        status=SourceStatus.SKIPPED,
+        complete_count=0,
+        reason=reason,
+    )
+
+
+def _append_candidate_payload(
+    source_result: SourceResult,
+    accepted_frames: list,
+) -> None:
+    if source_result.status not in {
+        SourceStatus.COMPLETE,
+        SourceStatus.PARTIAL,
+    }:
+        return
+    if source_result.source_kind is SourceKind.OUTCAR:
+        accepted_frames.extend(source_result.accepted_frames)
+        return
+    accepted_frames.extend(
+        atoms_from_mlab_configuration(configuration)
+        for configuration in source_result.parsed_configurations
     )
 
 

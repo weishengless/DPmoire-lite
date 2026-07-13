@@ -160,6 +160,7 @@ class SourceResult:
 class CollectionCandidate:
     source_results: tuple[SourceResult, ...]
     accepted_frames: tuple[Atoms, ...]
+    expected_directories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         source_results = tuple(self.source_results)
@@ -171,6 +172,9 @@ class CollectionCandidate:
         frames = tuple(copy.deepcopy(frame) for frame in self.accepted_frames)
         if any(not isinstance(frame, Atoms) for frame in frames):
             raise TypeError("accepted_frames must contain only ASE Atoms")
+        expected_directories = tuple(self.expected_directories)
+        for directory in expected_directories:
+            _validate_relative_source_path(directory)
 
         object.__setattr__(
             self,
@@ -178,6 +182,7 @@ class CollectionCandidate:
             tuple(copy.deepcopy(source_result) for source_result in source_results),
         )
         object.__setattr__(self, "accepted_frames", frames)
+        object.__setattr__(self, "expected_directories", expected_directories)
 
         source_accepted_count = sum(
             source_result.accepted_count for source_result in source_results
@@ -191,6 +196,42 @@ class CollectionCandidate:
     @property
     def frame_count(self) -> int:
         return len(self.accepted_frames)
+
+    @property
+    def expected_directory_count(self) -> int:
+        return len(self.expected_directories)
+
+    @property
+    def sources_complete(self) -> int:
+        return sum(
+            source_result.status is SourceStatus.COMPLETE
+            for source_result in self.source_results
+        )
+
+    @property
+    def sources_partial(self) -> int:
+        return sum(
+            source_result.status is SourceStatus.PARTIAL
+            for source_result in self.source_results
+        )
+
+    @property
+    def sources_skipped(self) -> int:
+        return sum(
+            source_result.status is SourceStatus.SKIPPED
+            for source_result in self.source_results
+        )
+
+    @property
+    def sources_failed(self) -> int:
+        return sum(
+            source_result.status is SourceStatus.FAILED
+            for source_result in self.source_results
+        )
+
+    @property
+    def sources_attempted(self) -> int:
+        return self.sources_complete + self.sources_partial + self.sources_failed
 
 
 def _validate_relative_source_path(source_path: str) -> None:

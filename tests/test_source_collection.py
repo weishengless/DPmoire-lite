@@ -12,8 +12,9 @@ from ase.units import GPa
 
 from dpmoire_lite import collect as collect_module
 from dpmoire_lite import collect_models as models
+from dpmoire_lite.config import load_config
 from dpmoire_lite import dataset as dataset_module
-from dpmoire_lite.manifest import Manifest, read_manifest
+from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
 from dpmoire_lite.mlab import (
     MlabConfiguration,
     MlabIdentity,
@@ -1141,3 +1142,514 @@ def test_outcar_source_records_pattern_index_and_order(tmp_path):
     assert result.pattern == selection.pattern
     assert result.pattern_index == selection.pattern_index
     assert result.order == selection.order
+
+
+def _build_seed_aware_candidate_api():
+    builder = getattr(
+        collect_module,
+        "build_seed_aware_candidate",
+        None,
+    )
+    assert callable(
+        builder
+    ), "build_seed_aware_candidate is not implemented"
+    return builder
+
+
+def _task6_config(
+    tmp_path: Path,
+    *,
+    vasp_ml: bool,
+    outcar_collect_freq: int = 1,
+    outcar_patterns: tuple[str, ...] = (r"^OUTCAR$",),
+):
+    root = tmp_path / "config-root"
+    input_dir = root / "input"
+    script_dir = root / "scripts"
+    potcar_dir = root / "potcars"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    potcar_dir.mkdir(parents=True, exist_ok=True)
+    config_path = root / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "dft_script": "DFT_script.sh",
+                "potcar_dir": str(potcar_dir),
+                "script_dir": str(script_dir),
+                "input_dir": str(input_dir),
+                "work_dir": str(tmp_path / "work"),
+                "n_nodes": 1,
+                "stage": 0,
+                "submit": False,
+                "auto_resub": False,
+                "vasp_ml": vasp_ml,
+                "outcar_collect_freq": outcar_collect_freq,
+                "do_relaxation": True,
+                "init_mlff": True,
+                "sc_rlx": True,
+                "n_sectors": [1, 1],
+                "sc": [1, 1],
+                "d": 4.0,
+                "k_mesh": 20,
+                "encut_factor": 1.5,
+                "r_cut": -1,
+                "symm_reduce": False,
+                "twist_val": False,
+                "min_val_n": 4,
+                "max_val_n": 5,
+                "include_monolayer_md": False,
+                "outcar_patterns": list(outcar_patterns),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return load_config(config_path)
+
+
+def _task6_current_manifest(
+    work_dir: Path,
+    stage: str,
+    directories: list[str],
+    *,
+    seed_fixture: str | None = None,
+):
+    mlff_seed = {}
+    if seed_fixture is not None:
+        parsed_seed = parse_mlab(_mlab_fixture_path(seed_fixture))
+        seed_identity = seed_prefix_identity(parsed_seed.configurations)
+        mlff_seed = {
+            "source": "init_mlff/ML_ABN",
+            "configurations": len(parsed_seed.configurations),
+            "digest_schema": "mlab-seed-v1",
+            "seed_prefix_sha256": seed_identity.sha256,
+            "ml_ab_sha256": hashlib.sha256(b"synthetic-ML_AB").hexdigest(),
+            "ml_ff_sha256": hashlib.sha256(b"synthetic-ML_FF").hexdigest(),
+        }
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage=stage,
+            generated_at="2026-07-13T00:00:00+00:00",
+            directories=list(directories),
+            mlff_seed=mlff_seed,
+        ),
+    )
+    result = read_manifest(work_dir, stage)
+    assert result.kind == "current"
+    assert result.manifest is not None
+    return result
+
+
+def _task6_legacy_manifest(
+    work_dir: Path,
+    stage: str,
+    directories: list[str],
+):
+    path = manifest_path(work_dir, stage)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "stage": stage,
+                "directories": list(directories),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    result = read_manifest(work_dir, stage)
+    assert result.kind == "legacy"
+    assert result.manifest is None
+    assert isinstance(result.raw_data, dict)
+    return result
+
+
+def _task6_file_snapshot(work_dir: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(work_dir).as_posix(): path.read_bytes()
+        for path in work_dir.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_candidate_uses_manifest_directories_only(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    declared = work_dir / "rlx" / "declared"
+    undeclared = work_dir / "rlx" / "undeclared"
+    declared.mkdir(parents=True)
+    undeclared.mkdir(parents=True)
+    fixture = _outcar_fixture_path("complete_two_frame.OUTCAR")
+    shutil.copy2(fixture, declared / "OUTCAR")
+    shutil.copy2(fixture, undeclared / "OUTCAR")
+    manifest = _task6_legacy_manifest(work_dir, "rlx", ["rlx/declared"])
+    config = _task6_config(tmp_path, vasp_ml=False)
+
+    candidate = builder(config=config, stage="rlx", manifest=manifest)
+
+    assert candidate.expected_directories == ("rlx/declared",)
+    assert candidate.expected_directory_count == 1
+    assert tuple(
+        source_result.source_path for source_result in candidate.source_results
+    ) == ("rlx/declared/OUTCAR",)
+    assert "rlx/undeclared/OUTCAR" not in {
+        source_result.source_path for source_result in candidate.source_results
+    }
+    assert candidate.frame_count == 2
+
+
+def test_missing_directory_and_file_are_skipped_with_reason(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    (work_dir / "md" / "empty").mkdir(parents=True)
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        ["md/missing", "md/empty"],
+        seed_fixture="complete_vasp_651.mlab",
+    )
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    candidate = builder(config=config, stage="md", manifest=manifest)
+
+    assert candidate.expected_directory_count == 2
+    assert candidate.sources_skipped == 2
+    assert tuple(
+        source_result.source_path for source_result in candidate.source_results
+    ) == ("md/missing", "md/empty/ML_ABN")
+    assert all(
+        source_result.status is models.SourceStatus.SKIPPED
+        for source_result in candidate.source_results
+    )
+    assert "missing" in candidate.source_results[0].reason.lower()
+    assert "ml_abn" in candidate.source_results[1].reason.lower()
+    assert candidate.accepted_frames == ()
+
+
+def test_candidate_preserves_outcar_selection_order(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    first = work_dir / "rlx" / "directory_b"
+    second = work_dir / "rlx" / "directory_a"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    fixture = _outcar_fixture_path("complete_two_frame.OUTCAR")
+    shutil.copy2(fixture, first / "OUTCAR10")
+    shutil.copy2(fixture, first / "OUTCAR2")
+    shutil.copy2(fixture, second / "OUTCAR")
+    manifest = _task6_current_manifest(
+        work_dir,
+        "rlx",
+        ["rlx/directory_b", "rlx/directory_a"],
+    )
+    config = _task6_config(
+        tmp_path,
+        vasp_ml=False,
+        outcar_patterns=(r"^OUTCAR\d+$", r"^OUTCAR$"),
+    )
+
+    candidate = builder(config=config, stage="rlx", manifest=manifest)
+
+    assert tuple(
+        (
+            source_result.source_path,
+            source_result.pattern,
+            source_result.pattern_index,
+            source_result.order,
+        )
+        for source_result in candidate.source_results
+    ) == (
+        ("rlx/directory_b/OUTCAR2", r"^OUTCAR\d+$", 0, 0),
+        ("rlx/directory_b/OUTCAR10", r"^OUTCAR\d+$", 0, 1),
+        ("rlx/directory_a/OUTCAR", r"^OUTCAR$", 1, 0),
+    )
+
+
+def test_candidate_counts_all_source_statuses(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    directories = [
+        "rlx/complete",
+        "rlx/partial",
+        "rlx/failed",
+        "rlx/no-match",
+    ]
+    fixture_names = {
+        "complete": "complete_two_frame.OUTCAR",
+        "partial": "tail_truncated_second_frame.OUTCAR",
+        "failed": "internal_corruption_second_frame.OUTCAR",
+    }
+    for directory, fixture_name in fixture_names.items():
+        target_dir = work_dir / "rlx" / directory
+        target_dir.mkdir(parents=True)
+        shutil.copy2(
+            _outcar_fixture_path(fixture_name),
+            target_dir / "OUTCAR",
+        )
+    (work_dir / "rlx" / "no-match").mkdir(parents=True)
+    manifest = _task6_current_manifest(work_dir, "rlx", directories)
+    config = _task6_config(tmp_path, vasp_ml=False)
+
+    candidate = builder(config=config, stage="rlx", manifest=manifest)
+
+    assert candidate.expected_directory_count == 4
+    assert candidate.sources_attempted == 3
+    assert candidate.sources_complete == 1
+    assert candidate.sources_partial == 1
+    assert candidate.sources_skipped == 1
+    assert candidate.sources_failed == 1
+    assert tuple(
+        source_result.status for source_result in candidate.source_results
+    ) == (
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.PARTIAL,
+        models.SourceStatus.FAILED,
+        models.SourceStatus.SKIPPED,
+    )
+    skipped_result = candidate.source_results[-1]
+    assert skipped_result.source_path == "rlx/no-match"
+    assert skipped_result.reason is not None
+    assert "outcar" in skipped_result.reason.lower()
+    assert any(
+        marker in skipped_result.reason.lower()
+        for marker in ("match", "found", "no file")
+    )
+
+
+def test_candidate_frames_equal_complete_plus_partial_contributions(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    complete_text = _mlab_fixture_path("complete_multi.mlab").read_text(
+        encoding="utf-8"
+    )
+    tail_text = _mlab_fixture_path("tail_position_crop.mlab").read_text(
+        encoding="utf-8"
+    )
+    tail_block = tail_text[tail_text.index("Configuration num.      2") :].replace(
+        "Configuration num.      2", "Configuration num.      3", 1
+    )
+    partial_text = (
+        _replace_declared_count(complete_text, 3).rstrip()
+        + "\n"
+        + tail_block
+    )
+
+    for layout in ("current", "legacy"):
+        layout_root = tmp_path / layout
+        work_dir = layout_root / "work"
+        complete_dir = work_dir / "md" / "0_0"
+        partial_dir = work_dir / "md" / "0_1"
+        complete_dir.mkdir(parents=True)
+        partial_dir.mkdir(parents=True)
+        shutil.copy2(
+            _mlab_fixture_path("complete_multi.mlab"),
+            complete_dir / "ML_ABN",
+        )
+        (partial_dir / "ML_ABN").write_text(
+            partial_text,
+            encoding="utf-8",
+        )
+
+        if layout == "current":
+            manifest = _task6_current_manifest(
+                work_dir,
+                "md",
+                ["md/0_0", "md/0_1"],
+                seed_fixture="complete_vasp_651.mlab",
+            )
+        else:
+            seed_path = work_dir / "init_mlff" / "ML_ABN"
+            seed_path.parent.mkdir(parents=True)
+            shutil.copy2(
+                _mlab_fixture_path("complete_vasp_651.mlab"),
+                seed_path,
+            )
+            manifest = _task6_legacy_manifest(
+                work_dir,
+                "md",
+                ["md/0_0", "md/0_1"],
+            )
+        config = _task6_config(layout_root, vasp_ml=True)
+
+        if layout == "legacy":
+            with pytest.warns(UserWarning) as observed:
+                candidate = builder(
+                    config=config,
+                    stage="md",
+                    manifest=manifest,
+                )
+            assert len(observed) == 2
+            assert all(
+                "legacy" in str(item.message).lower() for item in observed
+            )
+        else:
+            with warnings.catch_warnings(record=True) as observed:
+                warnings.simplefilter("always")
+                candidate = builder(
+                    config=config,
+                    stage="md",
+                    manifest=manifest,
+                )
+            assert not observed
+
+        assert tuple(
+            source_result.source_path for source_result in candidate.source_results
+        ) == ("md/0_0/ML_ABN", "md/0_1/ML_ABN")
+        assert tuple(
+            source_result.status for source_result in candidate.source_results
+        ) == (
+            models.SourceStatus.COMPLETE,
+            models.SourceStatus.PARTIAL,
+        )
+        assert tuple(
+            source_result.accepted_count
+            for source_result in candidate.source_results
+        ) == (1, 1)
+        assert tuple(
+            tuple(
+                configuration.source_configuration_number
+                for configuration in source_result.parsed_configurations
+            )
+            for source_result in candidate.source_results
+        ) == ((2,), (2,))
+        assert candidate.frame_count == sum(
+            source_result.accepted_count
+            for source_result in candidate.source_results
+        ) == 2
+        for frame, source_result in zip(
+            candidate.accepted_frames,
+            candidate.source_results,
+            strict=True,
+        ):
+            expected = dataset_module.atoms_from_mlab_configuration(
+                source_result.parsed_configurations[0]
+            )
+            assert frame.get_chemical_symbols() == expected.get_chemical_symbols()
+            np.testing.assert_allclose(frame.cell.array, expected.cell.array)
+            np.testing.assert_allclose(frame.positions, expected.positions)
+            assert frame.get_potential_energy() == pytest.approx(
+                expected.get_potential_energy()
+            )
+            np.testing.assert_allclose(frame.get_forces(), expected.get_forces())
+
+
+def test_failed_sources_contribute_zero_frames(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    complete_dir = work_dir / "rlx" / "complete"
+    failed_dir = work_dir / "rlx" / "failed"
+    complete_dir.mkdir(parents=True)
+    failed_dir.mkdir(parents=True)
+    shutil.copy2(
+        _outcar_fixture_path("complete_two_frame.OUTCAR"),
+        complete_dir / "OUTCAR",
+    )
+    shutil.copy2(
+        _outcar_fixture_path("internal_corruption_second_frame.OUTCAR"),
+        failed_dir / "OUTCAR",
+    )
+    manifest = _task6_current_manifest(
+        work_dir,
+        "rlx",
+        ["rlx/complete", "rlx/failed"],
+    )
+    config = _task6_config(tmp_path, vasp_ml=False)
+
+    candidate = builder(config=config, stage="rlx", manifest=manifest)
+
+    assert candidate.frame_count == 2
+    assert candidate.sources_complete == 1
+    assert candidate.sources_failed == 1
+    failed_result = candidate.source_results[1]
+    assert failed_result.status is models.SourceStatus.FAILED
+    assert failed_result.complete_count == 1
+    assert failed_result.accepted_frames == ()
+    assert failed_result.accepted_count == 0
+
+
+def test_candidate_does_not_fuzzy_deduplicate_similar_frames(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    directories = ["md/0_0", "md/0_1", "md/0_2"]
+    for directory in directories:
+        (work_dir / directory).mkdir(parents=True)
+    for directory in directories[:2]:
+        shutil.copy2(
+            _mlab_fixture_path("complete_multi.mlab"),
+            work_dir / directory / "ML_ABN",
+        )
+    similar_text = _mlab_fixture_path("complete_multi.mlab").read_text(
+        encoding="utf-8"
+    ).replace(
+        "1.100000000000000E+000",
+        "1.100100000000000E+000",
+        1,
+    )
+    (work_dir / "md" / "0_2" / "ML_ABN").write_text(
+        similar_text,
+        encoding="utf-8",
+    )
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        directories,
+        seed_fixture="complete_vasp_651.mlab",
+    )
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    candidate = builder(config=config, stage="md", manifest=manifest)
+
+    assert tuple(
+        source_result.source_path for source_result in candidate.source_results
+    ) == tuple(f"{directory}/ML_ABN" for directory in directories)
+    assert tuple(
+        source_result.status for source_result in candidate.source_results
+    ) == (models.SourceStatus.COMPLETE,) * 3
+    assert tuple(
+        source_result.accepted_count for source_result in candidate.source_results
+    ) == (1, 1, 1)
+    assert candidate.frame_count == 3
+    np.testing.assert_allclose(
+        candidate.accepted_frames[0].positions,
+        candidate.accepted_frames[1].positions,
+    )
+    assert (
+        candidate.accepted_frames[0].get_chemical_symbols()
+        == candidate.accepted_frames[1].get_chemical_symbols()
+    )
+    assert candidate.accepted_frames[0].get_potential_energy() == pytest.approx(
+        candidate.accepted_frames[1].get_potential_energy()
+    )
+    assert not np.array_equal(
+        candidate.accepted_frames[0].positions,
+        candidate.accepted_frames[2].positions,
+    )
+
+
+def test_candidate_creation_does_not_write_output_or_manifest(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    source_dir = work_dir / "rlx" / "0_0"
+    source_dir.mkdir(parents=True)
+    shutil.copy2(
+        _outcar_fixture_path("complete_two_frame.OUTCAR"),
+        source_dir / "OUTCAR",
+    )
+    manifest = _task6_current_manifest(work_dir, "rlx", ["rlx/0_0"])
+    output = work_dir / "rlx_data.extxyz"
+    output.write_bytes(b"existing-output")
+    journal = work_dir / "journal.json"
+    journal.write_bytes(b"existing-journal")
+    candidate_dir = work_dir / "candidates"
+    candidate_dir.mkdir()
+    (candidate_dir / "candidate.tmp").write_bytes(b"existing-candidate")
+    backup_dir = work_dir / "backups"
+    backup_dir.mkdir()
+    (backup_dir / "old.extxyz").write_bytes(b"existing-backup")
+    before = _task6_file_snapshot(work_dir)
+    config = _task6_config(tmp_path, vasp_ml=False)
+
+    builder(config=config, stage="rlx", manifest=manifest)
+
+    assert _task6_file_snapshot(work_dir) == before
