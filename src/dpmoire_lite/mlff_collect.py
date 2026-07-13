@@ -13,6 +13,9 @@ from .collect_models import (
     MLFFCollectMode,
     SourceInventory,
     SourceDedupStats,
+    SourceKind,
+    SourceResult,
+    SourceStatus,
     _validate_relative_source_path,
 )
 from .dataset import atoms_from_mlab_configuration
@@ -63,6 +66,61 @@ class ExactDedupFoldResult:
 
         object.__setattr__(self, "accepted_configurations", configurations)
         object.__setattr__(self, "accepted_frames", frames)
+
+
+@dataclass(frozen=True)
+class FullDedupSourceFoldResult:
+    source_results: tuple[SourceResult, ...]
+    dedup: ExactDedupFoldResult
+
+    def __post_init__(self) -> None:
+        source_results = _normalize_tuple(
+            "source_results",
+            self.source_results,
+        )
+        if any(not isinstance(result, SourceResult) for result in source_results):
+            raise TypeError("source_results must contain only SourceResult values")
+        for result in source_results:
+            if result.source_kind is not SourceKind.MLAB:
+                raise ValueError("source_results must contain only MLAB sources")
+            if result.status not in {
+                SourceStatus.COMPLETE,
+                SourceStatus.PARTIAL,
+                SourceStatus.FAILED,
+            }:
+                raise ValueError(
+                    "source_results must contain only finalized source statuses"
+                )
+
+        if not isinstance(self.dedup, ExactDedupFoldResult):
+            raise TypeError("dedup must be an ExactDedupFoldResult")
+
+        per_source = self.dedup.stats.per_source
+        if len(per_source) != len(source_results):
+            raise ValueError(
+                "dedup per-source stats must align with source_results"
+            )
+        for result, stats in zip(source_results, per_source, strict=True):
+            if stats.source_path != result.source_path:
+                raise ValueError(
+                    "dedup per-source paths must align with source_results"
+                )
+            if result.status is SourceStatus.FAILED:
+                if (stats.seen, stats.retained, stats.duplicates_removed) != (
+                    0,
+                    0,
+                    0,
+                ):
+                    raise ValueError(
+                        "failed sources must have zero dedup statistics"
+                    )
+            elif stats.seen != result.accepted_count:
+                raise ValueError(
+                    "complete and partial source seen counts must equal "
+                    "accepted_count"
+                )
+
+        object.__setattr__(self, "source_results", source_results)
 
 
 def fold_exact_configurations(sources) -> ExactDedupFoldResult:

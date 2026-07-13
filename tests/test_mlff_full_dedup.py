@@ -1,11 +1,13 @@
 from dataclasses import replace
 from importlib import import_module, util
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pytest
 import yaml
 
+from dpmoire_lite import collect as collect_module
 from dpmoire_lite import collect_models as models
 from dpmoire_lite import dataset as dataset_module
 from dpmoire_lite.manifest import (
@@ -40,6 +42,18 @@ def _inventory_api():
     return builder
 
 
+def _full_dedup_source_api():
+    collector = getattr(
+        collect_module,
+        "collect_full_dedup_mlab_sources",
+        None,
+    )
+    assert callable(
+        collector
+    ), "collect_full_dedup_mlab_sources is not implemented"
+    return collector
+
+
 _MLAB_FIXTURE_DIR = Path(__file__).parent / "data" / "mlab"
 _MISSING_SCAN_WARNING = (
     "MD manifest is missing; full-dedup used a bounded direct-child legacy scan "
@@ -71,6 +85,18 @@ def _write_legacy_md_manifest(work_dir: Path, directories: list[str]) -> Path:
 def _write_placeholder_mlabn(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("synthetic inventory placeholder\n", encoding="utf-8")
+
+
+def _copy_mlab_source(
+    work_dir: Path,
+    source_name: str,
+    fixture_name: str,
+    filename: str = "ML_ABN",
+) -> Path:
+    path = work_dir / "md" / source_name / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(_MLAB_FIXTURE_DIR / fixture_name, path)
+    return path
 
 
 def test_mlff_collect_mode_values_are_stable():
@@ -746,3 +772,395 @@ def test_missing_scan_marks_coverage_unknown_and_records_warning(tmp_path):
     assert inventory.warnings == (_MISSING_SCAN_WARNING,)
     assert not manifest_path(work_dir, "md").exists()
     assert before == after
+
+
+def test_full_dedup_complete_source_commits_unique_configurations(tmp_path):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    final_path = _copy_mlab_source(
+        work_dir,
+        "complete",
+        "complete_multi.mlab",
+    )
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(final_path,),
+    )
+
+    source_result = result.source_results[0]
+    assert [item.source_path for item in result.source_results] == [
+        "md/complete/ML_ABN"
+    ]
+    assert source_result.status is models.SourceStatus.COMPLETE
+    assert source_result.complete_count == 2
+    assert source_result.accepted_count == 2
+    assert len(source_result.parsed_configurations) == 2
+    assert result.dedup.accepted_configurations == (
+        source_result.parsed_configurations
+    )
+    assert len(result.dedup.accepted_frames) == 2
+    assert isinstance(
+        result.dedup,
+        import_module("dpmoire_lite.mlff_collect").ExactDedupFoldResult,
+    )
+
+    stats = result.dedup.stats
+    assert (stats.seen, stats.unique, stats.duplicates_removed) == (2, 2, 0)
+    assert stats.candidate_frame_count == 2
+    per_source = stats.per_source[0]
+    assert per_source.source_path == source_result.source_path
+    assert (per_source.seen, per_source.retained, per_source.duplicates_removed) == (
+        2,
+        2,
+        0,
+    )
+
+
+def test_full_dedup_partial_source_commits_only_complete_prefix(tmp_path):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    final_path = _copy_mlab_source(
+        work_dir,
+        "partial",
+        "tail_position_crop.mlab",
+    )
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(final_path,),
+    )
+
+    source_result = result.source_results[0]
+    assert source_result.status is models.SourceStatus.PARTIAL
+    assert source_result.complete_count == 1
+    assert source_result.accepted_count == 1
+    assert len(source_result.parsed_configurations) == 1
+    assert source_result.discarded_configuration_number == 2
+    assert source_result.discarded_block == "positions"
+    assert source_result.reason
+    assert result.dedup.accepted_configurations == (
+        source_result.parsed_configurations
+    )
+    assert (result.dedup.stats.seen, result.dedup.stats.unique) == (1, 1)
+    assert result.dedup.stats.duplicates_removed == 0
+    assert result.dedup.stats.per_source[0].source_path == source_result.source_path
+    assert (
+        result.dedup.stats.per_source[0].seen,
+        result.dedup.stats.per_source[0].retained,
+        result.dedup.stats.per_source[0].duplicates_removed,
+    ) == (1, 1, 0)
+
+
+def test_full_dedup_failed_source_commits_no_frames_or_identities(
+    tmp_path,
+    monkeypatch,
+):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    module = import_module("dpmoire_lite.mlff_collect")
+    real_identity = module.config_identity
+    identity_calls = []
+
+    def spy(configuration):
+        identity_calls.append(configuration)
+        return real_identity(configuration)
+
+    monkeypatch.setattr(module, "config_identity", spy)
+    work_dir = tmp_path / "work"
+    final_path = _copy_mlab_source(
+        work_dir,
+        "failed",
+        "internal_corruption.mlab",
+    )
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(final_path,),
+    )
+
+    source_result = result.source_results[0]
+    assert source_result.status is models.SourceStatus.FAILED
+    assert source_result.complete_count == 0
+    assert source_result.accepted_count == 0
+    assert source_result.parsed_configurations == ()
+    assert source_result.accepted_frames == ()
+    assert source_result.reason
+    assert identity_calls == []
+    assert len(result.dedup.accepted_frames) == 0
+    assert len(result.dedup.accepted_configurations) == 0
+    assert (
+        result.dedup.stats.seen,
+        result.dedup.stats.unique,
+        result.dedup.stats.duplicates_removed,
+        result.dedup.stats.candidate_frame_count,
+    ) == (0, 0, 0, 0)
+    assert result.dedup.stats.per_source[0].source_path == source_result.source_path
+    assert (
+        result.dedup.stats.per_source[0].seen,
+        result.dedup.stats.per_source[0].retained,
+        result.dedup.stats.per_source[0].duplicates_removed,
+    ) == (0, 0, 0)
+
+
+def test_failed_source_identity_does_not_hide_later_valid_frame(
+    tmp_path,
+    monkeypatch,
+):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    module = import_module("dpmoire_lite.mlff_collect")
+    real_identity = module.config_identity
+    identity_calls = []
+
+    def spy(configuration):
+        identity_calls.append(configuration)
+        return real_identity(configuration)
+
+    monkeypatch.setattr(module, "config_identity", spy)
+    work_dir = tmp_path / "work"
+    failed_path = _copy_mlab_source(
+        work_dir,
+        "failed",
+        "internal_corruption.mlab",
+    )
+    valid_path = _copy_mlab_source(
+        work_dir,
+        "valid",
+        "complete_multi.mlab",
+    )
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(failed_path, valid_path),
+    )
+
+    source_results = result.source_results
+    assert [source_result.source_path for source_result in source_results] == [
+        "md/failed/ML_ABN",
+        "md/valid/ML_ABN",
+    ]
+    assert [source_result.status for source_result in source_results] == [
+        models.SourceStatus.FAILED,
+        models.SourceStatus.COMPLETE,
+    ]
+    assert len(identity_calls) == 2
+    assert source_results[0].accepted_count == 0
+    assert source_results[1].accepted_count == 2
+    assert result.dedup.accepted_configurations == (
+        source_results[1].parsed_configurations
+    )
+    assert len(result.dedup.accepted_frames) == 2
+    assert (result.dedup.stats.seen, result.dedup.stats.unique) == (2, 2)
+    assert result.dedup.stats.duplicates_removed == 0
+    assert [
+        (item.seen, item.retained, item.duplicates_removed)
+        for item in result.dedup.stats.per_source
+    ] == [(0, 0, 0), (2, 2, 0)]
+
+
+def test_full_dedup_common_seed_is_retained_once(tmp_path):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    seed_path = _copy_mlab_source(
+        work_dir,
+        "seed",
+        "complete_vasp_651.mlab",
+    )
+    restart_path = _copy_mlab_source(
+        work_dir,
+        "restart",
+        "complete_multi.mlab",
+    )
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(seed_path, restart_path),
+    )
+
+    source_results = result.source_results
+    assert [source_result.status for source_result in source_results] == [
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+    ]
+    assert [source_result.accepted_count for source_result in source_results] == [
+        1,
+        2,
+    ]
+    assert config_identity(
+        source_results[0].parsed_configurations[0]
+    ).sha256 == config_identity(source_results[1].parsed_configurations[0]).sha256
+    assert result.dedup.accepted_configurations == (
+        source_results[0].parsed_configurations[0],
+        source_results[1].parsed_configurations[1],
+    )
+    assert (
+        result.dedup.stats.seen,
+        result.dedup.stats.unique,
+        result.dedup.stats.duplicates_removed,
+    ) == (3, 2, 1)
+    assert [
+        (item.seen, item.retained, item.duplicates_removed)
+        for item in result.dedup.stats.per_source
+    ] == [(1, 1, 0), (2, 1, 1)]
+
+
+def test_full_dedup_fresh_start_retains_every_unique_final_configuration(
+    tmp_path,
+):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    final_path = _copy_mlab_source(
+        work_dir,
+        "fresh",
+        "complete_multi.mlab",
+    )
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(final_path,),
+    )
+
+    source_result = result.source_results[0]
+    assert source_result.status is models.SourceStatus.COMPLETE
+    assert source_result.complete_count == 2
+    assert source_result.accepted_count == 2
+    assert result.dedup.accepted_configurations == (
+        source_result.parsed_configurations
+    )
+    assert (
+        result.dedup.stats.seen,
+        result.dedup.stats.unique,
+        result.dedup.stats.duplicates_removed,
+    ) == (2, 2, 0)
+    assert len(result.dedup.accepted_frames) == 2
+
+
+def test_restart_time_ml_ab_count_is_never_used_by_full_dedup(
+    tmp_path,
+    monkeypatch,
+):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    final_path = _copy_mlab_source(
+        work_dir,
+        "restart",
+        "complete_multi.mlab",
+    )
+    current_ml_ab = _copy_mlab_source(
+        work_dir,
+        "restart",
+        "complete_vasp_651.mlab",
+        filename="ML_AB",
+    )
+    before = current_ml_ab.read_bytes()
+
+    def unexpected_count(*args, **kwargs):
+        raise AssertionError("full-dedup must not inspect current ML_AB")
+
+    monkeypatch.setattr(collect_module, "count_ml_ab_configs", unexpected_count)
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(final_path,),
+    )
+
+    assert result.source_results[0].status is models.SourceStatus.COMPLETE
+    assert result.source_results[0].accepted_count == 2
+    assert result.dedup.stats.seen == 2
+    assert result.dedup.stats.unique == 2
+    assert current_ml_ab.read_bytes() == before
+
+
+def test_full_dedup_reads_only_final_mlabn(tmp_path, monkeypatch):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    final_path = _copy_mlab_source(
+        work_dir,
+        "final-only",
+        "complete_multi.mlab",
+    )
+    _copy_mlab_source(
+        work_dir,
+        "final-only",
+        "complete_vasp_651.mlab",
+        filename="ML_AB",
+    )
+    _copy_mlab_source(
+        work_dir,
+        "final-only",
+        "complete_vasp_651.mlab",
+        filename="ML_ABN0",
+    )
+    _copy_mlab_source(
+        work_dir,
+        "final-only",
+        "complete_vasp_651.mlab",
+        filename="ML_ABN1",
+    )
+
+    real_parse = collect_module.parse_mlab
+    parsed_paths = []
+
+    def spy(path):
+        parsed_paths.append(Path(path))
+        return real_parse(path)
+
+    monkeypatch.setattr(collect_module, "parse_mlab", spy)
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(final_path,),
+    )
+
+    assert parsed_paths == [final_path]
+    assert result.source_results[0].source_path == "md/final-only/ML_ABN"
+    assert result.source_results[0].status is models.SourceStatus.COMPLETE
+    assert result.dedup.stats.seen == 2
+    assert result.dedup.stats.unique == 2
+
+
+def test_distinct_seed_configurations_are_retained(tmp_path):
+    collect_full_dedup_mlab_sources = _full_dedup_source_api()
+
+    work_dir = tmp_path / "work"
+    first_path = _copy_mlab_source(
+        work_dir,
+        "first",
+        "complete_vasp_641.mlab",
+    )
+    second_path = _copy_mlab_source(
+        work_dir,
+        "second",
+        "complete_vasp_651.mlab",
+    )
+    first_configuration = _fixture_configuration("complete_vasp_641.mlab")
+    second_configuration = _fixture_configuration("complete_vasp_651.mlab")
+    assert config_identity(first_configuration).sha256 != config_identity(
+        second_configuration
+    ).sha256
+
+    result = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=(first_path, second_path),
+    )
+
+    assert [source_result.source_path for source_result in result.source_results] == [
+        "md/first/ML_ABN",
+        "md/second/ML_ABN",
+    ]
+    assert [source_result.status for source_result in result.source_results] == [
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+    ]
+    assert result.dedup.accepted_configurations == (
+        result.source_results[0].parsed_configurations[0],
+        result.source_results[1].parsed_configurations[0],
+    )
+    assert (
+        result.dedup.stats.seen,
+        result.dedup.stats.unique,
+        result.dedup.stats.duplicates_removed,
+    ) == (2, 2, 0)
+    assert [
+        (item.seen, item.retained, item.duplicates_removed)
+        for item in result.dedup.stats.per_source
+    ] == [(1, 1, 0), (1, 1, 0)]

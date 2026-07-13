@@ -18,6 +18,7 @@ from .collect_models import (
 )
 from .dataset import Dataset, atoms_from_mlab_configuration, count_ml_ab_configs
 from .manifest import Manifest, ManifestReadResult, read_manifest, write_manifest
+from .mlff_collect import FullDedupSourceFoldResult, fold_exact_configurations
 from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
 from .outcar import (
     OutcarSelection,
@@ -117,6 +118,59 @@ def collect_mlab_source(*, work_dir: Path, source_path: Path) -> SourceResult:
         reason=reason,
         discarded_configuration_number=parsed.discarded_configuration_number,
         discarded_block=parsed.discarded_block,
+    )
+
+
+def collect_full_dedup_mlab_sources(
+    *,
+    work_dir: Path,
+    source_paths,
+) -> FullDedupSourceFoldResult:
+    if isinstance(source_paths, (str, bytes, bytearray)):
+        raise TypeError("source_paths must be a non-string iterable")
+    try:
+        paths = tuple(source_paths)
+    except TypeError as exc:
+        raise TypeError("source_paths must be an iterable") from exc
+    if any(not isinstance(source_path, Path) for source_path in paths):
+        raise TypeError("source_paths must contain only Path values")
+
+    for source_path in paths:
+        if source_path.name != "ML_ABN":
+            raise ValueError("full-dedup source paths must have basename ML_ABN")
+        relative_to_workdir(work_dir, source_path)
+
+    source_results: list[SourceResult] = []
+    fold_sources = []
+    for source_path in paths:
+        source_result = collect_mlab_source(
+            work_dir=work_dir,
+            source_path=source_path,
+        )
+        if not isinstance(source_result, SourceResult):
+            raise TypeError("collect_mlab_source must return a SourceResult")
+        if source_result.source_kind is not SourceKind.MLAB:
+            raise ValueError("full-dedup source result must be an MLAB source")
+        if source_result.status not in {
+            SourceStatus.COMPLETE,
+            SourceStatus.PARTIAL,
+            SourceStatus.FAILED,
+        }:
+            raise ValueError("full-dedup source result has an invalid status")
+
+        source_results.append(source_result)
+        configurations = (
+            source_result.parsed_configurations
+            if source_result.status
+            in {SourceStatus.COMPLETE, SourceStatus.PARTIAL}
+            else ()
+        )
+        fold_sources.append((source_result.source_path, configurations))
+
+    dedup = fold_exact_configurations(tuple(fold_sources))
+    return FullDedupSourceFoldResult(
+        source_results=tuple(source_results),
+        dedup=dedup,
     )
 
 
