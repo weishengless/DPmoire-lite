@@ -11,14 +11,22 @@ from ase.io import ParseError
 from .config import DPmoireLiteConfig, load_config
 from .collect_models import (
     CollectionCandidate,
+    DedupStats,
+    MLFFCollectMode,
     SourceKind,
     SourceResult,
+    SourceDedupStats,
+    SourceInventory,
     SourceStatus,
     _validate_relative_source_path,
 )
 from .dataset import Dataset, atoms_from_mlab_configuration, count_ml_ab_configs
 from .manifest import Manifest, ManifestReadResult, read_manifest, write_manifest
-from .mlff_collect import FullDedupSourceFoldResult, fold_exact_configurations
+from .mlff_collect import (
+    FullDedupSourceFoldResult,
+    build_mlff_source_inventory,
+    fold_exact_configurations,
+)
 from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
 from .outcar import (
     OutcarSelection,
@@ -171,6 +179,111 @@ def collect_full_dedup_mlab_sources(
     return FullDedupSourceFoldResult(
         source_results=tuple(source_results),
         dedup=dedup,
+    )
+
+
+def build_full_dedup_candidate(
+    *,
+    work_dir: Path,
+    manifest: ManifestReadResult,
+) -> CollectionCandidate:
+    work_dir = Path(work_dir)
+    source_inventory = build_mlff_source_inventory(
+        work_dir=work_dir,
+        mode=MLFFCollectMode.FULL_DEDUP,
+        manifest=manifest,
+    )
+    if not isinstance(source_inventory, SourceInventory):
+        raise TypeError("build_mlff_source_inventory must return a SourceInventory")
+
+    source_paths: list[Path] = []
+    inventory_slots: list[Path | None] = []
+    skipped_results: list[SourceResult | None] = []
+
+    for declared_directory in source_inventory.directories:
+        directory = _candidate_directory_path(work_dir, declared_directory)
+        if not directory.is_dir():
+            inventory_slots.append(None)
+            skipped_results.append(
+                _skipped_candidate_source(
+                    declared_directory,
+                    SourceKind.MLAB,
+                    f"Missing declared directory: {declared_directory}",
+                )
+            )
+            continue
+
+        source_path = directory / "ML_ABN"
+        relative_source_path = relative_to_workdir(work_dir, source_path)
+        if not source_path.is_file():
+            inventory_slots.append(None)
+            skipped_results.append(
+                _skipped_candidate_source(
+                    relative_source_path,
+                    SourceKind.MLAB,
+                    f"Missing ML_ABN source: {relative_source_path}",
+                )
+            )
+            continue
+
+        source_paths.append(source_path)
+        inventory_slots.append(source_path)
+        skipped_results.append(None)
+
+    folded = collect_full_dedup_mlab_sources(
+        work_dir=work_dir,
+        source_paths=tuple(source_paths),
+    )
+    if not isinstance(folded, FullDedupSourceFoldResult):
+        raise TypeError(
+            "collect_full_dedup_mlab_sources must return a "
+            "FullDedupSourceFoldResult"
+        )
+    if len(folded.source_results) != len(source_paths):
+        raise ValueError("full-dedup source results do not match source paths")
+
+    merged_source_results: list[SourceResult] = []
+    merged_per_source: list[SourceDedupStats] = []
+    folded_index = 0
+    for source_path, skipped_result in zip(
+        inventory_slots,
+        skipped_results,
+        strict=True,
+    ):
+        if source_path is None:
+            if skipped_result is None:
+                raise ValueError("missing inventory slot has no skipped result")
+            merged_source_results.append(skipped_result)
+            merged_per_source.append(
+                SourceDedupStats(
+                    source_path=skipped_result.source_path,
+                    seen=0,
+                    retained=0,
+                    duplicates_removed=0,
+                )
+            )
+            continue
+
+        source_result = folded.source_results[folded_index]
+        source_stats = folded.dedup.stats.per_source[folded_index]
+        folded_index += 1
+        merged_source_results.append(source_result)
+        merged_per_source.append(source_stats)
+
+    if folded_index != len(folded.source_results):
+        raise ValueError("not all full-dedup source results were merged")
+
+    dedup_stats = replace(
+        folded.dedup.stats,
+        per_source=tuple(merged_per_source),
+    )
+    return CollectionCandidate(
+        source_results=tuple(merged_source_results),
+        accepted_frames=folded.dedup.accepted_frames,
+        expected_directories=source_inventory.directories,
+        collection_mode=MLFFCollectMode.FULL_DEDUP,
+        source_inventory=source_inventory,
+        dedup_stats=dedup_stats,
     )
 
 

@@ -54,6 +54,18 @@ def _full_dedup_source_api():
     return collector
 
 
+def _full_dedup_candidate_api():
+    builder = getattr(
+        collect_module,
+        "build_full_dedup_candidate",
+        None,
+    )
+    assert callable(
+        builder
+    ), "build_full_dedup_candidate is not implemented"
+    return builder
+
+
 _MLAB_FIXTURE_DIR = Path(__file__).parent / "data" / "mlab"
 _MISSING_SCAN_WARNING = (
     "MD manifest is missing; full-dedup used a bounded direct-child legacy scan "
@@ -97,6 +109,16 @@ def _copy_mlab_source(
     path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(_MLAB_FIXTURE_DIR / fixture_name, path)
     return path
+
+
+def _snapshot_work_tree(work_dir: Path):
+    return {
+        path.relative_to(work_dir).as_posix(): (
+            path.is_dir(),
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in work_dir.rglob("*")
+    }
 
 
 def test_mlff_collect_mode_values_are_stable():
@@ -1164,3 +1186,361 @@ def test_distinct_seed_configurations_are_retained(tmp_path):
         (item.seen, item.retained, item.duplicates_removed)
         for item in result.dedup.stats.per_source
     ] == [(1, 1, 0), (1, 1, 0)]
+
+
+def test_full_dedup_candidate_preserves_inventory_order(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    directories = ["md/z-last", "md/a-first", "md/z-last"]
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="md",
+            generated_at="2026-07-13T12:00:00",
+            directories=directories,
+        ),
+    )
+    _copy_mlab_source(work_dir, "z-last", "complete_vasp_651.mlab")
+    _copy_mlab_source(work_dir, "a-first", "complete_vasp_651.mlab")
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=read_manifest(work_dir, "md"),
+    )
+
+    assert isinstance(candidate, models.CollectionCandidate)
+    assert candidate.expected_directories == tuple(directories)
+    assert candidate.source_inventory.directories == tuple(directories)
+    assert candidate.source_inventory.manifest_kind == "current"
+    expected_paths = (
+        "md/z-last/ML_ABN",
+        "md/a-first/ML_ABN",
+        "md/z-last/ML_ABN",
+    )
+    assert [item.source_path for item in candidate.source_results] == list(
+        expected_paths
+    )
+    assert [item.source_path for item in candidate.dedup_stats.per_source] == list(
+        expected_paths
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        replace(
+            candidate,
+            expected_directories=("md/a-first", "md/z-last", "md/z-last"),
+        )
+
+
+def test_full_dedup_candidate_counts_match_source_sums(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    directories = [
+        "md/complete",
+        "md/partial",
+        "md/failed",
+        "md/missing-dir",
+        "md/no-file",
+    ]
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="md",
+            generated_at="2026-07-13T12:00:00",
+            directories=directories,
+        ),
+    )
+    _copy_mlab_source(work_dir, "complete", "complete_multi.mlab")
+    _copy_mlab_source(work_dir, "partial", "tail_position_crop.mlab")
+    _copy_mlab_source(work_dir, "failed", "internal_corruption.mlab")
+    (work_dir / "md" / "no-file").mkdir(parents=True, exist_ok=True)
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=read_manifest(work_dir, "md"),
+    )
+    statuses = [item.status for item in candidate.source_results]
+    assert statuses == [
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.PARTIAL,
+        models.SourceStatus.FAILED,
+        models.SourceStatus.SKIPPED,
+        models.SourceStatus.SKIPPED,
+    ]
+    assert len(candidate.source_results) == len(candidate.dedup_stats.per_source)
+
+    for source_result, source_stats in zip(
+        candidate.source_results,
+        candidate.dedup_stats.per_source,
+    ):
+        if source_result.status in {
+            models.SourceStatus.COMPLETE,
+            models.SourceStatus.PARTIAL,
+        }:
+            assert source_stats.seen == source_result.accepted_count
+        else:
+            assert (
+                source_stats.seen,
+                source_stats.retained,
+                source_stats.duplicates_removed,
+            ) == (0, 0, 0)
+
+    assert candidate.dedup_stats.seen == sum(
+        item.accepted_count for item in candidate.source_results
+    )
+    assert candidate.dedup_stats.unique == sum(
+        item.retained for item in candidate.dedup_stats.per_source
+    )
+    assert candidate.dedup_stats.duplicates_removed == sum(
+        item.duplicates_removed for item in candidate.dedup_stats.per_source
+    )
+    assert candidate.expected_directory_count == 5
+    assert candidate.sources_complete == 1
+    assert candidate.sources_partial == 1
+    assert candidate.sources_failed == 1
+    assert candidate.sources_skipped == 2
+    assert candidate.sources_attempted == 3
+
+    bad_per_source = tuple(
+        replace(stats, source_path="md/not-aligned/ML_ABN")
+        if index == 0
+        else stats
+        for index, stats in enumerate(candidate.dedup_stats.per_source)
+    )
+    bad_stats = models.DedupStats(
+        seen=candidate.dedup_stats.seen,
+        unique=candidate.dedup_stats.unique,
+        duplicates_removed=candidate.dedup_stats.duplicates_removed,
+        candidate_frame_count=candidate.dedup_stats.candidate_frame_count,
+        per_source=bad_per_source,
+        schema=candidate.dedup_stats.schema,
+    )
+    with pytest.raises((TypeError, ValueError)):
+        replace(candidate, dedup_stats=bad_stats)
+
+
+def test_full_dedup_candidate_frames_equal_unique_count(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    directories = ["md/seed", "md/restart"]
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="md",
+            generated_at="2026-07-13T12:00:00",
+            directories=directories,
+        ),
+    )
+    _copy_mlab_source(work_dir, "seed", "complete_vasp_651.mlab")
+    _copy_mlab_source(work_dir, "restart", "complete_multi.mlab")
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=read_manifest(work_dir, "md"),
+    )
+    stats = candidate.dedup_stats
+    assert (stats.seen, stats.unique, stats.duplicates_removed) == (3, 2, 1)
+    assert candidate.frame_count == len(candidate.accepted_frames)
+    assert candidate.frame_count == stats.unique
+    assert candidate.frame_count == stats.candidate_frame_count
+    assert len(candidate.accepted_frames) == 2
+    assert candidate.accepted_frames[0].info["dpmoire_source_path"] == (
+        "md/seed/ML_ABN"
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        replace(candidate, accepted_frames=candidate.accepted_frames[:-1])
+    with pytest.raises((TypeError, ValueError)):
+        replace(
+            candidate,
+            accepted_frames=candidate.accepted_frames
+            + (candidate.accepted_frames[0],),
+        )
+
+
+def test_duplicates_alone_do_not_mark_source_or_candidate_degraded(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    directories = ["md/one", "md/two"]
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="md",
+            generated_at="2026-07-13T12:00:00",
+            directories=directories,
+        ),
+    )
+    _copy_mlab_source(work_dir, "one", "complete_vasp_651.mlab")
+    _copy_mlab_source(work_dir, "two", "complete_vasp_651.mlab")
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=read_manifest(work_dir, "md"),
+    )
+
+    assert [item.status for item in candidate.source_results] == [
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+    ]
+    assert candidate.sources_complete == 2
+    assert candidate.sources_partial == 0
+    assert candidate.sources_skipped == 0
+    assert candidate.sources_failed == 0
+    assert candidate.source_inventory.coverage_known is True
+    assert (
+        candidate.dedup_stats.seen,
+        candidate.dedup_stats.unique,
+        candidate.dedup_stats.duplicates_removed,
+    ) == (2, 1, 1)
+    assert not hasattr(candidate, "status")
+    assert not hasattr(candidate, "collect_status")
+
+
+def test_missing_scan_candidate_preserves_coverage_unknown(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    for name in ("0_10", "0_2", "0_1"):
+        _copy_mlab_source(work_dir, name, "complete_vasp_651.mlab")
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=read_manifest(work_dir, "md"),
+    )
+
+    assert candidate.source_inventory.manifest_kind == "missing"
+    assert candidate.source_inventory.directory_discovery == "legacy-scan"
+    assert candidate.source_inventory.coverage_known is False
+    assert candidate.source_inventory.warnings == (_MISSING_SCAN_WARNING,)
+    assert candidate.expected_directories == (
+        "md/0_1",
+        "md/0_2",
+        "md/0_10",
+    )
+    assert [item.source_path for item in candidate.source_results] == [
+        "md/0_1/ML_ABN",
+        "md/0_2/ML_ABN",
+        "md/0_10/ML_ABN",
+    ]
+    assert [item.source_path for item in candidate.dedup_stats.per_source] == [
+        "md/0_1/ML_ABN",
+        "md/0_2/ML_ABN",
+        "md/0_10/ML_ABN",
+    ]
+    assert not manifest_path(work_dir, "md").exists()
+
+
+def test_candidate_records_input_layout_discovery_mode_and_schema(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    directories = ["md/legacy"]
+    manifest_file = _write_legacy_md_manifest(work_dir, directories)
+    original_bytes = manifest_file.read_bytes()
+    _copy_mlab_source(work_dir, "legacy", "complete_vasp_651.mlab")
+    manifest = read_manifest(work_dir, "md")
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=manifest,
+    )
+
+    assert candidate.collection_mode is models.MLFFCollectMode.FULL_DEDUP
+    assert candidate.source_inventory.manifest_kind == "legacy"
+    assert candidate.source_inventory.directory_discovery == "declared"
+    assert candidate.source_inventory.coverage_known is True
+    assert candidate.source_inventory.warnings == ()
+    assert candidate.dedup_stats.schema == "mlab-config-v1"
+    assert candidate.expected_directories == tuple(directories)
+    assert manifest_file.read_bytes() == original_bytes
+
+    with pytest.raises((TypeError, ValueError)):
+        replace(candidate, collection_mode=None)
+
+
+def test_candidate_creation_writes_no_output_manifest_or_journal(tmp_path):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    work_dir = tmp_path / "work"
+    _copy_mlab_source(work_dir, "scan", "complete_vasp_651.mlab")
+    sentinels = {
+        work_dir / "MD_data.extxyz": b"output-sentinel",
+        work_dir / "md" / "compatibility-result.yaml": b"result-sentinel",
+        work_dir / "md" / "journal.json": b"journal-sentinel",
+        work_dir / "md" / "candidate.tmp": b"candidate-sentinel",
+        work_dir / "backups" / "collect" / "previous.bak": b"backup-sentinel",
+    }
+    for path, payload in sentinels.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    manifest = read_manifest(work_dir, "md")
+    before = _snapshot_work_tree(work_dir)
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=manifest,
+    )
+    after = _snapshot_work_tree(work_dir)
+
+    assert isinstance(candidate, models.CollectionCandidate)
+    assert after == before
+    assert not manifest_path(work_dir, "md").exists()
+
+
+def test_candidate_cost_is_one_identity_per_complete_configuration(
+    tmp_path,
+    monkeypatch,
+):
+    build_full_dedup_candidate = _full_dedup_candidate_api()
+
+    mlff_collect = import_module("dpmoire_lite.mlff_collect")
+    real_identity = mlff_collect.config_identity
+    calls = []
+
+    def spy(configuration):
+        calls.append(configuration)
+        return real_identity(configuration)
+
+    monkeypatch.setattr(mlff_collect, "config_identity", spy)
+
+    work_dir = tmp_path / "work"
+    directories = ["md/one", "md/two", "md/failed", "md/missing"]
+    write_manifest(
+        work_dir,
+        Manifest(
+            stage="md",
+            generated_at="2026-07-13T12:00:00",
+            directories=directories,
+        ),
+    )
+    _copy_mlab_source(work_dir, "one", "complete_vasp_651.mlab")
+    _copy_mlab_source(work_dir, "two", "complete_multi.mlab")
+    _copy_mlab_source(work_dir, "failed", "internal_corruption.mlab")
+
+    candidate = build_full_dedup_candidate(
+        work_dir=work_dir,
+        manifest=read_manifest(work_dir, "md"),
+    )
+    accepted_total = sum(
+        item.accepted_count
+        for item in candidate.source_results
+        if item.status
+        in {models.SourceStatus.COMPLETE, models.SourceStatus.PARTIAL}
+    )
+
+    assert len(calls) == accepted_total
+    assert len(calls) == candidate.dedup_stats.seen
+    assert accepted_total == 3
+    assert [item.status for item in candidate.source_results] == [
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.FAILED,
+        models.SourceStatus.SKIPPED,
+    ]
+    assert [
+        (item.seen, item.retained, item.duplicates_removed)
+        for item in candidate.dedup_stats.per_source
+    ][-2:] == [(0, 0, 0), (0, 0, 0)]

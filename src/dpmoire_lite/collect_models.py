@@ -277,6 +277,9 @@ class CollectionCandidate:
     source_results: tuple[SourceResult, ...]
     accepted_frames: tuple[Atoms, ...]
     expected_directories: tuple[str, ...] = ()
+    collection_mode: MLFFCollectMode | None = None
+    source_inventory: SourceInventory | None = None
+    dedup_stats: DedupStats | None = None
 
     def __post_init__(self) -> None:
         source_results = tuple(self.source_results)
@@ -303,10 +306,104 @@ class CollectionCandidate:
         source_accepted_count = sum(
             source_result.accepted_count for source_result in source_results
         )
-        if len(frames) != source_accepted_count:
+        metadata_present = any(
+            value is not None
+            for value in (
+                self.collection_mode,
+                self.source_inventory,
+                self.dedup_stats,
+            )
+        )
+        if not metadata_present:
+            if len(frames) != source_accepted_count:
+                raise ValueError(
+                    f"candidate frame count {len(frames)} does not equal "
+                    f"source accepted count {source_accepted_count}"
+                )
+            return
+
+        if not all(
+            value is not None
+            for value in (
+                self.collection_mode,
+                self.source_inventory,
+                self.dedup_stats,
+            )
+        ):
             raise ValueError(
-                f"candidate frame count {len(frames)} does not equal "
-                f"source accepted count {source_accepted_count}"
+                "full-dedup candidate metadata must be supplied together"
+            )
+        if self.collection_mode is not MLFFCollectMode.FULL_DEDUP:
+            raise ValueError(
+                "full-dedup candidate collection_mode must be FULL_DEDUP"
+            )
+        if not isinstance(self.source_inventory, SourceInventory):
+            raise TypeError("source_inventory must be a SourceInventory")
+        if not isinstance(self.dedup_stats, DedupStats):
+            raise TypeError("dedup_stats must be a DedupStats")
+        if expected_directories != self.source_inventory.directories:
+            raise ValueError(
+                "candidate expected_directories must match source inventory"
+            )
+
+        for source_result in source_results:
+            if source_result.source_kind is not SourceKind.MLAB:
+                raise ValueError(
+                    "full-dedup candidate source results must be MLAB sources"
+                )
+            if source_result.status not in {
+                SourceStatus.COMPLETE,
+                SourceStatus.PARTIAL,
+                SourceStatus.SKIPPED,
+                SourceStatus.FAILED,
+            }:
+                raise ValueError(
+                    "full-dedup candidate source results must be finalized"
+                )
+
+        per_source = self.dedup_stats.per_source
+        if len(per_source) != len(source_results):
+            raise ValueError(
+                "full-dedup candidate per-source stats must align with sources"
+            )
+        for source_result, source_stats in zip(
+            source_results,
+            per_source,
+            strict=True,
+        ):
+            if source_stats.source_path != source_result.source_path:
+                raise ValueError(
+                    "full-dedup candidate per-source paths must align"
+                )
+            if source_result.status in {
+                SourceStatus.COMPLETE,
+                SourceStatus.PARTIAL,
+            }:
+                if source_stats.seen != source_result.accepted_count:
+                    raise ValueError(
+                        "complete and partial source seen counts must equal "
+                        "accepted_count"
+                    )
+            elif (
+                source_stats.seen,
+                source_stats.retained,
+                source_stats.duplicates_removed,
+            ) != (0, 0, 0):
+                raise ValueError(
+                    "skipped and failed sources must have zero dedup statistics"
+                )
+
+        if self.dedup_stats.seen != source_accepted_count:
+            raise ValueError(
+                "dedup seen count must equal finalized source accepted counts"
+            )
+        if len(frames) != self.dedup_stats.unique:
+            raise ValueError(
+                "candidate frame count must equal dedup unique count"
+            )
+        if len(frames) != self.dedup_stats.candidate_frame_count:
+            raise ValueError(
+                "candidate frame count must equal dedup candidate frame count"
             )
 
     @property
