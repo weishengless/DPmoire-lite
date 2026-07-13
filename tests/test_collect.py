@@ -4,12 +4,15 @@ from pathlib import Path
 
 import pytest
 import yaml
+from ase import Atoms
 
 import dpmoire_lite.collect as collect_module
 import dpmoire_lite.dataset as dataset_module
+from dpmoire_lite import collect_models as models
 from dpmoire_lite.dataset import Dataset
 from dpmoire_lite.collect import run_collect
 from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
+from dpmoire_lite.mlab import MlabConfiguration
 
 
 def write_collect_config(root, **overrides):
@@ -74,6 +77,275 @@ def install_dataset_stream_spies(monkeypatch, streams, opened):
         reject_batch_reader,
         raising=False,
     )
+
+
+def _aggregate_status_api():
+    collect_status = getattr(models, "CollectStatus", None)
+    assert collect_status is not None, "CollectStatus is not implemented"
+    collect_result = getattr(models, "CollectResult", None)
+    assert collect_result is not None, "CollectResult is not implemented"
+    selector = getattr(collect_module, "select_collect_status", None)
+    assert callable(selector), "select_collect_status is not implemented"
+    return collect_status, collect_result, selector
+
+
+def _status_frame(x_position: float = 0.0) -> Atoms:
+    return Atoms(
+        "H",
+        positions=[[x_position, 0.0, 0.0]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=True,
+    )
+
+
+def _status_source_result(status, index: int, reason: str | None = None):
+    accepted_frames = ()
+    complete_count = 0
+    if status in {models.SourceStatus.COMPLETE, models.SourceStatus.PARTIAL}:
+        accepted_frames = (_status_frame(float(index)),)
+        complete_count = 1
+    if status is not models.SourceStatus.COMPLETE and reason is None:
+        reason = f"structured {status.value} source"
+    return models.SourceResult(
+        source_path=f"md/{index}/OUTCAR",
+        source_kind=models.SourceKind.OUTCAR,
+        status=status,
+        complete_count=complete_count,
+        accepted_frames=accepted_frames,
+        reason=reason,
+    )
+
+
+def _status_candidate(*statuses, reasons=()):
+    if reasons and len(reasons) != len(statuses):
+        raise ValueError("reasons must align with statuses")
+    source_results = tuple(
+        _status_source_result(
+            status,
+            index,
+            reasons[index] if reasons else None,
+        )
+        for index, status in enumerate(statuses)
+    )
+    accepted_frames = tuple(
+        frame
+        for source_result in source_results
+        for frame in source_result.accepted_frames
+    )
+    return models.CollectionCandidate(
+        source_results=source_results,
+        accepted_frames=accepted_frames,
+        expected_directories=tuple(
+            f"md/{index}" for index in range(len(source_results))
+        ),
+    )
+
+
+def _status_mlab_configuration() -> MlabConfiguration:
+    return MlabConfiguration(
+        source_path=Path("md/0/ML_ABN"),
+        source_configuration_number=1,
+        source_line=8,
+        elements=("H",),
+        counts=(1,),
+        n_atoms=1,
+        lattice=((4.0, 0.0, 0.0), (0.0, 4.0, 0.0), (0.0, 0.0, 4.0)),
+        positions=((0.0, 0.0, 0.0),),
+        energy=-1.0,
+        forces=((0.0, 0.0, 0.0),),
+        stress_kbar=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+
+
+def _full_dedup_status_candidate(*, coverage_known: bool, duplicate: bool = False):
+    seen = 2 if duplicate else 1
+    source_path = "md/0/ML_ABN"
+    configurations = tuple(_status_mlab_configuration() for _ in range(seen))
+    source_result = models.SourceResult(
+        source_path=source_path,
+        source_kind=models.SourceKind.MLAB,
+        status=models.SourceStatus.COMPLETE,
+        complete_count=seen,
+        parsed_configurations=configurations,
+    )
+    if coverage_known:
+        inventory = models.SourceInventory(
+            manifest_kind="current",
+            directory_discovery="declared",
+            directories=("md/0",),
+            coverage_known=True,
+            warnings=("fatal degraded skipped log text is not status evidence",),
+        )
+    else:
+        inventory = models.SourceInventory(
+            manifest_kind="missing",
+            directory_discovery="legacy-scan",
+            directories=("md/0",),
+            coverage_known=False,
+            warnings=("legacy scan cannot prove expected-source coverage",),
+        )
+    source_stats = models.SourceDedupStats(
+        source_path=source_path,
+        seen=seen,
+        retained=1,
+        duplicates_removed=seen - 1,
+    )
+    dedup_stats = models.DedupStats(
+        seen=seen,
+        unique=1,
+        duplicates_removed=seen - 1,
+        candidate_frame_count=1,
+        per_source=(source_stats,),
+    )
+    return models.CollectionCandidate(
+        source_results=(source_result,),
+        accepted_frames=(_status_frame(),),
+        expected_directories=inventory.directories,
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        source_inventory=inventory,
+        dedup_stats=dedup_stats,
+    )
+
+
+def test_complete_requires_frames_and_all_expected_sources_complete():
+    CollectStatus, CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _status_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+    )
+
+    assert tuple(status.value for status in CollectStatus) == (
+        "complete",
+        "degraded",
+        "no_data",
+        "fatal",
+    )
+    assert select_collect_status(candidate) is CollectStatus.COMPLETE
+    with pytest.raises(ValueError, match="publication"):
+        CollectResult(status=CollectStatus.COMPLETE, candidate=candidate)
+    result = CollectResult(
+        status=CollectStatus.COMPLETE,
+        candidate=candidate,
+        publication_committed=True,
+    )
+    assert result.accepted_frame_count == 2
+    assert result.sources_complete == 2
+
+
+def test_partial_with_frames_selects_degraded():
+    CollectStatus, CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _status_candidate(models.SourceStatus.PARTIAL)
+
+    assert select_collect_status(candidate) is CollectStatus.DEGRADED
+    result = CollectResult(
+        status=CollectStatus.DEGRADED,
+        candidate=candidate,
+        publication_committed=True,
+    )
+    assert result.sources_partial == 1
+
+
+def test_skipped_or_failed_with_other_frames_selects_degraded():
+    CollectStatus, _CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _status_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.SKIPPED,
+        models.SourceStatus.FAILED,
+    )
+
+    assert select_collect_status(candidate) is CollectStatus.DEGRADED
+
+
+def test_coverage_decline_with_frames_selects_degraded():
+    CollectStatus, _CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _status_candidate(models.SourceStatus.COMPLETE)
+
+    assert select_collect_status(
+        candidate,
+        coverage_declined=True,
+    ) is CollectStatus.DEGRADED
+
+
+def test_unknown_coverage_legacy_scan_with_frames_selects_degraded():
+    CollectStatus, _CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _full_dedup_status_candidate(coverage_known=False)
+
+    assert select_collect_status(candidate) is CollectStatus.DEGRADED
+
+
+def test_exact_duplicates_alone_do_not_select_degraded():
+    CollectStatus, _CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _full_dedup_status_candidate(
+        coverage_known=True,
+        duplicate=True,
+    )
+
+    assert candidate.dedup_stats.duplicates_removed == 1
+    assert select_collect_status(candidate) is CollectStatus.COMPLETE
+
+
+def test_zero_frames_selects_no_data_before_publication():
+    CollectStatus, CollectResult, select_collect_status = _aggregate_status_api()
+
+    candidate = _status_candidate(
+        models.SourceStatus.SKIPPED,
+        models.SourceStatus.FAILED,
+    )
+
+    assert select_collect_status(candidate) is CollectStatus.NO_DATA
+    with pytest.raises(ValueError, match="publication"):
+        CollectResult(status=CollectStatus.NO_DATA, candidate=candidate)
+    result = CollectResult(
+        status=CollectStatus.NO_DATA,
+        candidate=candidate,
+        publication_committed=True,
+    )
+    assert result.accepted_frame_count == 0
+
+
+def test_global_invariant_failure_selects_fatal():
+    CollectStatus, CollectResult, select_collect_status = _aggregate_status_api()
+
+    diagnostic = "candidate/source count invariant failed"
+
+    assert select_collect_status(
+        None,
+        fatal_diagnostic=diagnostic,
+    ) is CollectStatus.FATAL
+    result = CollectResult(
+        status=CollectStatus.FATAL,
+        fatal_diagnostic=diagnostic,
+    )
+    assert result.fatal_diagnostic == diagnostic
+    assert result.accepted_frame_count == 0
+    with pytest.raises(ValueError, match="fatal.*publication"):
+        CollectResult(
+            status=CollectStatus.FATAL,
+            publication_committed=True,
+            fatal_diagnostic=diagnostic,
+        )
+
+
+def test_status_selection_does_not_parse_log_text():
+    CollectStatus, _CollectResult, select_collect_status = _aggregate_status_api()
+
+    complete_candidate = _status_candidate(
+        models.SourceStatus.COMPLETE,
+        reasons=("fatal failed partial degraded no_data",),
+    )
+    partial_candidate = _status_candidate(
+        models.SourceStatus.PARTIAL,
+        reasons=("complete transaction committed",),
+    )
+
+    assert select_collect_status(complete_candidate) is CollectStatus.COMPLETE
+    assert select_collect_status(partial_candidate) is CollectStatus.DEGRADED
 
 
 def test_load_ml_abn_sample_counts_frames(tmp_path, sample_dir):

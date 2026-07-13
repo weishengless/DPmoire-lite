@@ -10,6 +10,7 @@ from ase.io import ParseError
 
 from .config import DPmoireLiteConfig, load_config
 from .collect_models import (
+    CollectStatus,
     CollectionCandidate,
     DedupStats,
     MLFFCollectMode,
@@ -42,6 +43,41 @@ COLLECT_OUTPUTS = {
     "md": "MD_data.extxyz",
     "validation": "valid.extxyz",
 }
+
+
+def select_collect_status(
+    candidate: CollectionCandidate | None,
+    *,
+    coverage_declined: bool = False,
+    fatal_diagnostic: str | None = None,
+) -> CollectStatus:
+    if not isinstance(coverage_declined, bool):
+        raise TypeError("coverage_declined must be a bool")
+    if fatal_diagnostic is not None:
+        if not isinstance(fatal_diagnostic, str) or not fatal_diagnostic.strip():
+            raise ValueError("fatal_diagnostic must be a non-empty string or None")
+        return CollectStatus.FATAL
+    if not isinstance(candidate, CollectionCandidate):
+        raise TypeError(
+            "candidate must be a CollectionCandidate unless a fatal diagnostic "
+            "is supplied"
+        )
+    if candidate.frame_count == 0:
+        return CollectStatus.NO_DATA
+    if coverage_declined:
+        return CollectStatus.DEGRADED
+    if (
+        candidate.sources_partial
+        or candidate.sources_skipped
+        or candidate.sources_failed
+    ):
+        return CollectStatus.DEGRADED
+    if (
+        candidate.source_inventory is not None
+        and not candidate.source_inventory.coverage_known
+    ):
+        return CollectStatus.DEGRADED
+    return CollectStatus.COMPLETE
 
 
 def run_collect(config_path: Path, stage: str) -> None:

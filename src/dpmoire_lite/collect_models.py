@@ -22,6 +22,13 @@ class SourceStatus(str, Enum):
     FAILED = "failed"
 
 
+class CollectStatus(str, Enum):
+    COMPLETE = "complete"
+    DEGRADED = "degraded"
+    NO_DATA = "no_data"
+    FATAL = "fatal"
+
+
 class MLFFCollectMode(str, Enum):
     SEED_AWARE = "seed-aware"
     FULL_DEDUP = "full-dedup"
@@ -445,6 +452,102 @@ class CollectionCandidate:
     @property
     def sources_attempted(self) -> int:
         return self.sources_complete + self.sources_partial + self.sources_failed
+
+
+@dataclass(frozen=True)
+class CollectResult:
+    status: CollectStatus
+    candidate: CollectionCandidate | None = None
+    publication_committed: bool = False
+    coverage_declined: bool = False
+    warnings: tuple[str, ...] = ()
+    fatal_diagnostic: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, CollectStatus):
+            raise TypeError("status must be a CollectStatus")
+        if self.candidate is not None and not isinstance(
+            self.candidate,
+            CollectionCandidate,
+        ):
+            raise TypeError("candidate must be a CollectionCandidate or None")
+        if not isinstance(self.publication_committed, bool):
+            raise TypeError("publication_committed must be a bool")
+        if not isinstance(self.coverage_declined, bool):
+            raise TypeError("coverage_declined must be a bool")
+
+        warnings = _normalize_iterable("warnings", self.warnings)
+        if any(
+            not isinstance(warning, str) or not warning.strip()
+            for warning in warnings
+        ):
+            raise ValueError("warnings must contain non-empty strings")
+        object.__setattr__(self, "warnings", warnings)
+        if self.candidate is not None:
+            object.__setattr__(self, "candidate", copy.deepcopy(self.candidate))
+
+        if self.status is CollectStatus.FATAL:
+            if (
+                not isinstance(self.fatal_diagnostic, str)
+                or not self.fatal_diagnostic.strip()
+            ):
+                raise ValueError("fatal result requires a non-empty diagnostic")
+            if self.publication_committed:
+                raise ValueError("fatal result cannot claim publication success")
+            return
+
+        if self.fatal_diagnostic is not None:
+            raise ValueError("nonfatal result cannot carry a fatal diagnostic")
+        if self.candidate is None:
+            raise ValueError("nonfatal result requires a collection candidate")
+        if not self.publication_committed:
+            raise ValueError("nonfatal result requires publication commitment")
+        if self.status in {CollectStatus.COMPLETE, CollectStatus.DEGRADED}:
+            if self.candidate.frame_count == 0:
+                raise ValueError(
+                    "complete and degraded results require accepted frames"
+                )
+        elif (
+            self.status is CollectStatus.NO_DATA
+            and self.candidate.frame_count != 0
+        ):
+            raise ValueError("no_data result requires zero accepted frames")
+
+    @property
+    def accepted_frame_count(self) -> int:
+        return self.candidate.frame_count if self.candidate is not None else 0
+
+    @property
+    def source_results(self) -> tuple[SourceResult, ...]:
+        return self.candidate.source_results if self.candidate is not None else ()
+
+    @property
+    def source_count(self) -> int:
+        return len(self.source_results)
+
+    @property
+    def sources_complete(self) -> int:
+        return (
+            self.candidate.sources_complete if self.candidate is not None else 0
+        )
+
+    @property
+    def sources_partial(self) -> int:
+        return self.candidate.sources_partial if self.candidate is not None else 0
+
+    @property
+    def sources_skipped(self) -> int:
+        return self.candidate.sources_skipped if self.candidate is not None else 0
+
+    @property
+    def sources_failed(self) -> int:
+        return self.candidate.sources_failed if self.candidate is not None else 0
+
+    @property
+    def sources_attempted(self) -> int:
+        return (
+            self.candidate.sources_attempted if self.candidate is not None else 0
+        )
 
 
 def _validate_relative_source_path(source_path: str) -> None:
