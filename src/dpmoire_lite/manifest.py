@@ -91,14 +91,48 @@ def write_manifest(work_dir: Path, manifest: Manifest | ManifestReadResult) -> N
     if isinstance(manifest, ManifestReadResult):
         if manifest.manifest is None:
             raise ValueError("Cannot write a manifest read as missing or legacy")
+        stage = manifest.manifest.stage
+    else:
+        stage = manifest.stage
+
+    path = manifest_path(work_dir, stage)
+    serialized = serialize_manifest(work_dir, manifest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_io.atomic_text_publish(path, serialized, encoding="utf-8")
+
+
+def serialize_manifest(work_dir: Path, manifest: Manifest | ManifestReadResult) -> str:
+    if isinstance(manifest, ManifestReadResult):
+        if manifest.manifest is None:
+            raise ValueError("Cannot write a manifest read as missing or legacy")
         manifest = manifest.manifest
 
     path = manifest_path(work_dir, manifest.stage)
     data = asdict(manifest)
     _validate_v2_data(data, path, work_dir=Path(work_dir), expected_stage=manifest.stage)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = yaml.safe_dump(data, sort_keys=False)
-    atomic_io.atomic_text_publish(path, serialized, encoding="utf-8")
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+def validate_current_manifest_text(
+    text: str,
+    *,
+    work_dir: Path,
+    stage: str,
+    path: Path,
+) -> Manifest:
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Could not read manifest candidate {path}: {exc}") from exc
+
+    if not isinstance(data, Mapping):
+        raise ValueError(f"Invalid manifest {path}: top-level data must be a mapping")
+    data = dict(data)
+    _validate_v2_data(data, Path(path), work_dir=Path(work_dir), expected_stage=stage)
+    try:
+        return Manifest(**data)
+    except TypeError as exc:
+        raise ValueError(f"Invalid Manifest v2 field in {path}: {exc}") from exc
 
 
 def read_manifest(work_dir: Path, stage: str) -> ManifestReadResult:

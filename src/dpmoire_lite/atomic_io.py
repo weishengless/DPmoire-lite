@@ -22,6 +22,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def create_candidate(destination: Path) -> Path:
+    """Create a unique candidate beside its eventual destination."""
+    return _new_candidate(Path(destination))
+
+
+def fsync_path(path: Path) -> None:
+    """Flush an already-written candidate file to durable storage."""
+    with Path(path).open("r+b") as handle:
+        _fsync_file(handle)
+
+
 def atomic_text_publish(
     destination: Path,
     text: str,
