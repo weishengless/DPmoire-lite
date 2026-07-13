@@ -81,6 +81,138 @@ class CompatibilityManifestEvidence:
     dedup: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class CollectionAuditEvidence:
+    sources_attempted: int
+    sources_complete: int
+    sources_partial: int
+    sources_skipped: int
+    sources_failed: int
+    previous_sources_attempted: int | None
+    previous_sources_complete: int | None
+    previous_sources_partial: int | None
+    previous_sources_skipped: int | None
+    previous_sources_failed: int | None
+    expected_directories: tuple[str, ...]
+    previous_expected_directories: tuple[str, ...] | None
+    source_order: tuple[str, ...]
+    collection_mode: str | None
+    inventory: Mapping[str, Any]
+    dedup: Mapping[str, Any] | None
+    coverage_declined: bool
+
+    def __post_init__(self) -> None:
+        current_counts = (
+            self.sources_attempted,
+            self.sources_complete,
+            self.sources_partial,
+            self.sources_skipped,
+            self.sources_failed,
+        )
+        previous_counts = (
+            self.previous_sources_attempted,
+            self.previous_sources_complete,
+            self.previous_sources_partial,
+            self.previous_sources_skipped,
+            self.previous_sources_failed,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in current_counts
+        ):
+            raise TypeError("current source counts must be nonnegative integers")
+        if any(value is None for value in previous_counts):
+            if not all(value is None for value in previous_counts):
+                raise ValueError("previous source counts must be all known or all unknown")
+        elif any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in previous_counts
+        ):
+            raise TypeError("previous source counts must be nonnegative integers")
+        if self.sources_attempted != (
+            self.sources_complete + self.sources_partial + self.sources_failed
+        ):
+            raise ValueError(
+                "sources_attempted must equal complete plus partial plus failed"
+            )
+
+        expected_directories = tuple(self.expected_directories)
+        previous_expected_directories = (
+            None
+            if self.previous_expected_directories is None
+            else tuple(self.previous_expected_directories)
+        )
+        source_order = tuple(self.source_order)
+        for label, values in (
+            ("expected_directories", expected_directories),
+            ("source_order", source_order),
+        ):
+            if any(not isinstance(value, str) or not value for value in values):
+                raise ValueError(f"{label} must contain non-empty strings")
+        if previous_expected_directories is not None and any(
+            not isinstance(value, str) or not value
+            for value in previous_expected_directories
+        ):
+            raise ValueError(
+                "previous_expected_directories must contain non-empty strings"
+            )
+        source_total = (
+            self.sources_complete
+            + self.sources_partial
+            + self.sources_skipped
+            + self.sources_failed
+        )
+        if len(source_order) != source_total:
+            raise ValueError("source_order must align with aggregate source counts")
+        if self.collection_mode not in {None, "seed-aware", "full-dedup"}:
+            raise ValueError("collection_mode must be seed-aware, full-dedup, or null")
+        if not isinstance(self.inventory, Mapping):
+            raise TypeError("inventory must be a mapping")
+        inventory = copy.deepcopy(dict(self.inventory))
+        required_inventory_fields = {
+            "manifest_kind",
+            "directory_discovery",
+            "directories",
+            "coverage_known",
+            "warnings",
+        }
+        if set(inventory) != required_inventory_fields:
+            raise ValueError("inventory fields do not match the collection audit schema")
+        if inventory["manifest_kind"] not in {"current", "legacy", "missing"}:
+            raise ValueError("inventory manifest_kind is unsupported")
+        if inventory["directory_discovery"] not in {"declared", "legacy-scan"}:
+            raise ValueError("inventory directory_discovery is unsupported")
+        if inventory["directories"] != list(expected_directories):
+            raise ValueError("inventory directories must match expected_directories")
+        if not isinstance(inventory["coverage_known"], bool):
+            raise TypeError("inventory coverage_known must be a bool")
+        if not isinstance(inventory["warnings"], list) or any(
+            not isinstance(value, str) or not value
+            for value in inventory["warnings"]
+        ):
+            raise ValueError("inventory warnings must be a list of non-empty strings")
+        if self.collection_mode is None:
+            if self.dedup is not None:
+                raise ValueError("non-MLFF collection audit must not claim dedup evidence")
+            dedup = None
+        else:
+            if not isinstance(self.dedup, Mapping):
+                raise TypeError("MLFF collection audit requires dedup evidence")
+            dedup = copy.deepcopy(dict(self.dedup))
+        if not isinstance(self.coverage_declined, bool):
+            raise TypeError("coverage_declined must be a bool")
+
+        object.__setattr__(self, "expected_directories", expected_directories)
+        object.__setattr__(
+            self,
+            "previous_expected_directories",
+            previous_expected_directories,
+        )
+        object.__setattr__(self, "source_order", source_order)
+        object.__setattr__(self, "inventory", inventory)
+        object.__setattr__(self, "dedup", dedup)
+
+
 DataWriter = Callable[[Dataset, Path], None]
 
 
@@ -95,6 +227,8 @@ class CandidateRequest:
     expected_frame_count: int
     status: str
     source_diagnostics: tuple[Mapping[str, Any], ...] = ()
+    collection_audit: CollectionAuditEvidence | None = None
+    previous_output_frames: int | None = None
     previous_output_sha256: str | None = None
     previous_manifest_sha256: str | None = None
     backup_path: str | None = None
@@ -142,6 +276,7 @@ class PublicationResult:
     previous_output_sha256: str | None
     backup_path: Path | None
     backup_sha256: str | None
+    previous_output_frames: int | None = None
 
 
 @dataclass(frozen=True)
@@ -425,6 +560,26 @@ def _validate_request(request: CandidateRequest) -> None:
         raise CandidateValidationError(
             "Dataset.n_configs does not match expected frame count"
         )
+    if request.collection_audit is not None:
+        if not isinstance(request.collection_audit, CollectionAuditEvidence):
+            raise CandidateValidationError(
+                "collection_audit must be CollectionAuditEvidence or null"
+            )
+        diagnostic_order = tuple(
+            source.get("path") for source in request.source_diagnostics
+        )
+        if diagnostic_order != request.collection_audit.source_order:
+            raise CandidateValidationError(
+                "source diagnostics must align with collection audit order"
+            )
+    if request.previous_output_frames is not None and (
+        isinstance(request.previous_output_frames, bool)
+        or not isinstance(request.previous_output_frames, int)
+        or request.previous_output_frames < 0
+    ):
+        raise CandidateValidationError(
+            "previous output frame count must be a nonnegative integer or null"
+        )
     if (request.backup_path is None) != (request.backup_sha256 is None):
         raise CandidateValidationError("backup path and hash must both be set or both be null")
 
@@ -556,7 +711,7 @@ def _build_manifest_text_from_collect(
 
 
 def _collect_record(request: CandidateRequest, data_sha256: str) -> dict[str, Any]:
-    return {
+    record = {
         "transaction_id": request.transaction_id,
         "status": request.status,
         "frames": request.expected_frame_count,
@@ -569,8 +724,51 @@ def _collect_record(request: CandidateRequest, data_sha256: str) -> dict[str, An
         "previous_manifest_sha256": request.previous_manifest_sha256,
         "backup": request.backup_path,
         "backup_sha256": request.backup_sha256,
-        "sources": [copy.deepcopy(dict(source)) for source in request.source_diagnostics],
     }
+    audit = request.collection_audit
+    if audit is not None:
+        previous_directories = audit.previous_expected_directories
+        record.update(
+            {
+                "preserved_previous_output": False,
+                "previous_frames": request.previous_output_frames,
+                "sources_attempted": audit.sources_attempted,
+                "sources_complete": audit.sources_complete,
+                "sources_partial": audit.sources_partial,
+                "sources_skipped": audit.sources_skipped,
+                "sources_failed": audit.sources_failed,
+                "previous_sources_attempted": audit.previous_sources_attempted,
+                "previous_sources_complete": audit.previous_sources_complete,
+                "previous_sources_partial": audit.previous_sources_partial,
+                "previous_sources_skipped": audit.previous_sources_skipped,
+                "previous_sources_failed": audit.previous_sources_failed,
+                "expected_directories": list(audit.expected_directories),
+                "expected_directory_count": len(audit.expected_directories),
+                "previous_expected_directories": (
+                    None
+                    if previous_directories is None
+                    else list(previous_directories)
+                ),
+                "previous_expected_directory_count": (
+                    None
+                    if previous_directories is None
+                    else len(previous_directories)
+                ),
+                "source_order": list(audit.source_order),
+                "collection_mode": audit.collection_mode,
+                "inventory": copy.deepcopy(dict(audit.inventory)),
+                "dedup": (
+                    None
+                    if audit.dedup is None
+                    else copy.deepcopy(dict(audit.dedup))
+                ),
+                "coverage_declined": audit.coverage_declined,
+            }
+        )
+    record["sources"] = [
+        copy.deepcopy(dict(source)) for source in request.source_diagnostics
+    ]
+    return record
 
 
 def _manifest_only_collect_record(
@@ -825,6 +1023,27 @@ class PublicationSession:
             lock.__exit__(exc_type, exc_value, traceback)
         return False
 
+    def previous_collect_record(self) -> Mapping[str, Any] | None:
+        """Return validated prior collect evidence while this session owns the lock."""
+        if not self._entered or self._lock is None:
+            raise PublicationError("publication session is not open")
+        if self.previous_manifest_sha256 is None:
+            return None
+        if _optional_file_sha256(self.target.path) != self.previous_manifest_sha256:
+            raise PublicationError(
+                "result manifest changed before previous coverage was read"
+            )
+        collect = _recovery_manifest_collect(
+            self,
+            self.target.path,
+            label="previous result manifest",
+        )
+        if _optional_file_sha256(self.target.path) != self.previous_manifest_sha256:
+            raise PublicationError(
+                "result manifest changed while previous coverage was read"
+            )
+        return copy.deepcopy(dict(collect))
+
     def publish(self, request: CandidateRequest) -> PublicationResult:
         if not self._entered or self._lock is None:
             raise PublicationError("publication session is not open")
@@ -871,6 +1090,7 @@ class PublicationSession:
             )
             publish_request = replace(
                 request,
+                previous_output_frames=backup.previous_output_frames,
                 previous_output_sha256=backup.previous_output_sha256,
                 previous_manifest_sha256=self.previous_manifest_sha256,
                 backup_path=backup_relative,
@@ -928,6 +1148,7 @@ class PublicationSession:
                 previous_output_sha256=backup.previous_output_sha256,
                 backup_path=backup.backup_path,
                 backup_sha256=backup.backup_sha256,
+                previous_output_frames=backup.previous_output_frames,
             )
             self._published = True
             return result
@@ -1095,9 +1316,13 @@ def _validate_session_request(
             "publication request previous manifest identity does not match its session"
         )
     if isinstance(request, CandidateRequest) and (
-        request.backup_path is not None or request.backup_sha256 is not None
+        request.previous_output_frames is not None
+        or request.backup_path is not None
+        or request.backup_sha256 is not None
     ):
-        raise PublicationError("publication session, not its caller, owns backup identity")
+        raise PublicationError(
+            "publication session, not its caller, owns prior output/backup identity"
+        )
 
 
 def _optional_file_sha256(path: Path) -> str | None:

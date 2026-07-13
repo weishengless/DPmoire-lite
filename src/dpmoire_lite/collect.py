@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 import warnings
@@ -23,6 +24,8 @@ from .collect_models import (
     _validate_relative_source_path,
 )
 from .collect_publish import (
+    CandidateRequest,
+    CollectionAuditEvidence,
     CompatibilityManifestEvidence,
     ManifestOnlyRequest,
     PublicationError,
@@ -52,6 +55,17 @@ COLLECT_OUTPUTS = {
     "md": "MD_data.extxyz",
     "validation": "valid.extxyz",
 }
+
+
+@dataclass(frozen=True)
+class _PreviousCoverage:
+    sources_attempted: int | None = None
+    sources_complete: int | None = None
+    sources_partial: int | None = None
+    sources_skipped: int | None = None
+    sources_failed: int | None = None
+    expected_directories: tuple[str, ...] | None = None
+    source_statuses: tuple[tuple[str, SourceStatus], ...] = ()
 
 
 def select_collect_status(
@@ -176,6 +190,371 @@ def publish_no_data_candidate(
         candidate=candidate,
         publication_committed=True,
     )
+
+
+def publish_nonzero_candidate(
+    *,
+    work_dir: Path,
+    stage: str,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode | None,
+    transaction_id: str,
+) -> CollectResult:
+    if not isinstance(manifest, ManifestReadResult):
+        raise TypeError("manifest must be a ManifestReadResult")
+    if not isinstance(candidate, CollectionCandidate):
+        raise TypeError("candidate must be a CollectionCandidate")
+    if candidate.frame_count <= 0:
+        raise ValueError("nonzero publication requires a positive-frame candidate")
+    if stage not in COLLECT_OUTPUTS:
+        raise ValueError(f"Unknown collect stage: {stage!r}")
+    if collection_mode is not None and not isinstance(
+        collection_mode,
+        MLFFCollectMode,
+    ):
+        raise TypeError("collection_mode must be an MLFFCollectMode or None")
+    if candidate.collection_mode is not None and (
+        collection_mode is not candidate.collection_mode
+    ):
+        raise ValueError("collection_mode does not match the candidate")
+    if collection_mode is MLFFCollectMode.FULL_DEDUP and (
+        candidate.collection_mode is not MLFFCollectMode.FULL_DEDUP
+    ):
+        raise ValueError("full-dedup publication requires full-dedup candidate evidence")
+
+    work_dir = Path(work_dir)
+    final_output = work_dir / COLLECT_OUTPUTS[stage]
+    target, compatibility_evidence = _no_data_result_target(
+        work_dir=work_dir,
+        stage=stage,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=collection_mode,
+    )
+    source_diagnostics = tuple(
+        source_result.as_diagnostic()
+        for source_result in candidate.source_results
+    )
+    dataset = Dataset()
+    for frame in candidate.accepted_frames:
+        dataset.add_atoms(frame)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with PublicationSession(
+            work_dir=work_dir,
+            stage=stage,
+            final_output=final_output,
+            target=target,
+        ) as session:
+            if session.recovered_result is not None:
+                raise RuntimeError(
+                    "recovered publication requires Plan 10 Task 4 orchestration"
+                )
+            previous = _previous_coverage(session.previous_collect_record())
+            audit, new_noncomplete = _collection_audit_evidence(
+                manifest=manifest,
+                candidate=candidate,
+                collection_mode=collection_mode,
+                previous=previous,
+            )
+            status = select_collect_status(
+                candidate,
+                coverage_declined=audit.coverage_declined,
+            )
+            request = CandidateRequest(
+                work_dir=work_dir,
+                stage=stage,
+                final_output=final_output,
+                target=target,
+                transaction_id=transaction_id,
+                dataset=dataset,
+                expected_frame_count=candidate.frame_count,
+                status=status.value,
+                source_diagnostics=source_diagnostics,
+                collection_audit=audit,
+                previous_output_sha256=session.previous_output_sha256,
+                previous_manifest_sha256=session.previous_manifest_sha256,
+                current_manifest=(
+                    manifest
+                    if target.kind is ResultManifestTargetKind.CURRENT_STAGE
+                    else None
+                ),
+                compatibility_evidence=compatibility_evidence,
+            )
+            publication = session.publish(request)
+    except PublicationError as exc:
+        return CollectResult(
+            status=CollectStatus.FATAL,
+            candidate=candidate,
+            fatal_diagnostic=str(exc),
+        )
+
+    result_warnings = list(
+        candidate.source_inventory.warnings
+        if candidate.source_inventory is not None
+        else ()
+    )
+    frame_declined = (
+        publication.previous_output_frames is not None
+        and candidate.frame_count < publication.previous_output_frames
+    )
+    if frame_declined or audit.coverage_declined or new_noncomplete:
+        result_warnings.append(
+            _coverage_warning(
+                work_dir=work_dir,
+                candidate=candidate,
+                previous=previous,
+                previous_frames=publication.previous_output_frames,
+                backup_path=publication.backup_path,
+            )
+        )
+
+    return CollectResult(
+        status=status,
+        candidate=candidate,
+        publication_committed=True,
+        coverage_declined=audit.coverage_declined,
+        warnings=tuple(result_warnings),
+    )
+
+
+def _previous_coverage(
+    collect: Mapping[str, object] | None,
+) -> _PreviousCoverage:
+    if not collect:
+        return _PreviousCoverage()
+
+    source_statuses: tuple[tuple[str, SourceStatus], ...] = ()
+    structured_sources_known = False
+    raw_sources = collect.get("sources")
+    if isinstance(raw_sources, list):
+        parsed_sources: list[tuple[str, SourceStatus]] = []
+        for raw_source in raw_sources:
+            if not isinstance(raw_source, Mapping):
+                break
+            path = raw_source.get("path")
+            raw_status = raw_source.get("status")
+            if not isinstance(path, str) or not path:
+                break
+            try:
+                status = SourceStatus(raw_status)
+            except (TypeError, ValueError):
+                break
+            parsed_sources.append((path, status))
+        else:
+            source_statuses = tuple(parsed_sources)
+            structured_sources_known = True
+
+    count_fields = (
+        "sources_attempted",
+        "sources_complete",
+        "sources_partial",
+        "sources_skipped",
+        "sources_failed",
+    )
+    raw_counts = tuple(collect.get(field) for field in count_fields)
+    if all(_is_nonnegative_int(value) for value in raw_counts):
+        counts = raw_counts
+    elif structured_sources_known:
+        status_counts = Counter(status for _, status in source_statuses)
+        counts = (
+            status_counts[SourceStatus.COMPLETE]
+            + status_counts[SourceStatus.PARTIAL]
+            + status_counts[SourceStatus.FAILED],
+            status_counts[SourceStatus.COMPLETE],
+            status_counts[SourceStatus.PARTIAL],
+            status_counts[SourceStatus.SKIPPED],
+            status_counts[SourceStatus.FAILED],
+        )
+    else:
+        counts = (None, None, None, None, None)
+
+    expected_directories: tuple[str, ...] | None = None
+    raw_directories = collect.get("expected_directories")
+    if isinstance(raw_directories, list) and all(
+        isinstance(directory, str) and directory
+        for directory in raw_directories
+    ):
+        expected_directory_count = collect.get("expected_directory_count")
+        if expected_directory_count is None or (
+            _is_nonnegative_int(expected_directory_count)
+            and expected_directory_count == len(raw_directories)
+        ):
+            expected_directories = tuple(raw_directories)
+
+    return _PreviousCoverage(
+        sources_attempted=counts[0],
+        sources_complete=counts[1],
+        sources_partial=counts[2],
+        sources_skipped=counts[3],
+        sources_failed=counts[4],
+        expected_directories=expected_directories,
+        source_statuses=source_statuses,
+    )
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _collection_audit_evidence(
+    *,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode | None,
+    previous: _PreviousCoverage,
+) -> tuple[CollectionAuditEvidence, bool]:
+    current_complete_paths = Counter(
+        source_result.source_path
+        for source_result in candidate.source_results
+        if source_result.status is SourceStatus.COMPLETE
+    )
+    previous_complete_paths = Counter(
+        path
+        for path, status in previous.source_statuses
+        if status is SourceStatus.COMPLETE
+    )
+    source_coverage_declined = bool(
+        previous_complete_paths - current_complete_paths
+    ) or (
+        previous.sources_complete is not None
+        and candidate.sources_complete < previous.sources_complete
+    )
+    directory_coverage_declined = (
+        previous.expected_directories is not None
+        and bool(
+            Counter(previous.expected_directories)
+            - Counter(candidate.expected_directories)
+        )
+    )
+    coverage_declined = source_coverage_declined or directory_coverage_declined
+
+    current_noncomplete = Counter(
+        (source_result.source_path, source_result.status)
+        for source_result in candidate.source_results
+        if source_result.status
+        in {SourceStatus.PARTIAL, SourceStatus.SKIPPED, SourceStatus.FAILED}
+    )
+    previous_noncomplete = Counter(
+        (path, status)
+        for path, status in previous.source_statuses
+        if status in {SourceStatus.PARTIAL, SourceStatus.SKIPPED, SourceStatus.FAILED}
+    )
+    previous_source_baseline_known = (
+        previous.sources_attempted is not None
+        or bool(previous.source_statuses)
+    )
+    new_noncomplete = previous_source_baseline_known and bool(
+        current_noncomplete - previous_noncomplete
+    )
+    if previous.sources_partial is not None:
+        new_noncomplete = new_noncomplete or any(
+            (
+                candidate.sources_partial > previous.sources_partial,
+                candidate.sources_skipped > previous.sources_skipped,
+                candidate.sources_failed > previous.sources_failed,
+            )
+        )
+
+    inventory = _collection_inventory_evidence(
+        manifest=manifest,
+        candidate=candidate,
+    )
+    dedup = (
+        None
+        if collection_mode is None
+        else _no_data_dedup_evidence(candidate, collection_mode)
+    )
+    audit = CollectionAuditEvidence(
+        sources_attempted=candidate.sources_attempted,
+        sources_complete=candidate.sources_complete,
+        sources_partial=candidate.sources_partial,
+        sources_skipped=candidate.sources_skipped,
+        sources_failed=candidate.sources_failed,
+        previous_sources_attempted=previous.sources_attempted,
+        previous_sources_complete=previous.sources_complete,
+        previous_sources_partial=previous.sources_partial,
+        previous_sources_skipped=previous.sources_skipped,
+        previous_sources_failed=previous.sources_failed,
+        expected_directories=candidate.expected_directories,
+        previous_expected_directories=previous.expected_directories,
+        source_order=tuple(
+            source_result.source_path
+            for source_result in candidate.source_results
+        ),
+        collection_mode=(
+            None if collection_mode is None else collection_mode.value
+        ),
+        inventory=inventory,
+        dedup=dedup,
+        coverage_declined=coverage_declined,
+    )
+    return audit, new_noncomplete
+
+
+def _collection_inventory_evidence(
+    *,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+) -> dict[str, object]:
+    inventory = candidate.source_inventory
+    if inventory is not None:
+        return {
+            "manifest_kind": inventory.manifest_kind,
+            "directory_discovery": inventory.directory_discovery,
+            "directories": list(inventory.directories),
+            "coverage_known": inventory.coverage_known,
+            "warnings": list(inventory.warnings),
+        }
+    return {
+        "manifest_kind": manifest.kind,
+        "directory_discovery": "declared",
+        "directories": list(candidate.expected_directories),
+        "coverage_known": True,
+        "warnings": [],
+    }
+
+
+def _coverage_warning(
+    *,
+    work_dir: Path,
+    candidate: CollectionCandidate,
+    previous: _PreviousCoverage,
+    previous_frames: int | None,
+    backup_path: Path | None,
+) -> str:
+    backup = (
+        "none"
+        if backup_path is None
+        else backup_path.resolve(strict=False)
+        .relative_to(work_dir.resolve(strict=False))
+        .as_posix()
+    )
+    previous_directories = (
+        None
+        if previous.expected_directories is None
+        else len(previous.expected_directories)
+    )
+    return (
+        "collection coverage warning: "
+        f"frames new={candidate.frame_count} old={_display_count(previous_frames)}; "
+        f"complete new={candidate.sources_complete} "
+        f"old={_display_count(previous.sources_complete)}; "
+        f"partial new={candidate.sources_partial} "
+        f"old={_display_count(previous.sources_partial)}; "
+        f"skipped new={candidate.sources_skipped} "
+        f"old={_display_count(previous.sources_skipped)}; "
+        f"failed new={candidate.sources_failed} "
+        f"old={_display_count(previous.sources_failed)}; "
+        f"directories new={candidate.expected_directory_count} "
+        f"old={_display_count(previous_directories)}; backup={backup}"
+    )
+
+
+def _display_count(value: int | None) -> str:
+    return "unknown" if value is None else str(value)
 
 
 def _no_data_result_target(

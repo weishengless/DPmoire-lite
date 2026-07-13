@@ -7,6 +7,7 @@ import pytest
 import yaml
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.io import read as ase_read
 from ase.io import write as ase_write
 
 import dpmoire_lite.collect as collect_module
@@ -885,6 +886,665 @@ def test_missing_scan_no_data_does_not_create_stage_manifest(tmp_path):
             }
         ],
     }
+
+
+def _nonzero_publication_api():
+    publisher = getattr(collect_module, "publish_nonzero_candidate", None)
+    assert callable(publisher), "publish_nonzero_candidate is not implemented"
+    return publisher
+
+
+def _publication_frame(index: int) -> Atoms:
+    atoms = Atoms(
+        "H",
+        positions=[[0.1 * index, 0.0, 0.0]],
+        cell=np.diag([4.0, 4.0, 4.0]),
+        pbc=True,
+    )
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=-1.0 - index,
+        forces=np.zeros((1, 3), dtype=float),
+        stress=np.zeros(6, dtype=float),
+    )
+    return atoms
+
+
+def _publication_outcar_source(
+    *,
+    directory: str,
+    status: models.SourceStatus,
+    frame_index: int,
+):
+    frames = ()
+    complete_count = 0
+    reason = None
+    if status in {models.SourceStatus.COMPLETE, models.SourceStatus.PARTIAL}:
+        frames = (_publication_frame(frame_index),)
+        complete_count = 1
+    if status is not models.SourceStatus.COMPLETE:
+        reason = f"structured {status.value} publication source"
+    return models.SourceResult(
+        source_path=f"{directory}/OUTCAR",
+        source_kind=models.SourceKind.OUTCAR,
+        status=status,
+        complete_count=complete_count,
+        accepted_frames=frames,
+        reason=reason,
+    )
+
+
+def _publication_candidate(
+    *statuses: models.SourceStatus,
+    directories: tuple[str, ...] | None = None,
+):
+    selected_directories = directories or tuple(
+        f"md/run-{index}" for index in range(len(statuses))
+    )
+    if len(selected_directories) != len(statuses):
+        raise ValueError("directories must align with source statuses")
+    source_results = tuple(
+        _publication_outcar_source(
+            directory=directory,
+            status=status,
+            frame_index=index,
+        )
+        for index, (directory, status) in enumerate(
+            zip(selected_directories, statuses, strict=True)
+        )
+    )
+    accepted_frames = tuple(
+        frame
+        for source_result in source_results
+        for frame in source_result.accepted_frames
+    )
+    return models.CollectionCandidate(
+        source_results=source_results,
+        accepted_frames=accepted_frames,
+        expected_directories=selected_directories,
+    )
+
+
+def _publication_full_dedup_candidate(
+    *,
+    manifest_kind: str,
+    coverage_known: bool,
+    duplicate: bool = False,
+):
+    directory = "md/run-a"
+    source_path = f"{directory}/ML_ABN"
+    seen = 2 if duplicate else 1
+    configurations = tuple(_status_mlab_configuration() for _ in range(seen))
+    source_result = models.SourceResult(
+        source_path=source_path,
+        source_kind=models.SourceKind.MLAB,
+        status=models.SourceStatus.COMPLETE,
+        complete_count=seen,
+        parsed_configurations=configurations,
+    )
+    inventory = models.SourceInventory(
+        manifest_kind=manifest_kind,
+        directory_discovery=(
+            "legacy-scan" if manifest_kind == "missing" else "declared"
+        ),
+        directories=(directory,),
+        coverage_known=coverage_known,
+        warnings=(
+            ("legacy scan cannot prove expected-source coverage",)
+            if not coverage_known
+            else ()
+        ),
+    )
+    source_stats = models.SourceDedupStats(
+        source_path=source_path,
+        seen=seen,
+        retained=1,
+        duplicates_removed=seen - 1,
+    )
+    dedup_stats = models.DedupStats(
+        seen=seen,
+        unique=1,
+        duplicates_removed=seen - 1,
+        candidate_frame_count=1,
+        per_source=(source_stats,),
+    )
+    return models.CollectionCandidate(
+        source_results=(source_result,),
+        accepted_frames=(_publication_frame(0),),
+        expected_directories=inventory.directories,
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        source_inventory=inventory,
+        dedup_stats=dedup_stats,
+    )
+
+
+def _previous_collect_record(
+    *,
+    directories: tuple[str, ...],
+    statuses: tuple[models.SourceStatus, ...],
+    frames: int,
+):
+    if len(directories) != len(statuses):
+        raise ValueError("previous directories must align with statuses")
+    sources = [
+        {
+            "path": f"{directory}/OUTCAR",
+            "kind": "outcar",
+            "status": status.value,
+            "complete_count": 1 if status is models.SourceStatus.COMPLETE else 0,
+            "accepted_count": 1 if status is models.SourceStatus.COMPLETE else 0,
+        }
+        for directory, status in zip(directories, statuses, strict=True)
+    ]
+    counts = {
+        status: sum(observed is status for observed in statuses)
+        for status in models.SourceStatus
+    }
+    return {
+        "transaction_id": "previous-transaction",
+        "status": "complete",
+        "frames": frames,
+        "written": True,
+        "sources_attempted": (
+            counts[models.SourceStatus.COMPLETE]
+            + counts[models.SourceStatus.PARTIAL]
+            + counts[models.SourceStatus.FAILED]
+        ),
+        "sources_complete": counts[models.SourceStatus.COMPLETE],
+        "sources_partial": counts[models.SourceStatus.PARTIAL],
+        "sources_skipped": counts[models.SourceStatus.SKIPPED],
+        "sources_failed": counts[models.SourceStatus.FAILED],
+        "expected_directories": list(directories),
+        "expected_directory_count": len(directories),
+        "source_order": [source["path"] for source in sources],
+        "sources": sources,
+    }
+
+
+def _write_current_publication_manifest(
+    work: Path,
+    *,
+    directories: tuple[str, ...],
+    previous_collect: dict | None = None,
+):
+    write_manifest(
+        work,
+        Manifest(
+            stage="md",
+            generated_at="nonzero-publication-test",
+            directories=list(directories),
+            collect=previous_collect or {},
+        ),
+    )
+    return read_manifest(work, "md")
+
+
+def _write_legacy_publication_manifest(
+    work: Path,
+    *,
+    directories: tuple[str, ...],
+):
+    path = manifest_path(work, "md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "stage": "md",
+                "directories": list(directories),
+                "legacy_key": "preserve-me",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path, path.read_bytes(), read_manifest(work, "md")
+
+
+def _publish_nonzero(
+    publisher,
+    *,
+    work: Path,
+    manifest,
+    candidate,
+    transaction_id: str,
+    collection_mode: models.MLFFCollectMode | None = None,
+):
+    return publisher(
+        work_dir=work,
+        stage="md",
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=collection_mode,
+        transaction_id=transaction_id,
+    )
+
+
+def test_complete_candidate_publishes_data_and_manifest_transaction(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a", "md/run-b")
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+        directories=directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-complete",
+    )
+
+    output = work / "MD_data.extxyz"
+    collect = _current_collect_record(work)
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert output.is_file()
+    assert collect["transaction_id"] == "plan10-task3-complete"
+    assert collect["status"] == "complete"
+    assert collect["frames"] == 2
+    assert collect["written"] is True
+    assert collect["sources_complete"] == 2
+
+
+def test_partial_candidate_publishes_degraded_with_exact_source_counts(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a", "md/run-b")
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.PARTIAL,
+        directories=directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-partial",
+    )
+
+    collect = _current_collect_record(work)
+    assert result.status is models.CollectStatus.DEGRADED
+    assert collect["status"] == "degraded"
+    assert collect["sources_attempted"] == 2
+    assert collect["sources_complete"] == 1
+    assert collect["sources_partial"] == 1
+    assert collect["sources_skipped"] == 0
+    assert collect["sources_failed"] == 0
+    assert collect["sources"] == [
+        source_result.as_diagnostic()
+        for source_result in candidate.source_results
+    ]
+
+
+def test_failed_source_with_other_frames_publishes_degraded(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a", "md/run-b")
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.FAILED,
+        directories=directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-failed-source",
+    )
+
+    collect = _current_collect_record(work)
+    assert result.status is models.CollectStatus.DEGRADED
+    assert collect["frames"] == 1
+    assert collect["sources_complete"] == 1
+    assert collect["sources_failed"] == 1
+
+
+def test_new_frames_less_than_previous_warns_with_backup(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a",)
+    previous_collect = _previous_collect_record(
+        directories=directories,
+        statuses=(models.SourceStatus.COMPLETE,),
+        frames=3,
+    )
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+        previous_collect=previous_collect,
+    )
+    output = work / "MD_data.extxyz"
+    previous_bytes = _write_previous_extxyz(output, frame_count=3)
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        directories=directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-smaller",
+    )
+
+    collect = _current_collect_record(work)
+    warning = "\n".join(result.warnings)
+    assert result.status is models.CollectStatus.COMPLETE
+    assert collect["previous_frames"] == 3
+    assert collect["backup"].startswith("backups/collect/")
+    assert collect["backup_sha256"] == atomic_io.sha256_file(
+        work / collect["backup"]
+    )
+    assert (work / collect["backup"]).read_bytes() == previous_bytes
+    assert "frames new=1 old=3" in warning
+    assert "backup=backups/collect/" in warning
+
+
+def test_source_or_directory_coverage_decline_warns_with_backup(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    previous_directories = ("md/run-a", "md/run-b")
+    current_directories = ("md/run-a",)
+    previous_collect = _previous_collect_record(
+        directories=previous_directories,
+        statuses=(models.SourceStatus.COMPLETE, models.SourceStatus.COMPLETE),
+        frames=1,
+    )
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=current_directories,
+        previous_collect=previous_collect,
+    )
+    _write_previous_extxyz(work / "MD_data.extxyz", frame_count=1)
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        directories=current_directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-coverage-decline",
+    )
+
+    collect = _current_collect_record(work)
+    warning = "\n".join(result.warnings)
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.coverage_declined is True
+    assert collect["coverage_declined"] is True
+    assert collect["previous_sources_complete"] == 2
+    assert collect["sources_complete"] == 1
+    assert collect["previous_expected_directories"] == list(
+        previous_directories
+    )
+    assert collect["expected_directories"] == list(current_directories)
+    assert "complete new=1 old=2" in warning
+    assert "directories new=1 old=2" in warning
+    assert "backup=backups/collect/" in warning
+
+
+def test_new_partial_failed_or_skipped_warns_with_backup(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = tuple(f"md/run-{index}" for index in range(4))
+    previous_collect = _previous_collect_record(
+        directories=directories,
+        statuses=(models.SourceStatus.COMPLETE,) * 4,
+        frames=2,
+    )
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+        previous_collect=previous_collect,
+    )
+    _write_previous_extxyz(work / "MD_data.extxyz", frame_count=2)
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.PARTIAL,
+        models.SourceStatus.FAILED,
+        models.SourceStatus.SKIPPED,
+        directories=directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-new-noncomplete",
+    )
+
+    warning = "\n".join(result.warnings)
+    assert result.status is models.CollectStatus.DEGRADED
+    assert "partial new=1 old=0" in warning
+    assert "failed new=1 old=0" in warning
+    assert "skipped new=1 old=0" in warning
+    assert "backup=backups/collect/" in warning
+
+
+def test_published_manifest_frames_equal_reread_extxyz_frames(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a", "md/run-b")
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        models.SourceStatus.COMPLETE,
+        directories=directories,
+    )
+
+    _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id="plan10-task3-frame-proof",
+    )
+
+    frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    collect = _current_collect_record(work)
+    assert len(frames) == collect["frames"] == candidate.frame_count
+
+
+def test_published_manifest_and_output_share_transaction_and_hash(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a",)
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        directories=directories,
+    )
+    transaction_id = "plan10-task3-identity"
+
+    _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        transaction_id=transaction_id,
+    )
+
+    output = work / "MD_data.extxyz"
+    collect = _current_collect_record(work)
+    assert collect["transaction_id"] == transaction_id
+    assert collect["output_sha256"] == atomic_io.sha256_file(output)
+    assert not (work / ".MD_data.extxyz.collect-journal.yaml").exists()
+
+
+def test_full_dedup_current_v2_publishes_counts_to_stage_manifest(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a",)
+    manifest = _write_current_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_full_dedup_candidate(
+        manifest_kind="current",
+        coverage_known=True,
+        duplicate=True,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        transaction_id="plan10-task3-current-full-dedup",
+    )
+
+    collect = _current_collect_record(work)
+    assert result.status is models.CollectStatus.COMPLETE
+    assert collect["collection_mode"] == "full-dedup"
+    assert collect["inventory"] == {
+        "manifest_kind": "current",
+        "directory_discovery": "declared",
+        "directories": ["md/run-a"],
+        "coverage_known": True,
+        "warnings": [],
+    }
+    assert collect["dedup"] == {
+        "applied": True,
+        "schema": "mlab-config-v1",
+        "seen": 2,
+        "unique": 1,
+        "duplicates_removed": 1,
+        "candidate_frame_count": 1,
+        "per_source": [
+            {
+                "source_path": "md/run-a/ML_ABN",
+                "seen": 2,
+                "retained": 1,
+                "duplicates_removed": 1,
+            }
+        ],
+    }
+
+
+def test_full_dedup_legacy_publishes_compatibility_result_manifest(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a",)
+    legacy_path, legacy_bytes, manifest = _write_legacy_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_full_dedup_candidate(
+        manifest_kind="legacy",
+        coverage_known=True,
+        duplicate=True,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        transaction_id="plan10-task3-legacy-full-dedup",
+    )
+
+    compatibility = yaml.safe_load(
+        (work / "MD_data.collect.yaml").read_text(encoding="utf-8")
+    )
+    assert result.status is models.CollectStatus.COMPLETE
+    assert legacy_path.read_bytes() == legacy_bytes
+    assert compatibility["input_layout"] == "legacy-stage-manifest"
+    assert compatibility["collection_mode"] == "full-dedup"
+    assert compatibility["collect"]["dedup"]["seen"] == 2
+    assert compatibility["collect"]["dedup"]["duplicates_removed"] == 1
+
+
+def test_missing_scan_publication_is_degraded_and_records_inventory(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    manifest = read_manifest(work, "md")
+    candidate = _publication_full_dedup_candidate(
+        manifest_kind="missing",
+        coverage_known=False,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        transaction_id="plan10-task3-missing-full-dedup",
+    )
+
+    compatibility = yaml.safe_load(
+        (work / "MD_data.collect.yaml").read_text(encoding="utf-8")
+    )
+    assert result.status is models.CollectStatus.DEGRADED
+    assert not manifest_path(work, "md").exists()
+    assert compatibility["directory_discovery"] == "legacy-scan"
+    assert compatibility["discovered_directories"] == ["md/run-a"]
+    assert compatibility["collect"]["inventory"] == {
+        "manifest_kind": "missing",
+        "directory_discovery": "legacy-scan",
+        "directories": ["md/run-a"],
+        "coverage_known": False,
+        "warnings": ["legacy scan cannot prove expected-source coverage"],
+    }
+
+
+def test_compatibility_publication_never_rewrites_legacy_stage_manifest(tmp_path):
+    publish_nonzero_candidate = _nonzero_publication_api()
+    work = tmp_path / "work"
+    directories = ("md/run-a",)
+    legacy_path, legacy_bytes, manifest = _write_legacy_publication_manifest(
+        work,
+        directories=directories,
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        directories=directories,
+    )
+
+    result = _publish_nonzero(
+        publish_nonzero_candidate,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.SEED_AWARE,
+        transaction_id="plan10-task3-preserve-legacy",
+    )
+
+    assert result.status is models.CollectStatus.COMPLETE
+    assert legacy_path.read_bytes() == legacy_bytes
+    assert (work / "MD_data.collect.yaml").is_file()
+    assert (work / "MD_data.extxyz").is_file()
 
 
 def test_collect_validation_uses_all_ionic_steps(monkeypatch, tmp_path):
