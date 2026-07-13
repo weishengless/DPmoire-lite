@@ -73,7 +73,7 @@ class Dataset:
             )
 
         converted = [
-            _atoms_from_mlab_configuration(configuration)
+            atoms_from_mlab_configuration(configuration)
             for configuration in result.configurations[skip_configs:]
         ]
         self.data.extend(converted)
@@ -115,7 +115,7 @@ class Dataset:
         ase_write(Path(path), self.data, format="extxyz")
 
 
-def _atoms_from_mlab_configuration(configuration: MlabConfiguration) -> Atoms:
+def atoms_from_mlab_configuration(configuration: MlabConfiguration) -> Atoms:
     symbols = [
         element
         for element, count in zip(configuration.elements, configuration.counts)

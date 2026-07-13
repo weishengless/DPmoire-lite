@@ -1,11 +1,15 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 import yaml
 from ase import Atoms
+from ase.units import GPa
 
+from dpmoire_lite import collect as collect_module
 from dpmoire_lite import collect_models as models
-from dpmoire_lite.mlab import MlabConfiguration, MlabIdentity
+from dpmoire_lite import dataset as dataset_module
+from dpmoire_lite.mlab import MlabConfiguration, MlabIdentity, parse_mlab
 from dpmoire_lite.paths import relative_to_workdir
 
 
@@ -245,3 +249,119 @@ def test_source_diagnostics_use_workdir_relative_paths(tmp_path):
             complete_count=0,
             reason="missing ML_ABN",
         )
+
+
+def _collect_mlab_source(fixture_name: str):
+    collector = getattr(collect_module, "collect_mlab_source", None)
+    assert callable(collector), "collect_mlab_source is not implemented"
+    work_dir = Path(__file__).parent
+    source_path = work_dir / "data" / "mlab" / fixture_name
+    return collector(work_dir=work_dir, source_path=source_path)
+
+
+def test_complete_mlab_source_contributes_all_new_configurations():
+    result = _collect_mlab_source("complete_multi.mlab")
+
+    assert result.source_path == "data/mlab/complete_multi.mlab"
+    assert result.source_kind is models.SourceKind.MLAB
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == result.accepted_count == 2
+    assert result.accepted_frames == ()
+    assert result.reason is None
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in result.parsed_configurations
+    ) == (1, 2)
+
+
+def test_tail_partial_mlab_contributes_complete_prefix_and_metadata():
+    result = _collect_mlab_source("tail_position_crop.mlab")
+
+    assert result.status is models.SourceStatus.PARTIAL
+    assert result.complete_count == result.accepted_count == 1
+    assert len(result.parsed_configurations) == 1
+    assert result.parsed_configurations[0].source_configuration_number == 1
+    assert result.accepted_frames == ()
+    assert result.discarded_configuration_number == 2
+    assert result.discarded_block == "positions"
+    assert result.reason is not None
+    assert "end of file" in result.reason.lower()
+
+
+def test_first_frame_truncated_mlab_is_failed_with_zero_frames():
+    result = _collect_mlab_source("first_incomplete.mlab")
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.discarded_configuration_number == 1
+    assert result.discarded_block == "positions"
+    assert result.line_number is not None
+    assert result.reason is not None
+    assert "first configuration incomplete" in result.reason
+
+
+def test_internal_corruption_mlab_is_failed_with_zero_frames():
+    result = _collect_mlab_source("internal_corruption.mlab")
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.discarded_configuration_number == 2
+    assert result.discarded_block == "positions"
+    assert result.line_number is not None
+    assert result.reason is not None
+    assert "internal corruption" in result.reason
+
+
+def test_mlab_source_failure_does_not_mutate_existing_candidate():
+    existing_source = _outcar_result("md/existing/OUTCAR", 0.5)
+    candidate = models.CollectionCandidate(
+        source_results=(existing_source,),
+        accepted_frames=(_frame(0.5),),
+    )
+    before_source = candidate.source_results[0]
+    before_frame = candidate.accepted_frames[0]
+    before_symbols = tuple(before_frame.get_chemical_symbols())
+    before_cell = before_frame.get_cell().array.copy()
+    before_positions = before_frame.get_positions().copy()
+
+    result = _collect_mlab_source("internal_corruption.mlab")
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.accepted_count == 0
+    assert result.parsed_configurations == ()
+    assert candidate.frame_count == 1
+    assert candidate.source_results[0] is before_source
+    assert candidate.source_results[0].accepted_count == 1
+    assert tuple(candidate.accepted_frames[0].get_chemical_symbols()) == before_symbols
+    np.testing.assert_allclose(candidate.accepted_frames[0].get_cell().array, before_cell)
+    np.testing.assert_allclose(
+        candidate.accepted_frames[0].get_positions(), before_positions
+    )
+
+
+def test_mlab_source_ase_properties_match_parsed_values():
+    source_path = Path(__file__).parent / "data" / "mlab" / "complete_vasp_651.mlab"
+    configuration = parse_mlab(source_path).configurations[0]
+    adapter = getattr(dataset_module, "atoms_from_mlab_configuration", None)
+    assert callable(adapter), "atoms_from_mlab_configuration is not implemented"
+
+    atoms = adapter(configuration)
+
+    expected_symbols = tuple(
+        element
+        for element, count in zip(configuration.elements, configuration.counts)
+        for _ in range(count)
+    )
+    assert tuple(atoms.get_chemical_symbols()) == expected_symbols
+    np.testing.assert_allclose(atoms.get_cell().array, configuration.lattice)
+    np.testing.assert_allclose(atoms.get_positions(), configuration.positions)
+    assert atoms.get_potential_energy() == pytest.approx(configuration.energy)
+    np.testing.assert_allclose(atoms.get_forces(), configuration.forces)
+
+    xx, yy, zz, xy, yz, zx = configuration.stress_kbar
+    expected_stress = -0.1 * GPa * np.array([xx, yy, zz, yz, zx, xy])
+    np.testing.assert_allclose(atoms.get_stress(), expected_stress)

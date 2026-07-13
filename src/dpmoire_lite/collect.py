@@ -4,8 +4,10 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import DPmoireLiteConfig, load_config
+from .collect_models import SourceKind, SourceResult, SourceStatus
 from .dataset import Dataset, count_ml_ab_configs
 from .manifest import Manifest, read_manifest, write_manifest
+from .mlab import MlabParseError, parse_mlab
 from .outcar import find_outcar_series
 from .paths import manifest_path, relative_to_workdir
 
@@ -61,6 +63,45 @@ def collect_md(config: DPmoireLiteConfig, manifest: Manifest) -> tuple[Dataset, 
 def collect_validation(config: DPmoireLiteConfig, manifest: Manifest) -> tuple[Dataset, Manifest]:
     manifest = _prepare_manifest(config, manifest, "validation")
     return _collect_outcars(config, manifest, freq=1)
+
+
+def collect_mlab_source(*, work_dir: Path, source_path: Path) -> SourceResult:
+    source_path = Path(source_path)
+    relative_source_path = relative_to_workdir(work_dir, source_path)
+
+    try:
+        parsed = parse_mlab(source_path)
+    except MlabParseError as error:
+        return SourceResult(
+            source_path=relative_source_path,
+            source_kind=SourceKind.MLAB,
+            status=SourceStatus.FAILED,
+            complete_count=0,
+            reason=error.reason,
+            discarded_configuration_number=error.configuration_number,
+            discarded_block=error.block,
+            line_number=error.line_number,
+        )
+
+    if parsed.status == "complete":
+        status = SourceStatus.COMPLETE
+        reason = None
+    elif parsed.status == "partial":
+        status = SourceStatus.PARTIAL
+        reason = parsed.discarded_reason
+    else:
+        raise ValueError(f"unknown ML_ABN parser status: {parsed.status!r}")
+
+    return SourceResult(
+        source_path=relative_source_path,
+        source_kind=SourceKind.MLAB,
+        status=status,
+        complete_count=parsed.complete_count,
+        parsed_configurations=parsed.configurations,
+        reason=reason,
+        discarded_configuration_number=parsed.discarded_configuration_number,
+        discarded_block=parsed.discarded_block,
+    )
 
 
 def _collect_md_ml(config: DPmoireLiteConfig, manifest: Manifest) -> tuple[Dataset, Manifest]:
