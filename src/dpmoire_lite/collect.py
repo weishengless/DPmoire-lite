@@ -4,11 +4,12 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+import warnings
 
 from .config import DPmoireLiteConfig, load_config
 from .collect_models import SourceKind, SourceResult, SourceStatus
 from .dataset import Dataset, count_ml_ab_configs
-from .manifest import Manifest, read_manifest, write_manifest
+from .manifest import Manifest, ManifestReadResult, read_manifest, write_manifest
 from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
 from .outcar import find_outcar_series
 from .paths import manifest_path, relative_to_workdir
@@ -113,6 +114,100 @@ def collect_current_mlab_source(
     manifest: Manifest,
 ) -> SourceResult:
     seed_count, expected_digest = _current_seed_evidence(manifest)
+    return _collect_mlab_seed_prefix(
+        work_dir=work_dir,
+        source_path=source_path,
+        seed_count=seed_count,
+        expected_digest=expected_digest,
+    )
+
+
+def collect_legacy_mlab_source(
+    *,
+    work_dir: Path,
+    source_path: Path,
+    manifest: ManifestReadResult,
+) -> SourceResult:
+    _validate_legacy_manifest_result(manifest)
+
+    source_path = Path(source_path)
+    relative_source_path = relative_to_workdir(work_dir, source_path)
+    seed_path = Path(work_dir) / "init_mlff" / "ML_ABN"
+    if not seed_path.is_file():
+        return _legacy_seed_failure(
+            relative_source_path,
+            "legacy seed evidence missing: init_mlff/ML_ABN",
+        )
+
+    try:
+        parsed_seed = parse_mlab(seed_path)
+    except MlabParseError as error:
+        details = [error.reason]
+        if error.configuration_number is not None:
+            details.append(f"configuration {error.configuration_number}")
+        if error.block:
+            details.append(f"block {error.block}")
+        if error.line_number is not None:
+            details.append(f"line {error.line_number}")
+        return _legacy_seed_failure(
+            relative_source_path,
+            "legacy seed evidence at init_mlff/ML_ABN is invalid: "
+            + ", ".join(details),
+        )
+
+    if parsed_seed.status == "partial":
+        reason = parsed_seed.discarded_reason or "parser returned partial evidence"
+        return _legacy_seed_failure(
+            relative_source_path,
+            "legacy seed evidence at init_mlff/ML_ABN must be complete: " + reason,
+        )
+    if parsed_seed.status != "complete":
+        raise ValueError(f"unknown ML_ABN parser status: {parsed_seed.status!r}")
+
+    seed_count = parsed_seed.complete_count
+    seed_identity = seed_prefix_identity(parsed_seed.configurations)
+    warnings.warn(
+        "Legacy seed evidence was rebuilt from init_mlff/ML_ABN using "
+        "mlab-seed-v1; the final prefix is being verified.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return _collect_mlab_seed_prefix(
+        work_dir=work_dir,
+        source_path=source_path,
+        seed_count=seed_count,
+        expected_digest=seed_identity.sha256,
+    )
+
+
+def _validate_legacy_manifest_result(manifest: ManifestReadResult) -> None:
+    if not isinstance(manifest, ManifestReadResult):
+        raise ValueError("legacy collection requires a ManifestReadResult")
+    if (
+        manifest.kind != "legacy"
+        or manifest.manifest is not None
+        or not isinstance(manifest.raw_data, Mapping)
+    ):
+        raise ValueError("legacy collection requires a valid legacy ManifestReadResult")
+
+
+def _legacy_seed_failure(source_path: str, reason: str) -> SourceResult:
+    return SourceResult(
+        source_path=source_path,
+        source_kind=SourceKind.MLAB,
+        status=SourceStatus.FAILED,
+        complete_count=0,
+        reason=reason,
+    )
+
+
+def _collect_mlab_seed_prefix(
+    *,
+    work_dir: Path,
+    source_path: Path,
+    seed_count: int,
+    expected_digest: str,
+) -> SourceResult:
     raw_result = collect_mlab_source(work_dir=work_dir, source_path=source_path)
 
     if raw_result.status is SourceStatus.FAILED:

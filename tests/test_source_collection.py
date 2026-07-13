@@ -1,5 +1,6 @@
 import hashlib
 import shutil
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -11,14 +12,14 @@ from ase.units import GPa
 from dpmoire_lite import collect as collect_module
 from dpmoire_lite import collect_models as models
 from dpmoire_lite import dataset as dataset_module
-from dpmoire_lite.manifest import Manifest
+from dpmoire_lite.manifest import Manifest, read_manifest
 from dpmoire_lite.mlab import (
     MlabConfiguration,
     MlabIdentity,
     parse_mlab,
     seed_prefix_identity,
 )
-from dpmoire_lite.paths import relative_to_workdir
+from dpmoire_lite.paths import manifest_path, relative_to_workdir
 
 
 def _frame(x_position: float = 0.0) -> Atoms:
@@ -670,3 +671,212 @@ def test_new_data_tail_partial_preserves_complete_new_frames(tmp_path):
     assert result.seed_identity == seed_prefix_identity(
         parsed_seed.configurations[:1]
     )
+
+
+def _collect_legacy_mlab_source_api():
+    collector = getattr(collect_module, "collect_legacy_mlab_source", None)
+    assert callable(
+        collector
+    ), "collect_legacy_mlab_source is not implemented"
+    return collector
+
+
+def _legacy_manifest_result(work_dir: Path):
+    path = manifest_path(work_dir, "md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "stage": "md",
+                "directories": ["md/0_0"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    result = read_manifest(work_dir, "md")
+    assert result.kind == "legacy"
+    assert result.manifest is None
+    assert isinstance(result.raw_data, dict)
+    return result
+
+
+def _legacy_runtime_source(
+    tmp_path: Path,
+    final_fixture: str,
+    seed_fixture: str | None,
+) -> tuple[Path, Path]:
+    work_dir = tmp_path / "work"
+    source_path = work_dir / "md" / "0_0" / "ML_ABN"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_mlab_fixture_path(final_fixture), source_path)
+    if seed_fixture is not None:
+        seed_path = work_dir / "init_mlff" / "ML_ABN"
+        seed_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(_mlab_fixture_path(seed_fixture), seed_path)
+    return work_dir, source_path
+
+
+def test_legacy_seed_identity_rebuilt_from_complete_init_mlff_mlabn(tmp_path):
+    collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
+    work_dir, source_path = _legacy_runtime_source(
+        tmp_path,
+        "complete_vasp_651.mlab",
+        "complete_vasp_651.mlab",
+    )
+    manifest = _legacy_manifest_result(work_dir)
+    expected_identity = seed_prefix_identity(
+        parse_mlab(work_dir / "init_mlff" / "ML_ABN").configurations
+    )
+
+    with pytest.warns(UserWarning) as observed:
+        result = collect_legacy_mlab_source(
+            work_dir=work_dir,
+            source_path=source_path,
+            manifest=manifest,
+        )
+
+    assert len(observed) == 1
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 1
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.seed_identity == expected_identity
+
+
+def test_legacy_seed_rebuild_warns_and_verifies_final_prefix(tmp_path):
+    collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
+    work_dir, source_path = _legacy_runtime_source(
+        tmp_path,
+        "complete_multi.mlab",
+        "complete_vasp_651.mlab",
+    )
+    manifest = _legacy_manifest_result(work_dir)
+    expected_identity = seed_prefix_identity(
+        parse_mlab(work_dir / "init_mlff" / "ML_ABN").configurations
+    )
+
+    with pytest.warns(UserWarning) as observed:
+        result = collect_legacy_mlab_source(
+            work_dir=work_dir,
+            source_path=source_path,
+            manifest=manifest,
+        )
+
+    assert len(observed) == 1
+    warning_message = str(observed[0].message).lower()
+    assert "legacy" in warning_message
+    assert "init_mlff/ml_abn" in warning_message
+    assert "mlab-seed-v1" in warning_message
+    assert "final prefix" in warning_message
+    assert "verif" in warning_message
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 2
+    assert result.accepted_count == 1
+    assert result.accepted_frames == ()
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in result.parsed_configurations
+    ) == (2,)
+    assert result.seed_identity == expected_identity
+
+
+def test_legacy_missing_init_seed_fails_without_using_md_ml_ab(tmp_path):
+    collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
+    work_dir, source_path = _legacy_runtime_source(
+        tmp_path,
+        "complete_multi.mlab",
+        None,
+    )
+    _copy_current_ml_ab(work_dir, "complete_vasp_651.mlab")
+    manifest = _legacy_manifest_result(work_dir)
+
+    result = collect_legacy_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 0
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.seed_identity is None
+    assert result.reason is not None
+    assert "init_mlff/ML_ABN" in result.reason
+    assert "legacy" in result.reason.lower()
+    assert "missing" in result.reason.lower()
+
+
+def test_legacy_partial_or_invalid_init_seed_fails(tmp_path):
+    collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
+    cases = (
+        ("partial", "tail_position_crop.mlab"),
+        ("invalid", "internal_corruption.mlab"),
+    )
+
+    for case_name, seed_fixture in cases:
+        work_dir, source_path = _legacy_runtime_source(
+            tmp_path / case_name,
+            "complete_vasp_651.mlab",
+            seed_fixture,
+        )
+        manifest = _legacy_manifest_result(work_dir)
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always")
+            result = collect_legacy_mlab_source(
+                work_dir=work_dir,
+                source_path=source_path,
+                manifest=manifest,
+            )
+
+        assert not any(
+            "legacy" in str(item.message).lower() for item in observed
+        )
+        assert result.status is models.SourceStatus.FAILED
+        assert result.complete_count == 0
+        assert result.accepted_count == 0
+        assert result.accepted_frames == ()
+        assert result.parsed_configurations == ()
+        assert result.seed_identity is None
+        assert result.reason is not None
+        assert "init_mlff/ML_ABN" in result.reason
+        assert any(
+            marker in result.reason.lower()
+            for marker in ("complete", "parse", "invalid")
+        )
+
+
+def test_legacy_final_prefix_mismatch_fails_source(tmp_path):
+    collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
+    work_dir, source_path = _legacy_runtime_source(
+        tmp_path,
+        "complete_vasp_651.mlab",
+        "complete_vasp_641.mlab",
+    )
+    manifest = _legacy_manifest_result(work_dir)
+    expected_identity = seed_prefix_identity(
+        parse_mlab(work_dir / "init_mlff" / "ML_ABN").configurations
+    )
+    actual_identity = seed_prefix_identity(parse_mlab(source_path).configurations)
+
+    with pytest.warns(UserWarning) as observed:
+        result = collect_legacy_mlab_source(
+            work_dir=work_dir,
+            source_path=source_path,
+            manifest=manifest,
+        )
+
+    assert len(observed) == 1
+    assert result.status is models.SourceStatus.FAILED
+    assert result.complete_count == 1
+    assert result.accepted_count == 0
+    assert result.accepted_frames == ()
+    assert result.parsed_configurations == ()
+    assert result.reason is not None
+    assert "seed prefix mismatch" in result.reason.lower()
+    assert expected_identity.sha256 in result.reason
+    assert actual_identity.sha256 in result.reason
+    assert result.seed_identity == actual_identity
