@@ -10,6 +10,7 @@ from ase.io import ParseError
 
 from .config import DPmoireLiteConfig, load_config
 from .collect_models import (
+    CollectResult,
     CollectStatus,
     CollectionCandidate,
     DedupStats,
@@ -20,6 +21,14 @@ from .collect_models import (
     SourceInventory,
     SourceStatus,
     _validate_relative_source_path,
+)
+from .collect_publish import (
+    CompatibilityManifestEvidence,
+    ManifestOnlyRequest,
+    PublicationError,
+    PublicationSession,
+    ResultManifestTarget,
+    ResultManifestTargetKind,
 )
 from .dataset import Dataset, atoms_from_mlab_configuration, count_ml_ab_configs
 from .manifest import Manifest, ManifestReadResult, read_manifest, write_manifest
@@ -78,6 +87,258 @@ def select_collect_status(
     ):
         return CollectStatus.DEGRADED
     return CollectStatus.COMPLETE
+
+
+def publish_no_data_candidate(
+    *,
+    work_dir: Path,
+    stage: str,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode | None,
+    transaction_id: str,
+) -> CollectResult:
+    if not isinstance(manifest, ManifestReadResult):
+        raise TypeError("manifest must be a ManifestReadResult")
+    if not isinstance(candidate, CollectionCandidate):
+        raise TypeError("candidate must be a CollectionCandidate")
+    if candidate.frame_count != 0:
+        raise ValueError("manifest-only publication requires a zero-frame candidate")
+    if stage not in COLLECT_OUTPUTS:
+        raise ValueError(f"Unknown collect stage: {stage!r}")
+    if collection_mode is not None and not isinstance(
+        collection_mode,
+        MLFFCollectMode,
+    ):
+        raise TypeError("collection_mode must be an MLFFCollectMode or None")
+    if candidate.collection_mode is not None and (
+        collection_mode is not candidate.collection_mode
+    ):
+        raise ValueError("collection_mode does not match the candidate")
+    if collection_mode is MLFFCollectMode.FULL_DEDUP and (
+        candidate.collection_mode is not MLFFCollectMode.FULL_DEDUP
+    ):
+        raise ValueError("full-dedup publication requires full-dedup candidate evidence")
+
+    work_dir = Path(work_dir)
+    final_output = work_dir / COLLECT_OUTPUTS[stage]
+    target, compatibility_evidence = _no_data_result_target(
+        work_dir=work_dir,
+        stage=stage,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=collection_mode,
+    )
+    source_diagnostics = tuple(
+        source_result.as_diagnostic()
+        for source_result in candidate.source_results
+    )
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with PublicationSession(
+            work_dir=work_dir,
+            stage=stage,
+            final_output=final_output,
+            target=target,
+        ) as session:
+            if session.recovered_result is not None:
+                raise RuntimeError(
+                    "recovered publication requires Plan 10 Task 4 orchestration"
+                )
+            request = ManifestOnlyRequest(
+                work_dir=work_dir,
+                stage=stage,
+                final_output=final_output,
+                target=target,
+                transaction_id=transaction_id,
+                status=CollectStatus.NO_DATA.value,
+                source_diagnostics=source_diagnostics,
+                previous_output_sha256=session.previous_output_sha256,
+                previous_manifest_sha256=session.previous_manifest_sha256,
+                current_manifest=(
+                    manifest
+                    if target.kind is ResultManifestTargetKind.CURRENT_STAGE
+                    else None
+                ),
+                compatibility_evidence=compatibility_evidence,
+            )
+            session.publish_manifest_only(request)
+    except PublicationError as exc:
+        return CollectResult(
+            status=CollectStatus.FATAL,
+            candidate=candidate,
+            fatal_diagnostic=str(exc),
+        )
+
+    return CollectResult(
+        status=CollectStatus.NO_DATA,
+        candidate=candidate,
+        publication_committed=True,
+    )
+
+
+def _no_data_result_target(
+    *,
+    work_dir: Path,
+    stage: str,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode | None,
+) -> tuple[ResultManifestTarget, CompatibilityManifestEvidence | None]:
+    if manifest.kind in {"current", "legacy"}:
+        declared_directories = _candidate_manifest_directories(
+            manifest,
+            stage=stage,
+        )
+        if candidate.expected_directories != declared_directories:
+            raise ValueError(
+                "candidate expected directories do not match the input manifest"
+            )
+        _validate_no_data_inventory(
+            candidate,
+            manifest_kind=manifest.kind,
+            directories=declared_directories,
+        )
+    else:
+        declared_directories = ()
+
+    if manifest.kind == "current":
+        return (
+            ResultManifestTarget(
+                kind=ResultManifestTargetKind.CURRENT_STAGE,
+                path=manifest_path(work_dir, stage),
+            ),
+            None,
+        )
+
+    if manifest.kind == "legacy":
+        if stage != "md":
+            raise ValueError("legacy result publication is supported only for MD")
+        mode = _require_compatibility_mode(collection_mode)
+        return (
+            ResultManifestTarget(
+                kind=ResultManifestTargetKind.MD_COMPATIBILITY,
+                path=work_dir / "MD_data.collect.yaml",
+            ),
+            CompatibilityManifestEvidence(
+                input_layout="legacy-stage-manifest",
+                directory_discovery="declared",
+                declared_directories=declared_directories,
+                discovered_directories=(),
+                collection_mode=mode.value,
+                dedup=_no_data_dedup_evidence(candidate, mode),
+            ),
+        )
+
+    if manifest.kind != "missing":
+        raise ValueError(f"unsupported manifest result kind: {manifest.kind!r}")
+    if manifest.manifest is not None or manifest.raw_data is not None:
+        raise ValueError("missing manifest result is internally inconsistent")
+    if stage != "md" or collection_mode is not MLFFCollectMode.FULL_DEDUP:
+        raise ValueError(
+            "missing manifests require explicit MD full-dedup compatibility publication"
+        )
+    inventory = candidate.source_inventory
+    if (
+        candidate.collection_mode is not MLFFCollectMode.FULL_DEDUP
+        or inventory is None
+        or inventory.manifest_kind != "missing"
+        or inventory.directory_discovery != "legacy-scan"
+        or inventory.coverage_known
+        or candidate.dedup_stats is None
+    ):
+        raise ValueError(
+            "missing manifest publication requires coherent legacy-scan inventory"
+        )
+
+    return (
+        ResultManifestTarget(
+            kind=ResultManifestTargetKind.MD_COMPATIBILITY,
+            path=work_dir / "MD_data.collect.yaml",
+        ),
+        CompatibilityManifestEvidence(
+            input_layout="missing-stage-manifest",
+            directory_discovery="legacy-scan",
+            declared_directories=(),
+            discovered_directories=inventory.directories,
+            collection_mode=collection_mode.value,
+            dedup=_no_data_dedup_evidence(candidate, collection_mode),
+        ),
+    )
+
+
+def _validate_no_data_inventory(
+    candidate: CollectionCandidate,
+    *,
+    manifest_kind: str,
+    directories: tuple[str, ...],
+) -> None:
+    inventory = candidate.source_inventory
+    if inventory is None:
+        return
+    if (
+        inventory.manifest_kind != manifest_kind
+        or inventory.directory_discovery != "declared"
+        or not inventory.coverage_known
+        or inventory.directories != directories
+    ):
+        raise ValueError("candidate inventory does not match the input manifest")
+
+
+def _require_compatibility_mode(
+    collection_mode: MLFFCollectMode | None,
+) -> MLFFCollectMode:
+    if not isinstance(collection_mode, MLFFCollectMode):
+        raise ValueError("compatibility publication requires an explicit MLFF mode")
+    return collection_mode
+
+
+def _no_data_dedup_evidence(
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode,
+) -> dict[str, object]:
+    if collection_mode is MLFFCollectMode.FULL_DEDUP:
+        stats = candidate.dedup_stats
+        if stats is None:
+            raise ValueError("full-dedup publication requires dedup statistics")
+        return {
+            "applied": True,
+            "schema": stats.schema,
+            "seen": stats.seen,
+            "unique": stats.unique,
+            "duplicates_removed": stats.duplicates_removed,
+            "candidate_frame_count": stats.candidate_frame_count,
+            "per_source": [
+                {
+                    "source_path": source_stats.source_path,
+                    "seen": source_stats.seen,
+                    "retained": source_stats.retained,
+                    "duplicates_removed": source_stats.duplicates_removed,
+                }
+                for source_stats in stats.per_source
+            ],
+        }
+
+    per_source = [
+        {
+            "source_path": source_result.source_path,
+            "seen": source_result.accepted_count,
+            "retained": source_result.accepted_count,
+            "duplicates_removed": 0,
+        }
+        for source_result in candidate.source_results
+    ]
+    seen = sum(source["seen"] for source in per_source)
+    return {
+        "applied": False,
+        "schema": None,
+        "seen": seen,
+        "unique": candidate.frame_count,
+        "duplicates_removed": 0,
+        "candidate_frame_count": candidate.frame_count,
+        "per_source": per_source,
+    }
 
 
 def run_collect(config_path: Path, stage: str) -> None:
