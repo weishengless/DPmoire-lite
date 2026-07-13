@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from ase.io.vasp import read_vasp_out
+from ase.io.vasp import iread_vasp_out, read_vasp_out
 
 from .config import DEFAULT_OUTCAR_PATTERNS
 
@@ -64,6 +65,16 @@ def find_outcar_series(
         )
         for order, (path, pattern, pattern_index) in enumerate(ordered_paths)
     )
+
+
+@contextmanager
+def open_outcar_frames(path: Path):
+    with Path(path).open(
+        "r",
+        encoding="utf-8",
+        errors="strict",
+    ) as file_object:
+        yield iread_vasp_out(file_object, index=":")
 
 
 def read_outcar_frames(path: Path):

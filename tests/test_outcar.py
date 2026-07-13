@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from ase.io.vasp import read_vasp_out
+import dpmoire_lite.outcar as outcar_module
 from dpmoire_lite.outcar import find_outcar_series
 
 
@@ -92,6 +93,79 @@ def touch(path, mtime):
 
 def selection_names(items):
     return [getattr(item, "path", item).name for item in items]
+
+
+def open_outcar_frames_for_test(path):
+    opener = getattr(outcar_module, "open_outcar_frames", None)
+    assert callable(opener), "open_outcar_frames is not implemented"
+    return opener(path)
+
+
+class RecordingTextHandle:
+    def __init__(self, handle):
+        self._handle = handle
+        self.name = handle.name
+        self.logical_bytes = 0
+        self.events = []
+
+    def _record_text(self, text):
+        self.logical_bytes += len(text.encode("utf-8"))
+
+    def read(self, size=-1):
+        self.events.append("read")
+        text = self._handle.read(size)
+        self._record_text(text)
+        return text
+
+    def readline(self, size=-1):
+        self.events.append("readline")
+        text = self._handle.readline(size)
+        self._record_text(text)
+        return text
+
+    def tell(self):
+        self.events.append("tell")
+        return self.logical_bytes
+
+    def close(self):
+        self.events.append("close")
+        return self._handle.close()
+
+    @property
+    def closed(self):
+        return self._handle.closed
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if line == "":
+            raise StopIteration
+        return line
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
+def install_recording_text_handle(monkeypatch):
+    real_open = Path.open
+    handles = []
+
+    def open_recording(path, *args, **kwargs):
+        handle = RecordingTextHandle(real_open(path, *args, **kwargs))
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", open_recording)
+    return handles
 
 
 def test_find_outcar_series_uses_pattern_priority_then_natural_sort(tmp_path):
@@ -201,3 +275,127 @@ def test_find_outcar_series_accepts_config_regex(tmp_path):
         find_outcar_series(tmp_path, patterns=[r"^history\.relax$"])
     )
     assert names == ["history.relax"]
+
+
+def test_open_outcar_frames_passes_file_object_to_iread_vasp_out(
+    monkeypatch,
+):
+    observed = {}
+
+    def fake_iread_vasp_out(file_object, index):
+        observed["file_object"] = file_object
+        observed["index"] = index
+        return iter(())
+
+    monkeypatch.setattr(
+        outcar_module,
+        "iread_vasp_out",
+        fake_iread_vasp_out,
+        raising=False,
+    )
+
+    with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+        assert list(frames) == []
+
+    file_object = observed["file_object"]
+    assert not isinstance(file_object, (str, Path))
+    assert hasattr(file_object, "name")
+    assert hasattr(file_object, "read")
+    assert hasattr(file_object, "readline")
+    assert observed["index"] == ":"
+
+
+def test_open_outcar_frames_reads_first_frame():
+    with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+        frame = next(frames)
+
+    assert len(frame) == 1
+    assert np.isfinite(frame.get_potential_energy())
+    assert np.isfinite(frame.calc.results["free_energy"])
+    assert np.isfinite(frame.get_forces()).all()
+    assert np.isfinite(frame.get_stress()).all()
+
+
+def test_first_frame_is_yielded_before_file_position_reaches_eof(monkeypatch):
+    handles = install_recording_text_handle(monkeypatch)
+
+    with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+        frame = next(frames)
+        assert len(frame) == 1
+        assert handles[0].tell() < OUTCAR_FIXTURE.stat().st_size
+
+
+def test_context_closes_handle_after_full_consumption(monkeypatch):
+    handles = install_recording_text_handle(monkeypatch)
+
+    with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+        assert len(list(frames)) == 2
+
+    assert handles[0].closed
+
+
+def test_context_closes_handle_after_break(monkeypatch):
+    handles = install_recording_text_handle(monkeypatch)
+
+    with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+        for _frame in frames:
+            break
+
+    assert handles[0].closed
+
+
+def test_context_closes_handle_after_iterator_error(monkeypatch):
+    handles = install_recording_text_handle(monkeypatch)
+    sentinel = RuntimeError("sentinel iterator failure")
+
+    def failing_iread_vasp_out(_file_object, index):
+        assert index == ":"
+
+        def frames():
+            yield object()
+            raise sentinel
+
+        return frames()
+
+    monkeypatch.setattr(
+        outcar_module,
+        "iread_vasp_out",
+        failing_iread_vasp_out,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="sentinel iterator failure"):
+        with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+            next(frames)
+            next(frames)
+
+    assert handles[0].closed
+
+
+def test_invalid_utf8_is_not_ignored(tmp_path):
+    invalid_path = tmp_path / "invalid.OUTCAR"
+    invalid_path.write_bytes(b"\xff")
+
+    with pytest.raises(UnicodeDecodeError):
+        with open_outcar_frames_for_test(invalid_path) as frames:
+            next(frames)
+
+
+def test_streamed_frames_match_small_batch_reference_semantics():
+    batch_frames = read_vasp_out(str(OUTCAR_FIXTURE), index=":")
+    with open_outcar_frames_for_test(OUTCAR_FIXTURE) as frames:
+        streamed_frames = list(frames)
+
+    assert len(streamed_frames) == len(batch_frames) == 2
+    for streamed, batch in zip(streamed_frames, batch_frames, strict=True):
+        assert streamed.get_chemical_symbols() == batch.get_chemical_symbols()
+        np.testing.assert_allclose(streamed.cell.array, batch.cell.array)
+        np.testing.assert_allclose(streamed.positions, batch.positions)
+        assert streamed.get_potential_energy() == pytest.approx(
+            batch.get_potential_energy()
+        )
+        assert streamed.calc.results["free_energy"] == pytest.approx(
+            batch.calc.results["free_energy"]
+        )
+        np.testing.assert_allclose(streamed.get_forces(), batch.get_forces())
+        np.testing.assert_allclose(streamed.get_stress(), batch.get_stress())
