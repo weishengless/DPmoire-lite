@@ -22,6 +22,122 @@ class SourceStatus(str, Enum):
     FAILED = "failed"
 
 
+class MLFFCollectMode(str, Enum):
+    SEED_AWARE = "seed-aware"
+    FULL_DEDUP = "full-dedup"
+
+
+DEFAULT_MLFF_COLLECT_MODE = MLFFCollectMode.SEED_AWARE
+
+
+@dataclass(frozen=True)
+class SourceInventory:
+    manifest_kind: str
+    directory_discovery: str
+    directories: tuple[str, ...]
+    coverage_known: bool
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.manifest_kind not in {"current", "legacy", "missing"}:
+            raise ValueError("manifest_kind must be current, legacy, or missing")
+        if self.directory_discovery not in {"declared", "legacy-scan"}:
+            raise ValueError(
+                "directory_discovery must be declared or legacy-scan"
+            )
+        if not isinstance(self.coverage_known, bool):
+            raise TypeError("coverage_known must be a bool")
+
+        if self.manifest_kind in {"current", "legacy"}:
+            if self.directory_discovery != "declared" or not self.coverage_known:
+                raise ValueError(
+                    "current and legacy inventories require declared, known coverage"
+                )
+        elif self.directory_discovery != "legacy-scan" or self.coverage_known:
+            raise ValueError(
+                "missing inventories require legacy-scan, unknown coverage"
+            )
+
+        directories = _normalize_iterable("directories", self.directories)
+        for directory in directories:
+            _validate_relative_source_path(directory)
+
+        warnings = _normalize_iterable("warnings", self.warnings)
+        for warning in warnings:
+            if not isinstance(warning, str) or not warning.strip():
+                raise ValueError("warnings must contain non-empty strings")
+
+        object.__setattr__(self, "directories", directories)
+        object.__setattr__(self, "warnings", warnings)
+
+
+@dataclass(frozen=True)
+class SourceDedupStats:
+    source_path: str
+    seen: int
+    retained: int
+    duplicates_removed: int
+
+    def __post_init__(self) -> None:
+        _validate_relative_source_path(self.source_path)
+        _validate_nonnegative_integer("seen", self.seen)
+        _validate_nonnegative_integer("retained", self.retained)
+        _validate_nonnegative_integer(
+            "duplicates_removed",
+            self.duplicates_removed,
+        )
+        if self.seen != self.retained + self.duplicates_removed:
+            raise ValueError(
+                "source seen must equal retained plus duplicates_removed"
+            )
+
+
+@dataclass(frozen=True)
+class DedupStats:
+    seen: int
+    unique: int
+    duplicates_removed: int
+    candidate_frame_count: int
+    per_source: tuple[SourceDedupStats, ...]
+    schema: str = "mlab-config-v1"
+
+    def __post_init__(self) -> None:
+        _validate_nonnegative_integer("seen", self.seen)
+        _validate_nonnegative_integer("unique", self.unique)
+        _validate_nonnegative_integer(
+            "duplicates_removed",
+            self.duplicates_removed,
+        )
+        _validate_nonnegative_integer(
+            "candidate_frame_count",
+            self.candidate_frame_count,
+        )
+        if self.schema != "mlab-config-v1":
+            raise ValueError("schema must be mlab-config-v1")
+
+        per_source = _normalize_iterable("per_source", self.per_source)
+        if any(not isinstance(stats, SourceDedupStats) for stats in per_source):
+            raise TypeError("per_source must contain only SourceDedupStats values")
+        object.__setattr__(self, "per_source", per_source)
+
+        if self.seen != self.unique + self.duplicates_removed:
+            raise ValueError("seen must equal unique plus duplicates_removed")
+        if self.unique != self.candidate_frame_count:
+            raise ValueError("unique must equal candidate_frame_count")
+        if sum(stats.seen for stats in per_source) != self.seen:
+            raise ValueError("per-source seen counts must equal aggregate seen")
+        if sum(stats.retained for stats in per_source) != self.unique:
+            raise ValueError(
+                "per-source retained counts must equal aggregate unique"
+            )
+        if sum(stats.duplicates_removed for stats in per_source) != (
+            self.duplicates_removed
+        ):
+            raise ValueError(
+                "per-source duplicate counts must equal aggregate duplicates_removed"
+            )
+
+
 @dataclass(frozen=True)
 class SourceResult:
     source_path: str
@@ -248,6 +364,15 @@ def _validate_relative_source_path(source_path: str) -> None:
         or ".." in posix_path.parts
     ):
         raise ValueError("source_path must be a workdir-relative POSIX path")
+
+
+def _normalize_iterable(name: str, value: object) -> tuple[object, ...]:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(f"{name} must be a non-string iterable")
+    try:
+        return tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError(f"{name} must be an iterable") from exc
 
 
 def _validate_nonnegative_integer(name: str, value: int) -> None:
