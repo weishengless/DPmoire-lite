@@ -1044,6 +1044,47 @@ class PublicationSession:
             )
         return copy.deepcopy(dict(collect))
 
+    def recovered_collect_record(self) -> Mapping[str, Any]:
+        """Return the collect record committed by this session's recovery."""
+        if not self._entered or self._lock is None:
+            raise PublicationError("publication session is not open")
+        recovered = self.recovered_result
+        if recovered is None:
+            raise PublicationError("publication session did not recover a transaction")
+        if recovered.data_sha256 is None:
+            raise PublicationError("recovered transaction has no published data hash")
+        if _optional_file_sha256(self.target.path) != recovered.manifest_sha256:
+            raise PublicationError(
+                "recovered result manifest hash does not match the transaction"
+            )
+        if _optional_file_sha256(self.final_output) != recovered.data_sha256:
+            raise PublicationError(
+                "recovered formal output hash does not match the transaction"
+            )
+
+        collect = _recovery_manifest_collect(
+            self,
+            self.target.path,
+            label="recovered result manifest",
+        )
+        if collect.get("transaction_id") != recovered.transaction_id:
+            raise PublicationError(
+                "recovered collect transaction_id does not match the transaction"
+            )
+        if collect.get("output_sha256") != recovered.data_sha256:
+            raise PublicationError(
+                "recovered collect output hash does not match the transaction"
+            )
+        if _optional_file_sha256(self.target.path) != recovered.manifest_sha256:
+            raise PublicationError(
+                "recovered result manifest changed while evidence was read"
+            )
+        if _optional_file_sha256(self.final_output) != recovered.data_sha256:
+            raise PublicationError(
+                "recovered formal output changed while evidence was read"
+            )
+        return copy.deepcopy(dict(collect))
+
     def publish(self, request: CandidateRequest) -> PublicationResult:
         if not self._entered or self._lock is None:
             raise PublicationError("publication session is not open")

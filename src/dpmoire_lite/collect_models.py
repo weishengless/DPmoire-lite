@@ -455,9 +455,61 @@ class CollectionCandidate:
 
 
 @dataclass(frozen=True)
+class RecoveredCollectionEvidence:
+    """Typed summary of a transaction committed during session recovery."""
+
+    transaction_id: str
+    status: CollectStatus
+    frame_count: int
+    sources_attempted: int
+    sources_complete: int
+    sources_partial: int
+    sources_skipped: int
+    sources_failed: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.transaction_id, str) or not self.transaction_id.strip():
+            raise ValueError("transaction_id must be a non-empty string")
+        if not isinstance(self.status, CollectStatus):
+            raise TypeError("status must be a CollectStatus")
+        if self.status not in {CollectStatus.COMPLETE, CollectStatus.DEGRADED}:
+            raise ValueError(
+                "recovered collection status must be complete or degraded"
+            )
+        _validate_nonnegative_integer("frame_count", self.frame_count)
+        if self.frame_count == 0:
+            raise ValueError("recovered collection evidence requires accepted frames")
+
+        for name in (
+            "sources_attempted",
+            "sources_complete",
+            "sources_partial",
+            "sources_skipped",
+            "sources_failed",
+        ):
+            _validate_nonnegative_integer(name, getattr(self, name))
+        if self.sources_attempted != (
+            self.sources_complete + self.sources_partial + self.sources_failed
+        ):
+            raise ValueError(
+                "sources_attempted must equal complete + partial + failed"
+            )
+
+    @property
+    def source_count(self) -> int:
+        return (
+            self.sources_complete
+            + self.sources_partial
+            + self.sources_skipped
+            + self.sources_failed
+        )
+
+
+@dataclass(frozen=True)
 class CollectResult:
     status: CollectStatus
     candidate: CollectionCandidate | None = None
+    recovered_evidence: RecoveredCollectionEvidence | None = None
     publication_committed: bool = False
     coverage_declined: bool = False
     warnings: tuple[str, ...] = ()
@@ -471,6 +523,13 @@ class CollectResult:
             CollectionCandidate,
         ):
             raise TypeError("candidate must be a CollectionCandidate or None")
+        if self.recovered_evidence is not None and not isinstance(
+            self.recovered_evidence,
+            RecoveredCollectionEvidence,
+        ):
+            raise TypeError(
+                "recovered_evidence must be RecoveredCollectionEvidence or None"
+            )
         if not isinstance(self.publication_committed, bool):
             raise TypeError("publication_committed must be a bool")
         if not isinstance(self.coverage_declined, bool):
@@ -487,6 +546,8 @@ class CollectResult:
             object.__setattr__(self, "candidate", copy.deepcopy(self.candidate))
 
         if self.status is CollectStatus.FATAL:
+            if self.recovered_evidence is not None:
+                raise ValueError("fatal result cannot carry recovered evidence")
             if (
                 not isinstance(self.fatal_diagnostic, str)
                 or not self.fatal_diagnostic.strip()
@@ -498,24 +559,42 @@ class CollectResult:
 
         if self.fatal_diagnostic is not None:
             raise ValueError("nonfatal result cannot carry a fatal diagnostic")
-        if self.candidate is None:
-            raise ValueError("nonfatal result requires a collection candidate")
+        evidence_count = int(self.candidate is not None) + int(
+            self.recovered_evidence is not None
+        )
+        if evidence_count != 1:
+            raise ValueError(
+                "nonfatal result requires exactly one candidate or recovered evidence"
+            )
         if not self.publication_committed:
             raise ValueError("nonfatal result requires publication commitment")
+        if self.recovered_evidence is not None:
+            if self.status is not self.recovered_evidence.status:
+                raise ValueError(
+                    "result status must match recovered collection evidence"
+                )
+            return
+        candidate = self.candidate
+        if candidate is None:
+            raise ValueError("nonfatal candidate result requires a candidate")
         if self.status in {CollectStatus.COMPLETE, CollectStatus.DEGRADED}:
-            if self.candidate.frame_count == 0:
+            if candidate.frame_count == 0:
                 raise ValueError(
                     "complete and degraded results require accepted frames"
                 )
         elif (
             self.status is CollectStatus.NO_DATA
-            and self.candidate.frame_count != 0
+            and candidate.frame_count != 0
         ):
             raise ValueError("no_data result requires zero accepted frames")
 
     @property
     def accepted_frame_count(self) -> int:
-        return self.candidate.frame_count if self.candidate is not None else 0
+        if self.candidate is not None:
+            return self.candidate.frame_count
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.frame_count
+        return 0
 
     @property
     def source_results(self) -> tuple[SourceResult, ...]:
@@ -523,31 +602,49 @@ class CollectResult:
 
     @property
     def source_count(self) -> int:
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.source_count
         return len(self.source_results)
 
     @property
     def sources_complete(self) -> int:
-        return (
-            self.candidate.sources_complete if self.candidate is not None else 0
-        )
+        if self.candidate is not None:
+            return self.candidate.sources_complete
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.sources_complete
+        return 0
 
     @property
     def sources_partial(self) -> int:
-        return self.candidate.sources_partial if self.candidate is not None else 0
+        if self.candidate is not None:
+            return self.candidate.sources_partial
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.sources_partial
+        return 0
 
     @property
     def sources_skipped(self) -> int:
-        return self.candidate.sources_skipped if self.candidate is not None else 0
+        if self.candidate is not None:
+            return self.candidate.sources_skipped
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.sources_skipped
+        return 0
 
     @property
     def sources_failed(self) -> int:
-        return self.candidate.sources_failed if self.candidate is not None else 0
+        if self.candidate is not None:
+            return self.candidate.sources_failed
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.sources_failed
+        return 0
 
     @property
     def sources_attempted(self) -> int:
-        return (
-            self.candidate.sources_attempted if self.candidate is not None else 0
-        )
+        if self.candidate is not None:
+            return self.candidate.sources_attempted
+        if self.recovered_evidence is not None:
+            return self.recovered_evidence.sources_attempted
+        return 0
 
 
 def _validate_relative_source_path(source_path: str) -> None:

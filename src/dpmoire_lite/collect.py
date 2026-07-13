@@ -8,14 +8,16 @@ from pathlib import Path
 import warnings
 
 from ase.io import ParseError
+import yaml
 
-from .config import DPmoireLiteConfig, load_config
+from .config import ConfigError, DPmoireLiteConfig, load_config
 from .collect_models import (
     CollectResult,
     CollectStatus,
     CollectionCandidate,
     DedupStats,
     MLFFCollectMode,
+    RecoveredCollectionEvidence,
     SourceKind,
     SourceResult,
     SourceDedupStats,
@@ -23,6 +25,7 @@ from .collect_models import (
     SourceStatus,
     _validate_relative_source_path,
 )
+from .file_lock import CollectLockError
 from .collect_publish import (
     CandidateRequest,
     CollectionAuditEvidence,
@@ -55,6 +58,10 @@ COLLECT_OUTPUTS = {
     "md": "MD_data.extxyz",
     "validation": "valid.extxyz",
 }
+
+
+class CollectionInvariantError(ValueError):
+    """Collection inputs cannot be interpreted without unsafe assumptions."""
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,148 @@ def select_collect_status(
     return CollectStatus.COMPLETE
 
 
+def _validated_previous_collect_record(
+    session: PublicationSession,
+) -> Mapping[str, object] | None:
+    previous_collect = session.previous_collect_record()
+    if session.target.kind is not ResultManifestTargetKind.MD_COMPATIBILITY:
+        return previous_collect
+    if previous_collect is None:
+        return None
+    if (
+        "output_sha256" not in previous_collect
+        or previous_collect.get("output_sha256")
+        != session.previous_output_sha256
+    ):
+        raise PublicationError(
+            "compatibility result output hash does not match the formal output"
+        )
+    return previous_collect
+
+
+def _publish_no_data_in_session(
+    session: PublicationSession,
+    *,
+    work_dir: Path,
+    stage: str,
+    final_output: Path,
+    target: ResultManifestTarget,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    compatibility_evidence: CompatibilityManifestEvidence | None,
+    transaction_id: str,
+) -> CollectResult:
+    _validated_previous_collect_record(session)
+    source_diagnostics = tuple(
+        source_result.as_diagnostic()
+        for source_result in candidate.source_results
+    )
+    request = ManifestOnlyRequest(
+        work_dir=work_dir,
+        stage=stage,
+        final_output=final_output,
+        target=target,
+        transaction_id=transaction_id,
+        status=CollectStatus.NO_DATA.value,
+        source_diagnostics=source_diagnostics,
+        previous_output_sha256=session.previous_output_sha256,
+        previous_manifest_sha256=session.previous_manifest_sha256,
+        current_manifest=(
+            manifest
+            if target.kind is ResultManifestTargetKind.CURRENT_STAGE
+            else None
+        ),
+        compatibility_evidence=compatibility_evidence,
+    )
+    session.publish_manifest_only(request)
+    return CollectResult(
+        status=CollectStatus.NO_DATA,
+        candidate=candidate,
+        publication_committed=True,
+    )
+
+
+def _publish_nonzero_in_session(
+    session: PublicationSession,
+    *,
+    work_dir: Path,
+    stage: str,
+    final_output: Path,
+    target: ResultManifestTarget,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode | None,
+    compatibility_evidence: CompatibilityManifestEvidence | None,
+    transaction_id: str,
+) -> CollectResult:
+    dataset = Dataset()
+    for frame in candidate.accepted_frames:
+        dataset.add_atoms(frame)
+    source_diagnostics = tuple(
+        source_result.as_diagnostic()
+        for source_result in candidate.source_results
+    )
+    previous = _previous_coverage(_validated_previous_collect_record(session))
+    audit, new_noncomplete = _collection_audit_evidence(
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=collection_mode,
+        previous=previous,
+    )
+    status = select_collect_status(
+        candidate,
+        coverage_declined=audit.coverage_declined,
+    )
+    request = CandidateRequest(
+        work_dir=work_dir,
+        stage=stage,
+        final_output=final_output,
+        target=target,
+        transaction_id=transaction_id,
+        dataset=dataset,
+        expected_frame_count=candidate.frame_count,
+        status=status.value,
+        source_diagnostics=source_diagnostics,
+        collection_audit=audit,
+        previous_output_sha256=session.previous_output_sha256,
+        previous_manifest_sha256=session.previous_manifest_sha256,
+        current_manifest=(
+            manifest
+            if target.kind is ResultManifestTargetKind.CURRENT_STAGE
+            else None
+        ),
+        compatibility_evidence=compatibility_evidence,
+    )
+    publication = session.publish(request)
+
+    result_warnings = list(
+        candidate.source_inventory.warnings
+        if candidate.source_inventory is not None
+        else ()
+    )
+    frame_declined = (
+        publication.previous_output_frames is not None
+        and candidate.frame_count < publication.previous_output_frames
+    )
+    if frame_declined or audit.coverage_declined or new_noncomplete:
+        result_warnings.append(
+            _coverage_warning(
+                work_dir=work_dir,
+                candidate=candidate,
+                previous=previous,
+                previous_frames=publication.previous_output_frames,
+                backup_path=publication.backup_path,
+            )
+        )
+    return CollectResult(
+        status=status,
+        candidate=candidate,
+        publication_committed=True,
+        coverage_declined=audit.coverage_declined,
+        warnings=tuple(result_warnings),
+    )
+
+
 def publish_no_data_candidate(
     *,
     work_dir: Path,
@@ -143,10 +292,6 @@ def publish_no_data_candidate(
         candidate=candidate,
         collection_mode=collection_mode,
     )
-    source_diagnostics = tuple(
-        source_result.as_diagnostic()
-        for source_result in candidate.source_results
-    )
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -160,36 +305,23 @@ def publish_no_data_candidate(
                 raise RuntimeError(
                     "recovered publication requires Plan 10 Task 4 orchestration"
                 )
-            request = ManifestOnlyRequest(
+            return _publish_no_data_in_session(
+                session,
                 work_dir=work_dir,
                 stage=stage,
                 final_output=final_output,
                 target=target,
-                transaction_id=transaction_id,
-                status=CollectStatus.NO_DATA.value,
-                source_diagnostics=source_diagnostics,
-                previous_output_sha256=session.previous_output_sha256,
-                previous_manifest_sha256=session.previous_manifest_sha256,
-                current_manifest=(
-                    manifest
-                    if target.kind is ResultManifestTargetKind.CURRENT_STAGE
-                    else None
-                ),
+                manifest=manifest,
+                candidate=candidate,
                 compatibility_evidence=compatibility_evidence,
+                transaction_id=transaction_id,
             )
-            session.publish_manifest_only(request)
     except PublicationError as exc:
         return CollectResult(
             status=CollectStatus.FATAL,
             candidate=candidate,
             fatal_diagnostic=str(exc),
         )
-
-    return CollectResult(
-        status=CollectStatus.NO_DATA,
-        candidate=candidate,
-        publication_committed=True,
-    )
 
 
 def publish_nonzero_candidate(
@@ -232,13 +364,6 @@ def publish_nonzero_candidate(
         candidate=candidate,
         collection_mode=collection_mode,
     )
-    source_diagnostics = tuple(
-        source_result.as_diagnostic()
-        for source_result in candidate.source_results
-    )
-    dataset = Dataset()
-    for frame in candidate.accepted_frames:
-        dataset.add_atoms(frame)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -252,72 +377,24 @@ def publish_nonzero_candidate(
                 raise RuntimeError(
                     "recovered publication requires Plan 10 Task 4 orchestration"
                 )
-            previous = _previous_coverage(session.previous_collect_record())
-            audit, new_noncomplete = _collection_audit_evidence(
-                manifest=manifest,
-                candidate=candidate,
-                collection_mode=collection_mode,
-                previous=previous,
-            )
-            status = select_collect_status(
-                candidate,
-                coverage_declined=audit.coverage_declined,
-            )
-            request = CandidateRequest(
+            return _publish_nonzero_in_session(
+                session,
                 work_dir=work_dir,
                 stage=stage,
                 final_output=final_output,
                 target=target,
-                transaction_id=transaction_id,
-                dataset=dataset,
-                expected_frame_count=candidate.frame_count,
-                status=status.value,
-                source_diagnostics=source_diagnostics,
-                collection_audit=audit,
-                previous_output_sha256=session.previous_output_sha256,
-                previous_manifest_sha256=session.previous_manifest_sha256,
-                current_manifest=(
-                    manifest
-                    if target.kind is ResultManifestTargetKind.CURRENT_STAGE
-                    else None
-                ),
+                manifest=manifest,
+                candidate=candidate,
+                collection_mode=collection_mode,
                 compatibility_evidence=compatibility_evidence,
+                transaction_id=transaction_id,
             )
-            publication = session.publish(request)
     except PublicationError as exc:
         return CollectResult(
             status=CollectStatus.FATAL,
             candidate=candidate,
             fatal_diagnostic=str(exc),
         )
-
-    result_warnings = list(
-        candidate.source_inventory.warnings
-        if candidate.source_inventory is not None
-        else ()
-    )
-    frame_declined = (
-        publication.previous_output_frames is not None
-        and candidate.frame_count < publication.previous_output_frames
-    )
-    if frame_declined or audit.coverage_declined or new_noncomplete:
-        result_warnings.append(
-            _coverage_warning(
-                work_dir=work_dir,
-                candidate=candidate,
-                previous=previous,
-                previous_frames=publication.previous_output_frames,
-                backup_path=publication.backup_path,
-            )
-        )
-
-    return CollectResult(
-        status=status,
-        candidate=candidate,
-        publication_committed=True,
-        coverage_declined=audit.coverage_declined,
-        warnings=tuple(result_warnings),
-    )
 
 
 def _previous_coverage(
@@ -718,6 +795,293 @@ def _no_data_dedup_evidence(
         "candidate_frame_count": candidate.frame_count,
         "per_source": per_source,
     }
+
+
+def _fatal_collection_result(
+    error: object,
+    *,
+    candidate: CollectionCandidate | None = None,
+) -> CollectResult:
+    diagnostic = str(error).strip() or type(error).__name__
+    return CollectResult(
+        status=CollectStatus.FATAL,
+        candidate=candidate,
+        fatal_diagnostic=diagnostic,
+    )
+
+
+def _orchestration_result_target(
+    *,
+    config: DPmoireLiteConfig,
+    stage: str,
+    manifest: ManifestReadResult,
+    collection_mode: MLFFCollectMode,
+) -> ResultManifestTarget:
+    try:
+        if collection_mode is MLFFCollectMode.FULL_DEDUP and (
+            stage != "md" or not config.vasp_ml
+        ):
+            raise ValueError("full-dedup collection requires MLFF MD mode")
+
+        if manifest.kind in {"current", "legacy"}:
+            _candidate_manifest_directories(manifest, stage=stage)
+        elif manifest.kind == "missing":
+            if manifest.manifest is not None or manifest.raw_data is not None:
+                raise ValueError("missing manifest result is internally inconsistent")
+            if stage != "md" or collection_mode is not MLFFCollectMode.FULL_DEDUP:
+                raise ValueError(
+                    "stage manifest is missing; only explicit MD full-dedup may "
+                    "use compatibility discovery"
+                )
+        else:
+            raise ValueError(f"unsupported manifest result kind: {manifest.kind!r}")
+
+        if (
+            manifest.kind == "current"
+            and stage == "md"
+            and config.vasp_ml
+            and collection_mode is MLFFCollectMode.SEED_AWARE
+        ):
+            current_manifest = manifest.manifest
+            if current_manifest is None:
+                raise ValueError("current manifest result has no Manifest")
+            _current_seed_evidence(current_manifest)
+
+        if manifest.kind == "current":
+            return ResultManifestTarget(
+                kind=ResultManifestTargetKind.CURRENT_STAGE,
+                path=manifest_path(config.work_dir, stage),
+            )
+        if stage != "md":
+            raise ValueError("legacy result publication is supported only for MD")
+        _require_compatibility_mode(collection_mode)
+        return ResultManifestTarget(
+            kind=ResultManifestTargetKind.MD_COMPATIBILITY,
+            path=Path(config.work_dir) / "MD_data.collect.yaml",
+        )
+    except ValueError as exc:
+        raise CollectionInvariantError(str(exc)) from exc
+
+
+def _build_orchestration_candidate(
+    *,
+    config: DPmoireLiteConfig,
+    stage: str,
+    manifest: ManifestReadResult,
+    collection_mode: MLFFCollectMode,
+) -> CollectionCandidate:
+    try:
+        if collection_mode is MLFFCollectMode.FULL_DEDUP:
+            return build_full_dedup_candidate(
+                work_dir=config.work_dir,
+                manifest=manifest,
+            )
+        return build_seed_aware_candidate(
+            config=config,
+            stage=stage,
+            manifest=manifest,
+        )
+    except ValueError as exc:
+        raise CollectionInvariantError(str(exc)) from exc
+
+
+def _candidate_publication_target(
+    *,
+    work_dir: Path,
+    stage: str,
+    manifest: ManifestReadResult,
+    candidate: CollectionCandidate,
+    collection_mode: MLFFCollectMode,
+    expected_target: ResultManifestTarget,
+) -> tuple[ResultManifestTarget, CompatibilityManifestEvidence | None]:
+    try:
+        target, compatibility_evidence = _no_data_result_target(
+            work_dir=work_dir,
+            stage=stage,
+            manifest=manifest,
+            candidate=candidate,
+            collection_mode=collection_mode,
+        )
+    except ValueError as exc:
+        raise CollectionInvariantError(str(exc)) from exc
+
+    if (
+        target.kind is not expected_target.kind
+        or Path(target.path).resolve(strict=False)
+        != Path(expected_target.path).resolve(strict=False)
+    ):
+        raise CollectionInvariantError(
+            "candidate publication target changed after the session lock was acquired"
+        )
+    return target, compatibility_evidence
+
+
+def _recovered_collection_result(
+    session: PublicationSession,
+) -> CollectResult:
+    recovered = session.recovered_result
+    if recovered is None:
+        raise CollectionInvariantError("publication session has no recovered transaction")
+    collect = session.recovered_collect_record()
+
+    raw_status = collect.get("status")
+    try:
+        status = CollectStatus(raw_status)
+    except (TypeError, ValueError) as exc:
+        raise CollectionInvariantError(
+            f"recovered collect status is invalid: {raw_status!r}"
+        ) from exc
+    if status not in {CollectStatus.COMPLETE, CollectStatus.DEGRADED}:
+        raise CollectionInvariantError(
+            "recovered collect status must be complete or degraded"
+        )
+
+    frame_count = collect.get("frames")
+    if not _is_nonnegative_int(frame_count) or frame_count == 0:
+        raise CollectionInvariantError(
+            "recovered collect frames must be a positive integer"
+        )
+    coverage_declined = collect.get("coverage_declined", False)
+    if not isinstance(coverage_declined, bool):
+        raise CollectionInvariantError(
+            "recovered collect coverage_declined must be a bool"
+        )
+
+    previous = _previous_coverage(collect)
+    counts = (
+        previous.sources_attempted,
+        previous.sources_complete,
+        previous.sources_partial,
+        previous.sources_skipped,
+        previous.sources_failed,
+    )
+    if any(count is None for count in counts):
+        raise CollectionInvariantError(
+            "recovered collect source summary is incomplete"
+        )
+    try:
+        evidence = RecoveredCollectionEvidence(
+            transaction_id=recovered.transaction_id,
+            status=status,
+            frame_count=frame_count,
+            sources_attempted=int(previous.sources_attempted),
+            sources_complete=int(previous.sources_complete),
+            sources_partial=int(previous.sources_partial),
+            sources_skipped=int(previous.sources_skipped),
+            sources_failed=int(previous.sources_failed),
+        )
+    except ValueError as exc:
+        raise CollectionInvariantError(
+            f"recovered collect source summary is invalid: {exc}"
+        ) from exc
+    return CollectResult(
+        status=status,
+        recovered_evidence=evidence,
+        publication_committed=True,
+        coverage_declined=coverage_declined,
+    )
+
+
+def orchestrate_collect(
+    *,
+    config_path: Path,
+    stage: str,
+    collection_mode: MLFFCollectMode,
+    transaction_id: str,
+) -> CollectResult:
+    """Collect and publish one stage under a single recovery-aware session."""
+    if not isinstance(stage, str):
+        raise TypeError("stage must be a string")
+    if stage not in COLLECT_OUTPUTS:
+        return _fatal_collection_result(f"Unknown collect stage: {stage!r}")
+    if not isinstance(collection_mode, MLFFCollectMode):
+        raise TypeError("collection_mode must be an MLFFCollectMode")
+    if not isinstance(transaction_id, str) or not transaction_id.strip():
+        raise ValueError("transaction_id must be a non-empty string")
+
+    try:
+        config = load_config(config_path)
+    except (ConfigError, OSError, UnicodeError, yaml.YAMLError) as exc:
+        return _fatal_collection_result(f"config error: {exc}")
+
+    work_dir = Path(config.work_dir)
+    try:
+        manifest = read_manifest(work_dir, stage)
+    except (ValueError, UnicodeError) as exc:
+        return _fatal_collection_result(f"manifest error: {exc}")
+
+    try:
+        target = _orchestration_result_target(
+            config=config,
+            stage=stage,
+            manifest=manifest,
+            collection_mode=collection_mode,
+        )
+    except CollectionInvariantError as exc:
+        return _fatal_collection_result(exc)
+
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _fatal_collection_result(f"could not prepare collection work_dir: {exc}")
+
+    final_output = work_dir / COLLECT_OUTPUTS[stage]
+    candidate: CollectionCandidate | None = None
+    try:
+        with PublicationSession(
+            work_dir=work_dir,
+            stage=stage,
+            final_output=final_output,
+            target=target,
+        ) as session:
+            if session.recovered_result is not None:
+                return _recovered_collection_result(session)
+
+            if target.kind is ResultManifestTargetKind.MD_COMPATIBILITY:
+                _validated_previous_collect_record(session)
+
+            candidate = _build_orchestration_candidate(
+                config=config,
+                stage=stage,
+                manifest=manifest,
+                collection_mode=collection_mode,
+            )
+            publication_target, compatibility_evidence = (
+                _candidate_publication_target(
+                    work_dir=work_dir,
+                    stage=stage,
+                    manifest=manifest,
+                    candidate=candidate,
+                    collection_mode=collection_mode,
+                    expected_target=target,
+                )
+            )
+            if candidate.frame_count == 0:
+                return _publish_no_data_in_session(
+                    session,
+                    work_dir=work_dir,
+                    stage=stage,
+                    final_output=final_output,
+                    target=publication_target,
+                    manifest=manifest,
+                    candidate=candidate,
+                    compatibility_evidence=compatibility_evidence,
+                    transaction_id=transaction_id,
+                )
+            return _publish_nonzero_in_session(
+                session,
+                work_dir=work_dir,
+                stage=stage,
+                final_output=final_output,
+                target=publication_target,
+                manifest=manifest,
+                candidate=candidate,
+                collection_mode=collection_mode,
+                compatibility_evidence=compatibility_evidence,
+                transaction_id=transaction_id,
+            )
+    except (CollectLockError, CollectionInvariantError, PublicationError) as exc:
+        return _fatal_collection_result(exc, candidate=candidate)
 
 
 def run_collect(config_path: Path, stage: str) -> None:

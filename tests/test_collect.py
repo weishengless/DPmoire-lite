@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import replace
 import shutil
 from pathlib import Path
 
@@ -1545,6 +1546,535 @@ def test_compatibility_publication_never_rewrites_legacy_stage_manifest(tmp_path
     assert legacy_path.read_bytes() == legacy_bytes
     assert (work / "MD_data.collect.yaml").is_file()
     assert (work / "MD_data.extxyz").is_file()
+
+
+def _fatal_recovery_api():
+    orchestrator = getattr(collect_module, "orchestrate_collect", None)
+    assert callable(orchestrator), "orchestrate_collect is not implemented"
+    return orchestrator
+
+
+def _run_orchestration(orchestrator, config_path, mode, transaction_id):
+    return orchestrator(
+        config_path=config_path,
+        stage="md",
+        collection_mode=mode,
+        transaction_id=transaction_id,
+    )
+
+
+def _write_invalid_md_manifest(work: Path, payload: str) -> Path:
+    path = manifest_path(work, "md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def _copy_mlab_fixture(work: Path, directory: str) -> Path:
+    source = Path(__file__).parent / "data" / "mlab" / "complete_multi.mlab"
+    target = work / directory / "ML_ABN"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    return target
+
+
+def _recovery_publication_request(work: Path, *, transaction_id: str):
+    dataset = Dataset()
+    dataset.add_atoms(_publication_frame(7))
+    target = collect_publish_module.ResultManifestTarget(
+        kind=collect_publish_module.ResultManifestTargetKind.CURRENT_STAGE,
+        path=manifest_path(work, "md"),
+    )
+    return collect_publish_module.CandidateRequest(
+        work_dir=work,
+        stage="md",
+        final_output=work / "MD_data.extxyz",
+        target=target,
+        transaction_id=transaction_id,
+        dataset=dataset,
+        expected_frame_count=1,
+        status="degraded",
+        source_diagnostics=(
+            {
+                "path": "md/run-a/OUTCAR",
+                "kind": "outcar",
+                "status": "partial",
+                "complete_count": 1,
+                "accepted_count": 1,
+                "reason": "synthetic recoverable partial source",
+            },
+        ),
+        current_manifest=read_manifest(work, "md"),
+    )
+
+
+def _interrupt_orchestration_recovery(
+    root: Path,
+    monkeypatch,
+    *,
+    boundary: str,
+    previous_output: bool,
+):
+    config_path = write_collect_config(root, vasp_ml=False)
+    work = root / "work"
+    _write_current_publication_manifest(work, directories=("md/run-a",))
+    request = _recovery_publication_request(
+        work,
+        transaction_id=f"plan10-task4-recovery-{boundary}",
+    )
+    if previous_output:
+        _write_previous_extxyz(request.final_output, frame_count=1)
+
+    with monkeypatch.context() as patch:
+        if boundary == "before_data_replace":
+            real_replace = collect_publish_module.os.replace
+            blocked_destination = request.final_output.resolve(strict=False)
+
+            def interrupting_replace(source, destination, *args, **kwargs):
+                if Path(destination).resolve(strict=False) == blocked_destination:
+                    raise OSError("synthetic Task 4 interruption before data replace")
+                return real_replace(source, destination, *args, **kwargs)
+
+            patch.setattr(collect_publish_module.os, "replace", interrupting_replace)
+        elif boundary == "before_committed":
+            real_publish_journal = collect_publish_module._publish_journal
+
+            def interrupting_publish_journal(path, record):
+                if record["state"] == "committed":
+                    raise OSError("synthetic Task 4 interruption before commit")
+                return real_publish_journal(path, record)
+
+            patch.setattr(
+                collect_publish_module,
+                "_publish_journal",
+                interrupting_publish_journal,
+            )
+        else:
+            raise AssertionError(f"unknown recovery boundary: {boundary}")
+
+        with pytest.raises(
+            collect_publish_module.PublicationError,
+            match="synthetic Task 4 interruption",
+        ):
+            with collect_publish_module.PublicationSession(
+                work_dir=request.work_dir,
+                stage=request.stage,
+                final_output=request.final_output,
+                target=request.target,
+            ) as session:
+                session_request = replace(
+                    request,
+                    previous_output_sha256=session.previous_output_sha256,
+                    previous_manifest_sha256=session.previous_manifest_sha256,
+                )
+                session.publish(session_request)
+
+    journal_path = work / ".MD_data.extxyz.collect-journal.yaml"
+    journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+
+    def artifact_path(field: str):
+        value = journal.get(field)
+        return None if value is None else work / Path(value)
+
+    return {
+        "config_path": config_path,
+        "work": work,
+        "request": request,
+        "journal_path": journal_path,
+        "journal": journal,
+        "data_candidate": artifact_path("data_candidate_path"),
+        "manifest_candidate": artifact_path("manifest_candidate_path"),
+        "backup_path": artifact_path("backup_path"),
+    }
+
+
+def _publish_historical_compatibility(work: Path, *, transaction_id: str):
+    publisher = _nonzero_publication_api()
+    legacy_path, legacy_bytes, manifest = _write_legacy_publication_manifest(
+        work,
+        directories=("md/run-a",),
+    )
+    candidate = _publication_candidate(
+        models.SourceStatus.COMPLETE,
+        directories=("md/run-a",),
+    )
+    result = _publish_nonzero(
+        publisher,
+        work=work,
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.SEED_AWARE,
+        transaction_id=transaction_id,
+    )
+    compatibility_path = work / "MD_data.collect.yaml"
+    assert result.status is models.CollectStatus.COMPLETE
+    return (
+        legacy_path,
+        legacy_bytes,
+        compatibility_path,
+        compatibility_path.read_bytes(),
+    )
+
+
+def test_seed_aware_missing_stage_manifest_returns_fatal_without_creating_manifest(
+    tmp_path,
+):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path)
+    work = tmp_path / "work"
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-seed-aware-missing",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert "manifest" in result.fatal_diagnostic.lower()
+    assert "missing" in result.fatal_diagnostic.lower()
+    assert not manifest_path(work, "md").exists()
+    assert not (work / "MD_data.collect.yaml").exists()
+    assert not (work / "MD_data.extxyz").exists()
+
+
+def test_missing_manifest_full_dedup_uses_legacy_scan_instead_of_fatal(tmp_path):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path)
+    work = tmp_path / "work"
+    _copy_mlab_fixture(work, "md/run-a")
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.FULL_DEDUP,
+        "plan10-task4-missing-full-dedup",
+    )
+
+    compatibility = yaml.safe_load(
+        (work / "MD_data.collect.yaml").read_text(encoding="utf-8")
+    )
+    frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(frames) > 0
+    assert not manifest_path(work, "md").exists()
+    assert compatibility["input_layout"] == "missing-stage-manifest"
+    assert compatibility["directory_discovery"] == "legacy-scan"
+    assert compatibility["collect"]["status"] == "degraded"
+
+
+def test_invalid_manifest_returns_fatal_without_overwrite(tmp_path):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path)
+    work = tmp_path / "work"
+    invalid_path = _write_invalid_md_manifest(
+        work,
+        "schema_version: 999\nstage: md\ngenerated_at: invalid\n",
+    )
+    invalid_bytes = invalid_path.read_bytes()
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-invalid-manifest",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert "manifest" in result.fatal_diagnostic.lower()
+    assert invalid_path.read_bytes() == invalid_bytes
+    assert not (work / "MD_data.collect.yaml").exists()
+    assert not (work / "MD_data.extxyz").exists()
+
+
+def test_invalid_manifest_full_dedup_never_falls_back_to_scan(tmp_path):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path)
+    work = tmp_path / "work"
+    source = _copy_mlab_fixture(work, "md/run-a")
+    source_bytes = source.read_bytes()
+    invalid_path = _write_invalid_md_manifest(
+        work,
+        "schema_version: [2\nstage: md\n",
+    )
+    invalid_bytes = invalid_path.read_bytes()
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.FULL_DEDUP,
+        "plan10-task4-invalid-full-dedup",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert source.read_bytes() == source_bytes
+    assert invalid_path.read_bytes() == invalid_bytes
+    assert not (work / "MD_data.collect.yaml").exists()
+    assert not (work / "MD_data.extxyz").exists()
+
+
+def test_config_error_returns_fatal_before_lock_or_manifest(tmp_path, monkeypatch):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path, n_nodes=0)
+    touched = []
+
+    def unexpected_manifest_read(*args, **kwargs):
+        touched.append("manifest")
+        raise AssertionError("manifest read occurred after invalid config")
+
+    def unexpected_session(*args, **kwargs):
+        touched.append("lock")
+        raise AssertionError("publication session opened after invalid config")
+
+    monkeypatch.setattr(collect_module, "read_manifest", unexpected_manifest_read)
+    monkeypatch.setattr(collect_module, "PublicationSession", unexpected_session)
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-invalid-config",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert "n_nodes" in result.fatal_diagnostic
+    assert touched == []
+
+
+def test_invalid_manifest_seed_schema_is_global_fatal(tmp_path):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path)
+    work = tmp_path / "work"
+    write_manifest(
+        work,
+        Manifest(
+            stage="md",
+            generated_at="invalid-seed-schema",
+            directories=[],
+            mlff_seed={
+                "configurations": 1,
+                "digest_schema": "unsupported-seed-schema",
+                "seed_prefix_sha256": "0" * 64,
+            },
+        ),
+    )
+    stage_manifest = manifest_path(work, "md")
+    manifest_bytes = stage_manifest.read_bytes()
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-invalid-seed-schema",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.candidate is None
+    assert result.publication_committed is False
+    assert "digest_schema" in result.fatal_diagnostic
+    assert stage_manifest.read_bytes() == manifest_bytes
+    assert not (work / "MD_data.extxyz").exists()
+
+
+def test_unrecoverable_pending_journal_returns_fatal_and_preserves_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    orchestrate_collect = _fatal_recovery_api()
+    case = _interrupt_orchestration_recovery(
+        tmp_path,
+        monkeypatch,
+        boundary="before_data_replace",
+        previous_output=True,
+    )
+    data_candidate = case["data_candidate"]
+    backup_path = case["backup_path"]
+    assert data_candidate is not None and data_candidate.is_file()
+    assert backup_path is not None and backup_path.is_file()
+    data_candidate.write_bytes(b"corrupt recovery candidate evidence\n")
+    evidence_paths = tuple(
+        path
+        for path in (
+            case["request"].final_output,
+            case["request"].target.path,
+            case["journal_path"],
+            data_candidate,
+            case["manifest_candidate"],
+            backup_path,
+        )
+        if path is not None and path.exists()
+    )
+    snapshot = {path: path.read_bytes() for path in evidence_paths}
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        case["config_path"],
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-unrecoverable-call",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert "data candidate" in result.fatal_diagnostic.lower()
+    assert {path: path.read_bytes() for path in evidence_paths} == snapshot
+
+
+def test_recovered_transaction_returns_its_committed_status(tmp_path, monkeypatch):
+    orchestrate_collect = _fatal_recovery_api()
+    case = _interrupt_orchestration_recovery(
+        tmp_path,
+        monkeypatch,
+        boundary="before_committed",
+        previous_output=False,
+    )
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        case["config_path"],
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-recovery-call",
+    )
+
+    recovered = result.recovered_evidence
+    collect = _current_collect_record(case["work"])
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.candidate is None
+    assert result.publication_committed is True
+    assert isinstance(recovered, models.RecoveredCollectionEvidence)
+    assert recovered.transaction_id == case["journal"]["transaction_id"]
+    assert result.accepted_frame_count == collect["frames"] == 1
+    assert collect["status"] == "degraded"
+    assert not case["journal_path"].exists()
+
+
+def test_recovery_completes_before_new_source_collection_starts(
+    tmp_path,
+    monkeypatch,
+):
+    orchestrate_collect = _fatal_recovery_api()
+    case = _interrupt_orchestration_recovery(
+        tmp_path,
+        monkeypatch,
+        boundary="before_committed",
+        previous_output=False,
+    )
+    source_calls = []
+
+    def unexpected_candidate_build(*args, **kwargs):
+        source_calls.append((args, kwargs))
+        raise AssertionError("source collection started after recovered transaction")
+
+    monkeypatch.setattr(
+        collect_module,
+        "build_seed_aware_candidate",
+        unexpected_candidate_build,
+    )
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        case["config_path"],
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-recovery-order-call",
+    )
+
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.publication_committed is True
+    assert source_calls == []
+    assert not case["journal_path"].exists()
+
+
+def test_lock_contention_returns_fatal(tmp_path):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path, vasp_ml=False)
+    work = tmp_path / "work"
+    _write_current_publication_manifest(work, directories=())
+    stage_manifest = manifest_path(work, "md")
+    manifest_bytes = stage_manifest.read_bytes()
+    output = work / "MD_data.extxyz"
+
+    with CollectFileLock(
+        "md",
+        output,
+        transaction_id="plan10-task4-held-lock",
+    ):
+        result = _run_orchestration(
+            orchestrate_collect,
+            config_path,
+            models.MLFFCollectMode.SEED_AWARE,
+            "plan10-task4-contender",
+        )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert "lock" in result.fatal_diagnostic.lower()
+    assert stage_manifest.read_bytes() == manifest_bytes
+    assert not output.exists()
+
+
+def test_current_v2_manifest_takes_precedence_over_old_compatibility_result(
+    tmp_path,
+):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path, vasp_ml=False)
+    work = tmp_path / "work"
+    _, _, compatibility_path, compatibility_bytes = _publish_historical_compatibility(
+        work,
+        transaction_id="plan10-task4-historical-compatibility",
+    )
+    output = work / "MD_data.extxyz"
+    preserved_output = _write_previous_extxyz(output, frame_count=2)
+    _write_current_publication_manifest(work, directories=())
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-current-authority",
+    )
+
+    collect = _current_collect_record(work)
+    assert result.status is models.CollectStatus.NO_DATA
+    assert result.publication_committed is True
+    assert collect["transaction_id"] == "plan10-task4-current-authority"
+    assert collect["status"] == "no_data"
+    assert compatibility_path.read_bytes() == compatibility_bytes
+    assert output.read_bytes() == preserved_output
+
+
+def test_compatibility_previous_result_requires_matching_output_hash(tmp_path):
+    orchestrate_collect = _fatal_recovery_api()
+    config_path = write_collect_config(tmp_path)
+    work = tmp_path / "work"
+    (
+        legacy_path,
+        legacy_bytes,
+        compatibility_path,
+        compatibility_bytes,
+    ) = _publish_historical_compatibility(
+        work,
+        transaction_id="plan10-task4-compatibility-before-mismatch",
+    )
+    output = work / "MD_data.extxyz"
+    mismatching_output = _write_previous_extxyz(output, frame_count=2)
+
+    result = _run_orchestration(
+        orchestrate_collect,
+        config_path,
+        models.MLFFCollectMode.SEED_AWARE,
+        "plan10-task4-compatibility-mismatch",
+    )
+
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    assert "hash" in result.fatal_diagnostic.lower()
+    assert legacy_path.read_bytes() == legacy_bytes
+    assert compatibility_path.read_bytes() == compatibility_bytes
+    assert output.read_bytes() == mismatching_output
 
 
 def test_collect_validation_uses_all_ionic_steps(monkeypatch, tmp_path):
