@@ -1963,6 +1963,88 @@ def _write_legacy_publication_manifest(
     return path, path.read_bytes(), read_manifest(work, "md")
 
 
+def test_legacy_declared_full_dedup_collects_end_to_end(tmp_path):
+    config_path, work = _prepare_task6_full_dedup_case(
+        tmp_path,
+        (
+            ("run-10", "complete_vasp_651.mlab"),
+            ("run-2", "complete_multi.mlab"),
+        ),
+    )
+    directories = ("md/run-10", "md/run-2")
+    legacy_path, legacy_bytes, _manifest = _write_legacy_publication_manifest(
+        work,
+        directories=directories,
+    )
+
+    result = run_collect(
+        config_path,
+        stage="md",
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+    )
+
+    output = work / "MD_data.extxyz"
+    output_frames = ase_read(output, format="extxyz", index=":")
+    compatibility_path = work / "MD_data.collect.yaml"
+    compatibility = yaml.safe_load(compatibility_path.read_text(encoding="utf-8"))
+    collect = compatibility["collect"]
+    source_paths = ("md/run-10/ML_ABN", "md/run-2/ML_ABN")
+
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert result.source_count == 2
+    assert tuple(source.source_path for source in result.source_results) == source_paths
+    assert [source.complete_count for source in result.source_results] == [1, 2]
+    assert [source.accepted_count for source in result.source_results] == [1, 2]
+    assert [frame.get_potential_energy() for frame in output_frames] == pytest.approx(
+        [-1.25, -1.2]
+    )
+
+    assert legacy_path.read_bytes() == legacy_bytes
+    assert compatibility_path.is_file()
+    assert compatibility["schema_version"] == 1
+    assert compatibility["kind"] == "dpmoire-lite-collect-result"
+    assert compatibility["stage"] == "md"
+    assert compatibility["input_layout"] == "legacy-stage-manifest"
+    assert compatibility["directory_discovery"] == "declared"
+    assert compatibility["declared_directories"] == list(directories)
+    assert compatibility["discovered_directories"] == []
+    assert compatibility["collection_mode"] == "full-dedup"
+    assert collect["status"] == "complete"
+    assert collect["frames"] == 2
+    assert collect["source_order"] == list(source_paths)
+    assert collect["inventory"] == {
+        "manifest_kind": "legacy",
+        "directory_discovery": "declared",
+        "directories": list(directories),
+        "coverage_known": True,
+        "warnings": [],
+    }
+    assert collect["dedup"] == {
+        "applied": True,
+        "schema": "mlab-config-v1",
+        "seen": 3,
+        "unique": 2,
+        "duplicates_removed": 1,
+        "candidate_frame_count": 2,
+        "per_source": [
+            {
+                "source_path": "md/run-10/ML_ABN",
+                "seen": 1,
+                "retained": 1,
+                "duplicates_removed": 0,
+            },
+            {
+                "source_path": "md/run-2/ML_ABN",
+                "seen": 2,
+                "retained": 1,
+                "duplicates_removed": 1,
+            },
+        ],
+    }
+
+
 def _publish_nonzero(
     publisher,
     *,
