@@ -156,11 +156,11 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 | `min_val_n` | 整数 | twist validation 搜索使用的最小 `n`。只在 `twist_val: true` 时使用。 |
 | `max_val_n` | 整数 | twist validation 搜索使用的最大 `n`。只在 `twist_val: true` 时使用。 |
 | `include_monolayer_md` | 布尔值 | stage1 是否额外生成 `md/top_layer` 和 `md/bot_layer` 单层 MD 目录。 |
-| `outcar_patterns` | 正则字符串列表，可选 | 收集时用于识别 OUTCAR 系列的正则列表。默认匹配 `OUTCAR`、`OUTCAR<number>`、`OUT<number>` 和 `out<number>`。 |
+| `outcar_patterns` | 正则字符串列表，可选 | 收集时用于识别 OUTCAR 系列的正则列表。默认优先级依次为 `OUTCAR<number>`、`OUT<number>`、`out<number>`，最后是无后缀 `OUTCAR`。 |
 
-## 目录替换策略
+## 一次性 Stage 策略
 
-当即将生成的子目录已经存在时，DPmoire-lite 会把该子目录备份为带时间戳后缀的目录，然后重新生成。备份范围只限当前要重新生成的 stage 子目录，不会整体移动 `work_dir`。
+如果任一目标 stage 已存在（包括空目录），DPmoire-lite 会在修改任何文件前停止。它不会移动、备份、覆盖或原地重建 stage。请显式删除完整的冲突 stage，然后重新运行 build。
 
 ## 命令行
 

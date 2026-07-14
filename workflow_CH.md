@@ -53,7 +53,7 @@ stage0 可以根据配置生成三组相互独立的目录：
 - 配置指定的提交脚本
 - 如果 INCAR 模板需要，则复制 `vdw_kernel.bindat`
 
-如果目标子目录已经存在，DPmoire-lite 会把该子目录备份成带时间戳后缀的目录，然后重新生成。它不会整体移动 `work_dir`。
+如果任一目标 stage 已存在（包括空目录），DPmoire-lite 会在修改任何文件前停止。它不会移动、备份、覆盖或原地重建 stage。请显式删除完整的冲突 stage，然后重新运行 build。
 
 ## 3. Init MLFF 路径
 
@@ -233,10 +233,10 @@ DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
 
 ```yaml
 outcar_patterns:
-  - '^OUTCAR$'
   - '^OUTCAR\d+$'
   - '^OUT\d+$'
   - '^out\d+$'
+  - '^OUTCAR$'
 ```
 
 这覆盖了常见重启历史文件，例如 `OUTCAR0`、`OUT1` 和 `out2`，同时避免宽泛匹配到 `OUTCAR.bad` 这类文件。

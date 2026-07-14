@@ -938,3 +938,238 @@ def test_wheel_contains_no_potcar_or_private_sample_paths(_fg2_wheel_path):
                 forbidden_members.append(member.filename)
 
     assert forbidden_members == []
+
+
+def test_user_facing_automation_docs_remain_fail_closed():
+    repo_root = Path(__file__).resolve().parents[1]
+    config_paths = (
+        repo_root / "example" / "config.yaml",
+        repo_root / "src" / "dpmoire_lite" / "example" / "config.yaml",
+    )
+    config_bytes = {
+        path.relative_to(repo_root).as_posix(): path.read_bytes()
+        for path in config_paths
+    }
+    config_texts = {
+        name: payload.decode("utf-8") for name, payload in config_bytes.items()
+    }
+    changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+    mismatches = []
+
+    if len(set(config_bytes.values())) != 1:
+        mismatches.append(
+            "example/config.yaml and src/dpmoire_lite/example/config.yaml "
+            "are not byte-identical"
+        )
+
+    expected_stage_ending = "*all* is temporarily unavailable."
+    expected_auto_resub_comment = (
+        "Reserved for submitted --wait workflows; not production-ready while "
+        "submitted --wait is disabled, and ignored in non-wait mode."
+    )
+    for name, text in config_texts.items():
+        issues = []
+        stage_line = next(
+            (line for line in text.splitlines() if re.match(r"^\s*stage\s*:", line)),
+            "",
+        )
+        auto_resub_line = next(
+            (
+                line
+                for line in text.splitlines()
+                if re.match(r"^\s*auto_resub\s*:", line)
+            ),
+            "",
+        )
+        if not stage_line.rstrip().endswith(expected_stage_ending):
+            issues.append(
+                f"stage comment must end {expected_stage_ending!r}"
+            )
+        if auto_resub_line.partition("#")[2].strip() != expected_auto_resub_comment:
+            issues.append(
+                f"auto_resub comment must be {expected_auto_resub_comment!r}"
+            )
+
+        folded = text.casefold()
+        if "*all* runs the automated submit-and-wait dependency" in folded:
+            issues.append("still claims stage: all runs automated submit-and-wait")
+        if (
+            "resubmit failed jobs once per calculation directory" in folded
+            or "all waited stage: all submissions" in folded
+        ):
+            issues.append("still claims auto_resub resubmits waited stage-all jobs")
+        if issues:
+            mismatches.append(f"{name}: " + "; ".join(issues))
+
+    expected_changelog = (
+        "`stage: all` and submitted `--wait` now fail closed before side effects "
+        "while Slurm terminal-state validation and failure propagation remain "
+        "deferred; use `submit: false` and submit generated stages manually."
+    )
+    normalized_changelog = " ".join(changelog.split())
+    changelog_issues = []
+    if expected_changelog not in normalized_changelog:
+        changelog_issues.append("missing the fail-closed/manual-submission entry")
+    folded_changelog = normalized_changelog.casefold()
+    if (
+        "slurm throttling now covers validation and final md submissions"
+        in folded_changelog
+        or "held jobs continue to count as active" in folded_changelog
+    ):
+        changelog_issues.append("still claims active throttling/held-job behavior")
+    if changelog_issues:
+        mismatches.append("CHANGELOG.md: " + "; ".join(changelog_issues))
+
+    assert mismatches == [], "automation documentation mismatches:\n- " + "\n- ".join(
+        mismatches
+    )
+
+
+def test_user_facing_outcar_defaults_follow_priority_order():
+    repo_root = Path(__file__).resolve().parents[1]
+    mismatches = []
+    expected_patterns = tuple(DEFAULT_OUTCAR_PATTERNS)
+
+    for relative_path in (
+        "example/config.yaml",
+        "src/dpmoire_lite/example/config.yaml",
+    ):
+        data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
+        raw_patterns = data.get("outcar_patterns")
+        observed_patterns = (
+            tuple(raw_patterns) if isinstance(raw_patterns, list) else raw_patterns
+        )
+        if observed_patterns != expected_patterns:
+            mismatches.append(
+                f"{relative_path}: {observed_patterns!r} != {expected_patterns!r}"
+            )
+
+    expected_yaml_block = "\n".join(
+        ("outcar_patterns:", *(f"  - '{pattern}'" for pattern in expected_patterns))
+    )
+    for relative_path in ("workflow.md", "workflow_CH.md"):
+        text = (repo_root / relative_path).read_text(encoding="utf-8")
+        if expected_yaml_block not in text:
+            mismatches.append(
+                f"{relative_path}: OUTCAR YAML block is not in production priority order"
+            )
+
+    readme_expectations = {
+        "README.md": (
+            "Defaults, in priority order, to `OUTCAR<number>`, `OUT<number>`, "
+            "`out<number>`, then unnumbered `OUTCAR`."
+        ),
+        "README_CH.md": (
+            "默认优先级依次为 `OUTCAR<number>`、`OUT<number>`、`out<number>`，"
+            "最后是无后缀 `OUTCAR`。"
+        ),
+    }
+    for relative_path, expected_sentence in readme_expectations.items():
+        normalized = " ".join(
+            (repo_root / relative_path).read_text(encoding="utf-8").split()
+        )
+        if expected_sentence not in normalized:
+            mismatches.append(
+                f"{relative_path}: missing history-first priority with unnumbered OUTCAR last"
+            )
+
+    assert mismatches == [], "OUTCAR documentation mismatches:\n- " + "\n- ".join(
+        mismatches
+    )
+
+
+def test_user_facing_build_docs_reject_in_place_rebuilds():
+    repo_root = Path(__file__).resolve().parents[1]
+    mismatches = []
+    document_contracts = {
+        "README.md": (
+            (
+                "existing stage includes empty directory",
+                ("target stage", "exists", "including", "empty directory"),
+            ),
+            (
+                "stop before modification",
+                ("stop", "before", "modif", "file"),
+            ),
+            (
+                "no move/backup/overwrite/in-place rebuild",
+                ("never", "move", "back", "overwrit", "rebuild", "in place"),
+            ),
+            (
+                "explicit complete-stage deletion before rerun",
+                ("explicit", "delet", "complete", "conflict", "stage", "rerun"),
+            ),
+        ),
+        "workflow.md": (
+            (
+                "existing stage includes empty directory",
+                ("target stage", "exists", "including", "empty directory"),
+            ),
+            (
+                "stop before modification",
+                ("stop", "before", "modif", "file"),
+            ),
+            (
+                "no move/backup/overwrite/in-place rebuild",
+                ("never", "move", "back", "overwrit", "rebuild", "in place"),
+            ),
+            (
+                "explicit complete-stage deletion before rerun",
+                ("explicit", "delet", "complete", "conflict", "stage", "rerun"),
+            ),
+        ),
+        "README_CH.md": (
+            (
+                "已有 stage 包括空目录",
+                ("目标 stage", "已存在", "包括", "空目录"),
+            ),
+            ("修改前停止", ("修改任何文件前", "停止")),
+            (
+                "不移动/备份/覆盖/原地重建",
+                ("不", "移动", "备份", "覆盖", "原地重建"),
+            ),
+            (
+                "显式删除完整冲突 stage 后重跑",
+                ("显式", "删除", "完整", "冲突", "stage", "重新运行"),
+            ),
+        ),
+        "workflow_CH.md": (
+            (
+                "已有 stage 包括空目录",
+                ("目标 stage", "已存在", "包括", "空目录"),
+            ),
+            ("修改前停止", ("修改任何文件前", "停止")),
+            (
+                "不移动/备份/覆盖/原地重建",
+                ("不", "移动", "备份", "覆盖", "原地重建"),
+            ),
+            (
+                "显式删除完整冲突 stage 后重跑",
+                ("显式", "删除", "完整", "冲突", "stage", "重新运行"),
+            ),
+        ),
+    }
+
+    for relative_path, clauses in document_contracts.items():
+        normalized = " ".join(
+            (repo_root / relative_path)
+            .read_text(encoding="utf-8")
+            .casefold()
+            .split()
+        )
+        issues = [
+            f"missing {label}"
+            for label, anchors in clauses
+            if not all(anchor in normalized for anchor in anchors)
+        ]
+        if relative_path in {"README.md", "workflow.md"}:
+            if "timestamp suffix" in normalized and "regenerat" in normalized:
+                issues.append("still promises timestamp-suffix backup/regeneration")
+        elif "时间戳后缀" in normalized and "重新生成" in normalized:
+            issues.append("仍承诺时间戳备份/重新生成")
+        if issues:
+            mismatches.append(f"{relative_path}: " + "; ".join(issues))
+
+    assert mismatches == [], "one-shot build documentation mismatches:\n- " + "\n- ".join(
+        mismatches
+    )

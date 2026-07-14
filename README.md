@@ -207,13 +207,11 @@ rejected.
 | `min_val_n` | int | Minimum `n` used by the twist validation search. Used only when `twist_val: true`. |
 | `max_val_n` | int | Maximum `n` used by the twist validation search. Used only when `twist_val: true`. |
 | `include_monolayer_md` | bool | In stage1, also generate `md/top_layer` and `md/bot_layer` monolayer MD folders. |
-| `outcar_patterns` | list of regex strings, optional | Regex list used to discover OUTCAR series during collection. Defaults to `OUTCAR`, `OUTCAR<number>`, `OUT<number>`, and `out<number>`. |
+| `outcar_patterns` | list of regex strings, optional | Regex list used to discover OUTCAR series during collection. Defaults, in priority order, to `OUTCAR<number>`, `OUT<number>`, `out<number>`, then unnumbered `OUTCAR`. |
 
-## Directory Replacement Policy
+## One-shot Stage Policy
 
-When a generated child directory already exists, DPmoire-lite backs up that
-child directory with a timestamp suffix and regenerates it. This is scoped to
-the stage child being regenerated, not to the whole `work_dir`.
+If any target stage exists, including an empty directory, DPmoire-lite stops before modifying any file. It never moves, backs up, overwrites, or rebuilds a stage in place. Explicitly delete the complete conflicting stage, then rerun the build.
 
 ## CLI
 

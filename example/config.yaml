@@ -10,9 +10,9 @@ n_nodes: 4                                  #Maximum active Slurm jobs in DPmoir
 username: example                           #Username, deprecated setting, not used anymore.
 
 ############################ Workflow Settings  ############################
-stage : 0    #Build stage: *0* generates init_mlff, rlx, and optional validation folders; *1* generates md folders; *all* runs the automated submit-and-wait dependency
+stage : 0    #Build stage: *0* generates init_mlff, rlx, and optional validation folders; *1* generates md folders; *all* is temporarily unavailable.
 submit: false            #*false*: only generate folders. *true*: submit generated folders with Slurm.
-auto_resub: false       #In --wait mode, resubmit failed jobs once per calculation directory, including all waited stage: all submissions.
+auto_resub: false       #Reserved for submitted --wait workflows; not production-ready while submitted --wait is disabled, and ignored in non-wait mode.
 vasp_ml: true           # *true*: use VASP MLFF for MD. Stage1 distributes init_mlff/ML_ABN and ML_FFN as ML_AB and ML_FF, and MD collection reads ML_ABN; *false*: collect MD from OUTCAR.
 outcar_collect_freq: 8   #Collect 1 data every 8 ionic steps in OUTCAR.
 do_relaxation: true      #In stage0, generate stacking relaxation folders under rlx/.

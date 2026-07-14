@@ -61,9 +61,7 @@ Each generated folder receives:
 - the configured submit script
 - optional `vdw_kernel.bindat` if required by the INCAR template
 
-If a target child directory already exists, DPmoire-lite backs up that child
-directory with a timestamp suffix and regenerates it. It does not move the whole
-`work_dir`.
+If any target stage exists, including an empty directory, DPmoire-lite stops before modifying any file. It never moves, backs up, overwrites, or rebuilds a stage in place. Explicitly delete the complete conflicting stage, then rerun the build.
 
 ## 3. Init MLFF Paths
 
@@ -283,10 +281,10 @@ default OUTCAR patterns are:
 
 ```yaml
 outcar_patterns:
-  - '^OUTCAR$'
   - '^OUTCAR\d+$'
   - '^OUT\d+$'
   - '^out\d+$'
+  - '^OUTCAR$'
 ```
 
 This covers common restarted relaxation histories such as `OUTCAR0`, `OUT1`,
