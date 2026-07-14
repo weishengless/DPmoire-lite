@@ -4,7 +4,7 @@ import subprocess
 import sys
 import zipfile
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from uuid import uuid4
 
@@ -23,7 +23,7 @@ from dpmoire_lite.collect_models import (
     SourceResult,
     SourceStatus,
 )
-from dpmoire_lite.config import ConfigError
+from dpmoire_lite.config import ConfigError, DEFAULT_OUTCAR_PATTERNS
 from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
 from dpmoire_lite.paths import manifest_path
 
@@ -757,3 +757,184 @@ def test_wheel_example_contains_preserve_grid_shift_md_false():
             data = yaml.safe_load(wheel.read("dpmoire_lite/example/config.yaml"))
 
     assert data["preserve_grid_shift_md"] is False
+
+
+def test_workflow_guides_document_bundled_example_defaults():
+    repo_root = Path(__file__).resolve().parents[1]
+    bundled_config = yaml.safe_load(
+        (
+            repo_root / "src" / "dpmoire_lite" / "example" / "config.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert bundled_config["stage"] == 0
+    assert bundled_config["submit"] is False
+    assert bundled_config["auto_resub"] is False
+    assert bundled_config["potcar_policy"] == "recommend"
+    assert bundled_config["preserve_grid_shift_md"] is False
+    assert tuple(bundled_config["outcar_patterns"]) == DEFAULT_OUTCAR_PATTERNS
+
+    guide_anchors = {
+        "workflow.md": (
+            ("stage: all", "unavailable"),
+            ("submitted", "--wait", "disabled", "auto_resub", "not production-ready"),
+            ("stage1", "clears md constraints", "default"),
+            ("seed-aware", "default"),
+        ),
+        "workflow_CH.md": (
+            ("stage: all", "暂时不可用"),
+            ("submitted", "--wait", "暂时关闭", "auto_resub", "不具备生产可用性"),
+            ("stage1", "默认清除 md 约束"),
+            ("seed-aware", "默认"),
+        ),
+    }
+    for guide_name, semantic_anchors in guide_anchors.items():
+        guide = " ".join(
+            (repo_root / guide_name)
+            .read_text(encoding="utf-8")
+            .casefold()
+            .split()
+        )
+        for anchors in semantic_anchors:
+            assert all(anchor in guide for anchor in anchors), (
+                guide_name,
+                anchors,
+            )
+
+
+def test_init_example_copies_complete_bundled_tree(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    root_example = repo_root / "example"
+    bundled_example = repo_root / "src" / "dpmoire_lite" / "example"
+    expected_names = {
+        "__init__.py",
+        "config.yaml",
+        "input/INCAR",
+        "input/MD_INCAR",
+        "input/MD_monolayer_INCAR",
+        "input/POSCAR",
+        "input/bot_layer.poscar",
+        "input/init_INCAR",
+        "input/rlx_INCAR",
+        "input/top_layer.poscar",
+        "input/val_INCAR",
+        "scripts/sub",
+    }
+    root_files = {
+        path.relative_to(root_example).as_posix(): path.read_bytes()
+        for path in root_example.rglob("*")
+        if path.is_file()
+    }
+    bundled_files = {
+        path.relative_to(bundled_example).as_posix(): path.read_bytes()
+        for path in bundled_example.rglob("*")
+        if path.is_file()
+    }
+
+    assert set(root_files) == expected_names
+    assert set(bundled_files) == expected_names
+    assert {
+        name
+        for name in expected_names
+        if root_files[name] != bundled_files[name]
+    } == set()
+
+    target = tmp_path / "initialized-example"
+    assert main(["init-example", str(target)]) == 0
+    initialized_files = {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    initialized_names = expected_names - {"__init__.py"}
+    assert set(initialized_files) == initialized_names
+    assert {
+        name
+        for name in initialized_names
+        if initialized_files[name] != bundled_files[name]
+    } == set()
+
+
+@pytest.fixture(scope="module")
+def _fg2_wheel_path(tmp_path_factory):
+    repo_root = Path(__file__).resolve().parents[1]
+    wheel_dir = tmp_path_factory.mktemp("fg2-wheelhouse")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "-w",
+            str(wheel_dir),
+            str(repo_root),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    wheels = sorted(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1, wheels
+    return wheels[0]
+
+
+def test_wheel_example_tree_matches_source(_fg2_wheel_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    bundled_example = repo_root / "src" / "dpmoire_lite" / "example"
+    expected_names = {
+        "__init__.py",
+        "config.yaml",
+        "input/INCAR",
+        "input/MD_INCAR",
+        "input/MD_monolayer_INCAR",
+        "input/POSCAR",
+        "input/bot_layer.poscar",
+        "input/init_INCAR",
+        "input/rlx_INCAR",
+        "input/top_layer.poscar",
+        "input/val_INCAR",
+        "scripts/sub",
+    }
+    source_files = {
+        path.relative_to(bundled_example).as_posix(): path.read_bytes()
+        for path in bundled_example.rglob("*")
+        if path.is_file()
+    }
+    wheel_files = {}
+    prefix = PurePosixPath("dpmoire_lite/example")
+    with zipfile.ZipFile(_fg2_wheel_path) as wheel:
+        for member in wheel.infolist():
+            if member.is_dir():
+                continue
+            member_path = PurePosixPath(member.filename)
+            try:
+                relative_path = member_path.relative_to(prefix)
+            except ValueError:
+                continue
+            wheel_files[relative_path.as_posix()] = wheel.read(member)
+
+    assert set(source_files) == expected_names
+    assert set(wheel_files) == expected_names
+    assert {
+        name
+        for name in expected_names
+        if wheel_files[name] != source_files[name]
+    } == set()
+
+
+def test_wheel_contains_no_potcar_or_private_sample_paths(_fg2_wheel_path):
+    forbidden_members = []
+    with zipfile.ZipFile(_fg2_wheel_path) as wheel:
+        for member in wheel.infolist():
+            if member.is_dir():
+                continue
+            member_path = PurePosixPath(member.filename)
+            if member_path.name.casefold() == "potcar" or any(
+                part.casefold() == "example-test"
+                for part in member_path.parts
+            ):
+                forbidden_members.append(member.filename)
+
+    assert forbidden_members == []
