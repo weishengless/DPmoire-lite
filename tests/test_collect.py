@@ -407,13 +407,25 @@ def test_collect_ml_md_records_missing_ml_abn_without_crashing(tmp_path):
     (work / "md" / "0_0").mkdir(parents=True)
     write_manifest(
         work,
-        Manifest(stage="md", generated_at="test", directories=["md/0_0"]),
+        Manifest(
+            stage="md",
+            generated_at="test",
+            directories=["md/0_0"],
+            mlff_seed={
+                "configurations": 1,
+                "digest_schema": "mlab-seed-v1",
+                "seed_prefix_sha256": "0" * 64,
+            },
+        ),
     )
 
-    run_collect(config_path, stage="md")
+    result = run_collect(config_path, stage="md")
 
+    assert result.status is models.CollectStatus.NO_DATA
+    assert result.publication_committed is True
     manifest = read_manifest(work, "md")
-    records = manifest.skipped + manifest.failed
+    records = manifest.collect["sources"]
+    assert records == [source.as_diagnostic() for source in result.source_results]
     assert records
     assert any("md/0_0/ML_ABN" in record["path"] for record in records)
     assert any("ML_ABN" in record["reason"] for record in records)
@@ -2088,18 +2100,25 @@ def test_collect_validation_uses_all_ionic_steps(monkeypatch, tmp_path):
     )
     seen_freqs = []
 
-    class FakeDataset:
-        def __init__(self):
-            self.n_configs = 0
+    def fake_collect_outcar_source(*, work_dir, selection, freq):
+        del work_dir, selection
+        seen_freqs.append(freq)
+        return models.SourceResult(
+            source_path="validation/1.00deg/OUTCAR",
+            source_kind=models.SourceKind.OUTCAR,
+            status=models.SourceStatus.COMPLETE,
+            complete_count=1,
+            accepted_frames=(_publication_frame(1),),
+            pattern="^OUTCAR$",
+            pattern_index=0,
+            order=0,
+        )
 
-        def load_outcar(self, path, freq):
-            seen_freqs.append(freq)
-            self.n_configs += 1
-
-        def save_extxyz(self, path):
-            Path(path).write_text("fake extxyz\n", encoding="utf-8")
-
-    monkeypatch.setattr(collect_module, "Dataset", FakeDataset, raising=False)
+    monkeypatch.setattr(
+        collect_module,
+        "collect_outcar_source",
+        fake_collect_outcar_source,
+    )
     monkeypatch.setattr(
         collect_module,
         "find_outcar_series",
@@ -2107,9 +2126,12 @@ def test_collect_validation_uses_all_ionic_steps(monkeypatch, tmp_path):
         raising=False,
     )
 
-    run_collect(config_path, stage="validation")
+    result = run_collect(config_path, stage="validation")
 
     assert seen_freqs == [1]
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == 1
     manifest = read_manifest(work, "validation")
     assert manifest.collect["frames"] == 1
 
@@ -2118,10 +2140,11 @@ def test_collect_missing_stage_manifest_fails_without_output_or_manifest(tmp_pat
     config_path = write_collect_config(tmp_path, vasp_ml=False)
     work = tmp_path / "work"
 
-    with pytest.raises(Exception) as exc_info:
-        run_collect(config_path, stage="rlx")
+    result = run_collect(config_path, stage="rlx")
 
-    message = str(exc_info.value).lower()
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    message = result.fatal_diagnostic.lower()
     assert "manifest" in message
     assert "rlx" in message
     assert not (work / "rlx_data.extxyz").exists()
@@ -2133,10 +2156,11 @@ def test_collect_does_not_derive_directories_from_config(tmp_path):
     work = tmp_path / "work"
     (work / "rlx" / "0_0").mkdir(parents=True)
 
-    with pytest.raises(Exception) as exc_info:
-        run_collect(config_path, stage="rlx")
+    result = run_collect(config_path, stage="rlx")
 
-    message = str(exc_info.value).lower()
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    message = result.fatal_diagnostic.lower()
     assert "manifest" in message
     assert "rlx" in message
     assert not (work / "rlx_data.extxyz").exists()
@@ -2148,10 +2172,11 @@ def test_collect_does_not_scan_validation_directories_without_manifest(tmp_path)
     work = tmp_path / "work"
     (work / "validation" / "1.00deg").mkdir(parents=True)
 
-    with pytest.raises(Exception) as exc_info:
-        run_collect(config_path, stage="validation")
+    result = run_collect(config_path, stage="validation")
 
-    message = str(exc_info.value).lower()
+    assert result.status is models.CollectStatus.FATAL
+    assert result.publication_committed is False
+    message = result.fatal_diagnostic.lower()
     assert "manifest" in message
     assert "validation" in message
     assert not (work / "valid.extxyz").exists()

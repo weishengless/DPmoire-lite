@@ -8,6 +8,10 @@
 - Added `surface_gap` mode, where `d` sets `min_z(top) - max_z(bot)`.
 - Added `reference_plane_gap` mode with optional `d_reference` selectors, where `d` sets the selected reference-plane mean-z distance.
 - Added `potcar_policy` with `recommend` and `minimal` modes for choosing VASP-recommended or lowest-`ZVAL` regular POTCAR variants.
+- Added typed `--mlff-collect-mode seed-aware|full-dedup` collection. The
+  seed-aware default validates immutable seed provenance, while explicit
+  full-dedup is MLFF-MD-only, reads every accepted final `ML_ABN`, retains the
+  first exact copy (including one shared seed), and uses more I/O.
 
 ### Fixed
 
@@ -19,3 +23,11 @@
 - Applied the selected spacing mode consistently to twist validation structures.
 - Rejected tilted slab cells whose spacing direction is not aligned with Cartesian z.
 - Improved layer recovery when ASE tags are unavailable by falling back to the largest z-gap split.
+- Collection now maps structured `complete`, `fatal`, `degraded`, and `no_data`
+  results to exits 0, 1, 2, and 3 and prints one concise stderr summary; every
+  nonzero code is a shell failure. `no_data` never creates, deletes, or replaces
+  extxyz and preserves existing output bytes. Invalid full-dedup combinations
+  fail before manifest access. Current Manifest v2 remains authoritative;
+  legacy/missing compatibility writes `MD_data.collect.yaml` without rewriting
+  build provenance, and missing-manifest scans are full-dedup-only and at best
+  degraded when they produce frames.

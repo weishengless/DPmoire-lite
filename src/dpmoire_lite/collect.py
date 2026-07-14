@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 import warnings
 
 from ase.io import ParseError
@@ -15,6 +16,7 @@ from .collect_models import (
     CollectResult,
     CollectStatus,
     CollectionCandidate,
+    DEFAULT_MLFF_COLLECT_MODE,
     DedupStats,
     MLFFCollectMode,
     RecoveredCollectionEvidence,
@@ -830,7 +832,8 @@ def _orchestration_result_target(
                 raise ValueError("missing manifest result is internally inconsistent")
             if stage != "md" or collection_mode is not MLFFCollectMode.FULL_DEDUP:
                 raise ValueError(
-                    "stage manifest is missing; only explicit MD full-dedup may "
+                    f"stage manifest for {stage!r} is missing; only explicit MD "
+                    "full-dedup may "
                     "use compatibility discovery"
                 )
         else:
@@ -1004,6 +1007,13 @@ def orchestrate_collect(
     except (ConfigError, OSError, UnicodeError, yaml.YAMLError) as exc:
         return _fatal_collection_result(f"config error: {exc}")
 
+    if collection_mode is MLFFCollectMode.FULL_DEDUP and (
+        stage != "md" or not config.vasp_ml
+    ):
+        return _fatal_collection_result(
+            "full-dedup collection requires MLFF MD mode"
+        )
+
     work_dir = Path(config.work_dir)
     try:
         manifest = read_manifest(work_dir, stage)
@@ -1084,33 +1094,20 @@ def orchestrate_collect(
         return _fatal_collection_result(exc, candidate=candidate)
 
 
-def run_collect(config_path: Path, stage: str) -> None:
-    if stage not in COLLECT_OUTPUTS:
-        raise ValueError(f"Unknown collect stage: {stage}")
-
-    config = load_config(config_path)
-    manifest = _require_stage_manifest(config, stage)
-    collectors = {
-        "rlx": collect_rlx,
-        "md": collect_md,
-        "validation": collect_validation,
-    }
-    dataset, manifest = collectors[stage](config, manifest)
-
-    output_path = config.work_dir / COLLECT_OUTPUTS[stage]
-    manifest.collect["output"] = _display_path(config.work_dir, output_path)
-    if dataset.n_configs > 0:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        dataset.save_extxyz(output_path)
-        manifest.collect["written"] = True
-        manifest.collect["removed_stale_output"] = False
-    else:
-        removed_stale_output = output_path.exists()
-        if removed_stale_output:
-            output_path.unlink()
-        manifest.collect["written"] = False
-        manifest.collect["removed_stale_output"] = removed_stale_output
-    write_manifest(config.work_dir, manifest)
+def run_collect(
+    config_path: Path,
+    stage: str,
+    *,
+    collection_mode: MLFFCollectMode = DEFAULT_MLFF_COLLECT_MODE,
+) -> CollectResult:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    transaction_id = f"collect-{timestamp}-{uuid4().hex}"
+    return orchestrate_collect(
+        config_path=config_path,
+        stage=stage,
+        collection_mode=collection_mode,
+        transaction_id=transaction_id,
+    )
 
 
 def collect_rlx(config: DPmoireLiteConfig, manifest: Manifest) -> tuple[Dataset, Manifest]:

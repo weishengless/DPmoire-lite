@@ -91,7 +91,16 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 
 ## 数据收集语义
 
-收集逻辑是宽容的。缺失或无法读取的来源会尽量跳过，并在对应 stage 的 manifest 中记录收集帧数、跳过项和失败项。
+收集命令返回结构化的汇总状态。CLI 只向 stderr 输出一行简短摘要；所选结果 manifest 保留详细的逐来源诊断。
+
+| 退出码 | 状态 | 含义 |
+| ---: | --- | --- |
+| `0` | `complete` | 至少发布一帧，且所有预期来源均完整完成。 |
+| `1` | `fatal` | 配置、provenance、manifest、恢复或发布失败。 |
+| `2` | `degraded` | 已发布帧，但来源覆盖存在 partial、skipped、failed 或未知。 |
+| `3` | `no_data` | 本次没有接受或发布新帧。 |
+
+所有非零退出码都是 shell 失败。`no_data` 不会创建、删除或替换 extxyz；如果已有输出，其字节保持不变。
 
 输出文件保持分开：
 
@@ -103,10 +112,14 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 
 对于 MD 数据：
 
-- 如果 `vasp_ml: true`，DPmoire-lite 读取 `ML_ABN`，只收集 ab initio 构型。如果 `ML_AB` 已经存在，则会跳过已经出现过的构型。
+- `seed-aware` 是默认模式。对于 `vasp_ml: true`，它会验证 Stage1 中不可变的 seed provenance 并排除该前缀；绝不会从当前 `md/ML_AB` 推断前缀。
+- 显式 `--mlff-collect-mode full-dedup` 只适用于 MLFF MD。它读取每个可接受的最终 `ML_ABN`，对重复构型保留第一份精确副本（包括一份共享 seed），因此比 `seed-aware` 产生更多 I/O。
+- 对弛豫、validation 或非 ML MD 使用 `full-dedup` 会 fatal 并返回 1。
 - 如果 `vasp_ml: false`，DPmoire-lite 读取 OUTCAR，并使用 `outcar_collect_freq` 控制采样间隔。
 
 对于 validation 数据，会以频率 1 收集所有 OUTCAR ionic step。
+
+有效的当前 Manifest v2 始终具有最高权威。旧版或显式兼容的缺失 manifest MLFF 收集会写入 `MD_data.collect.yaml`，绝不会伪造或重写 build provenance。缺失 manifest 扫描只允许显式 `full-dedup`；即使扫描产生了帧，由于预期来源覆盖未知，状态至多为 `degraded`。
 
 ## 配置项说明
 
@@ -156,5 +169,6 @@ DPmoireLite init-example my_case
 DPmoireLite build config.yaml
 DPmoireLite collect config.yaml --stage rlx
 DPmoireLite collect config.yaml --stage md
+DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
 DPmoireLite collect config.yaml --stage validation
 ```

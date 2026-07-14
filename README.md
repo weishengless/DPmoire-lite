@@ -125,9 +125,20 @@ The initial MLFF workflow is intentionally explicit:
 
 ## Collection Semantics
 
-Collection is permissive. Missing or unreadable sources are skipped where
-possible, and the stage manifest records collected frame counts plus skipped or
-failed records.
+Collection returns a structured aggregate status. The CLI prints one concise
+summary line to stderr; the selected result manifest keeps the detailed
+per-source diagnostics.
+
+| Exit code | Status | Meaning |
+| ---: | --- | --- |
+| `0` | `complete` | At least one frame was published and all expected sources completed. |
+| `1` | `fatal` | Configuration, provenance, manifest, recovery, or publication failed. |
+| `2` | `degraded` | Frames were published, but coverage is partial, skipped, failed, or unknown. |
+| `3` | `no_data` | No new frames were accepted or published. |
+
+Every nonzero code is a shell failure. A `no_data` run never creates, deletes,
+or replaces an extxyz file; if an output already exists, its bytes are
+preserved.
 
 Output files are kept separate:
 
@@ -140,12 +151,24 @@ one frame every `outcar_collect_freq` ionic steps.
 
 For MD data:
 
-- If `vasp_ml: true`, DPmoire-lite reads `ML_ABN` and collects only the ab initio
-  configurations. If `ML_AB` exists, already-seen configurations are skipped.
+- `seed-aware` is the default. For `vasp_ml: true`, it validates the immutable
+  Stage1 seed provenance and excludes that prefix; it never infers the prefix
+  from the current `md/ML_AB`.
+- Explicit `--mlff-collect-mode full-dedup` is valid only for MLFF MD. It reads
+  every accepted final `ML_ABN`, retains the first exact copy of repeated
+  configurations (including one shared seed), and performs more I/O than
+  `seed-aware`.
+- Using `full-dedup` for relaxation, validation, or non-ML MD is fatal (exit 1).
 - If `vasp_ml: false`, DPmoire-lite reads OUTCAR files using
   `outcar_collect_freq`.
 
 For validation data, all OUTCAR ionic steps are collected with frequency 1.
+
+A valid current Manifest v2 is authoritative. Legacy or explicitly compatible
+missing-manifest MLFF collection writes `MD_data.collect.yaml`; it never
+fabricates or rewrites build provenance. Missing-manifest scanning is available
+only with explicit `full-dedup`, and a scan that produces frames is at best
+`degraded` because expected-source coverage is unknown.
 
 ## Config Tags
 
@@ -199,5 +222,6 @@ DPmoireLite init-example my_case
 DPmoireLite build config.yaml
 DPmoireLite collect config.yaml --stage rlx
 DPmoireLite collect config.yaml --stage md
+DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
 DPmoireLite collect config.yaml --stage validation
 ```

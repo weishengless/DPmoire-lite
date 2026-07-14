@@ -247,13 +247,36 @@ Output:
 work_dir/valid.extxyz
 ```
 
-Collection is permissive. Missing or unreadable sources are skipped when
-possible, and the manifest records collected frame counts, skipped paths, and
-failed paths.
+The CLI writes one concise aggregate line to stderr. Detailed per-source
+diagnostics remain in the selected result manifest.
 
-For `vasp_ml: true` MD, DPmoire-lite reads `ML_ABN` and collects only ab initio
-frames. If `ML_AB` exists, already-seen configurations are skipped so repeated
-collection does not duplicate the seed data.
+| Exit code | Status | Result |
+| ---: | --- | --- |
+| `0` | `complete` | Frames published with complete expected-source coverage. |
+| `1` | `fatal` | Configuration, provenance, manifest, recovery, or publication failure. |
+| `2` | `degraded` | Frames published with partial, skipped, failed, or unknown coverage. |
+| `3` | `no_data` | No new frames published. |
+
+Every nonzero code is a shell failure. `no_data` never creates, deletes, or
+replaces extxyz; an existing output stays byte-for-byte unchanged.
+
+For `vasp_ml: true` MD, the default `seed-aware` mode validates the immutable
+Stage1 seed provenance and never derives it from the current `md/ML_AB`. Older
+restart trees can explicitly request:
+
+```bash
+DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
+```
+
+`full-dedup` reads every accepted final `ML_ABN`, retains the first exact copy
+of repeated configurations (including one shared seed), and therefore performs
+more I/O. It is valid only for MLFF MD; relaxation, validation, and non-ML MD
+return fatal/exit 1.
+
+Current Manifest v2 is authoritative. Legacy or missing-manifest compatibility
+collection writes `MD_data.collect.yaml` without fabricating or rewriting build
+provenance. Missing-manifest scanning is full-dedup-only and is at best
+`degraded` when it produces frames because expected-source coverage is unknown.
 
 For relaxation and `vasp_ml: false` MD, DPmoire-lite reads OUTCAR series. The
 default OUTCAR patterns are:

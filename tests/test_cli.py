@@ -3,13 +3,26 @@ import sys
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
+import re
 from uuid import uuid4
 
 import pytest
 import yaml
 
+import dpmoire_lite.collect as collect_module
 from dpmoire_lite.cli import main
+from dpmoire_lite.collect_models import (
+    CollectResult,
+    CollectStatus,
+    CollectionCandidate,
+    MLFFCollectMode,
+    RecoveredCollectionEvidence,
+    SourceKind,
+    SourceResult,
+    SourceStatus,
+)
 from dpmoire_lite.config import ConfigError
+from dpmoire_lite.manifest import Manifest, write_manifest
 
 
 @contextmanager
@@ -45,6 +58,453 @@ def test_collect_requires_stage(capsys):
         assert exc.code != 0
     captured = capsys.readouterr()
     assert "--stage" in captured.err
+
+
+def _write_collect_cli_config(root, *, stage="rlx", vasp_ml=False):
+    input_dir = root / "input"
+    script_dir = root / "scripts"
+    potcar_dir = root / "potcars"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    potcar_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = root / "work"
+    config_path = root / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "dft_script": "DFT_script.sh",
+                "potcar_dir": str(potcar_dir),
+                "script_dir": str(script_dir),
+                "input_dir": str(input_dir),
+                "work_dir": str(work_dir),
+                "n_nodes": 1,
+                "stage": 0,
+                "submit": False,
+                "auto_resub": False,
+                "vasp_ml": vasp_ml,
+                "outcar_collect_freq": 8,
+                "do_relaxation": True,
+                "init_mlff": True,
+                "sc_rlx": True,
+                "n_sectors": [1, 1],
+                "sc": [1, 1],
+                "d": 4.0,
+                "k_mesh": 20,
+                "encut_factor": 1.5,
+                "r_cut": -1,
+                "symm_reduce": False,
+                "twist_val": False,
+                "min_val_n": 4,
+                "max_val_n": 5,
+                "include_monolayer_md": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_manifest(
+        work_dir,
+        Manifest(stage=stage, generated_at="cli-red", directories=[]),
+    )
+    return config_path
+
+
+def _recovered_cli_result(
+    status,
+    *,
+    frames,
+    complete,
+    partial=0,
+    skipped=0,
+    failed=0,
+    warnings=(),
+):
+    return CollectResult(
+        status=status,
+        recovered_evidence=RecoveredCollectionEvidence(
+            transaction_id="collect-20260714-120000-" + "a" * 32,
+            status=status,
+            frame_count=frames,
+            sources_attempted=complete + partial + failed,
+            sources_complete=complete,
+            sources_partial=partial,
+            sources_skipped=skipped,
+            sources_failed=failed,
+        ),
+        publication_committed=True,
+        warnings=warnings,
+    )
+
+
+def _replace_orchestrate_collect(monkeypatch, result):
+    calls = []
+
+    def fake_orchestrate_collect(**request):
+        calls.append(request)
+        return result
+
+    monkeypatch.setattr(
+        collect_module,
+        "orchestrate_collect",
+        fake_orchestrate_collect,
+    )
+    return calls
+
+
+def _assert_orchestration_request(calls, *, config_path, stage, collection_mode):
+    assert len(calls) == 1
+    request = calls[0]
+    assert request["config_path"] == config_path
+    assert request["stage"] == stage
+    assert request["collection_mode"] is collection_mode
+    assert re.fullmatch(
+        r"collect-\d{8}-\d{6}-[0-9a-f]{32}",
+        request["transaction_id"],
+    )
+
+
+def _assert_one_stderr_summary(capsys, expected):
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1
+    assert captured.err == expected + "\n"
+
+
+def _main_exit_code(argv):
+    try:
+        return main(argv)
+    except SystemExit as exc:
+        return exc.code
+
+
+def test_collect_cli_complete_returns_zero(monkeypatch, tmp_path, capsys):
+    config_path = _write_collect_cli_config(tmp_path, stage="rlx")
+    result = _recovered_cli_result(
+        CollectStatus.COMPLETE,
+        frames=3,
+        complete=2,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "rlx"])
+
+    assert exit_code == 0
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="rlx",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=complete frames=3 sources=2 complete=2 partial=0 "
+        "skipped=0 failed=0 output=rlx_data.extxyz",
+    )
+
+
+def test_collect_cli_fatal_returns_one(monkeypatch, tmp_path, capsys):
+    config_path = _write_collect_cli_config(tmp_path, stage="rlx")
+    result = CollectResult(
+        status=CollectStatus.FATAL,
+        fatal_diagnostic="manifest invariant failed\n  before publication",
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "rlx"])
+
+    assert exit_code == 1
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="rlx",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=fatal frames=0 sources=0 complete=0 partial=0 skipped=0 "
+        "failed=0 output=rlx_data.extxyz diagnostic=manifest invariant failed "
+        "before publication",
+    )
+
+
+def test_collect_cli_degraded_returns_two(monkeypatch, tmp_path, capsys):
+    config_path = _write_collect_cli_config(tmp_path, stage="validation")
+    result = _recovered_cli_result(
+        CollectStatus.DEGRADED,
+        frames=4,
+        complete=1,
+        partial=1,
+        skipped=1,
+        failed=1,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "validation"])
+
+    assert exit_code == 2
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="validation",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=degraded frames=4 sources=4 complete=1 partial=1 skipped=1 "
+        "failed=1 output=valid.extxyz",
+    )
+
+
+def test_collect_cli_no_data_returns_three(monkeypatch, tmp_path, capsys):
+    config_path = _write_collect_cli_config(tmp_path, stage="rlx")
+    candidate = CollectionCandidate(
+        source_results=(
+            SourceResult(
+                source_path="rlx/skipped/OUTCAR",
+                source_kind=SourceKind.OUTCAR,
+                status=SourceStatus.SKIPPED,
+                complete_count=0,
+                reason="source was not ready",
+            ),
+            SourceResult(
+                source_path="rlx/failed/OUTCAR",
+                source_kind=SourceKind.OUTCAR,
+                status=SourceStatus.FAILED,
+                complete_count=0,
+                reason="source parse failed",
+            ),
+        ),
+        accepted_frames=(),
+    )
+    result = CollectResult(
+        status=CollectStatus.NO_DATA,
+        candidate=candidate,
+        publication_committed=True,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "rlx"])
+
+    assert exit_code == 3
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="rlx",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=no_data frames=0 sources=2 complete=0 partial=0 skipped=1 "
+        "failed=1 output=rlx_data.extxyz",
+    )
+
+
+def test_collect_cli_prints_short_summary_to_stderr(monkeypatch, tmp_path, capsys):
+    config_path = _write_collect_cli_config(
+        tmp_path,
+        stage="md",
+        vasp_ml=False,
+    )
+    result = _recovered_cli_result(
+        CollectStatus.DEGRADED,
+        frames=8,
+        complete=2,
+        partial=1,
+        skipped=1,
+        failed=1,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "md"])
+
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=degraded frames=8 sources=5 complete=2 partial=1 skipped=1 "
+        "failed=1 output=MD_data.extxyz",
+    )
+    assert exit_code == 2
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="md",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+
+
+def test_cli_does_not_infer_exit_code_from_manifest_or_log_text(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    config_path = _write_collect_cli_config(tmp_path, stage="validation")
+    result = _recovered_cli_result(
+        CollectStatus.COMPLETE,
+        frames=5,
+        complete=1,
+        warnings=(
+            "manifest and log contain misleading fatal degraded no_data text",
+        ),
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "validation"])
+
+    assert exit_code == 0
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=complete frames=5 sources=1 complete=1 partial=0 skipped=0 "
+        "failed=0 output=valid.extxyz",
+    )
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="validation",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+
+
+def test_collect_cli_defaults_mlff_mode_to_seed_aware(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    config_path = _write_collect_cli_config(tmp_path, stage="rlx")
+    result = _recovered_cli_result(
+        CollectStatus.COMPLETE,
+        frames=2,
+        complete=1,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = main(["collect", str(config_path), "--stage", "rlx"])
+
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="rlx",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+    assert exit_code == 0
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=complete frames=2 sources=1 complete=1 partial=0 skipped=0 "
+        "failed=0 output=rlx_data.extxyz",
+    )
+
+
+def test_collect_cli_accepts_full_dedup_only_for_mlff_md(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    config_path = _write_collect_cli_config(tmp_path, stage="md", vasp_ml=True)
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert config_data["vasp_ml"] is True
+    result = _recovered_cli_result(
+        CollectStatus.COMPLETE,
+        frames=2,
+        complete=1,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+
+    exit_code = _main_exit_code(
+        [
+            "collect",
+            str(config_path),
+            "--stage",
+            "md",
+            "--mlff-collect-mode",
+            "full-dedup",
+        ]
+    )
+
+    assert exit_code == 0
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="md",
+        collection_mode=MLFFCollectMode.FULL_DEDUP,
+    )
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=complete frames=2 sources=1 complete=1 partial=0 skipped=0 "
+        "failed=0 output=MD_data.extxyz",
+    )
+
+
+def test_collect_cli_rejects_full_dedup_for_rlx_validation_or_non_ml_md(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    cases = (
+        (
+            _write_collect_cli_config(tmp_path / "rlx", stage="rlx", vasp_ml=True),
+            "rlx",
+            "rlx_data.extxyz",
+        ),
+        (
+            _write_collect_cli_config(
+                tmp_path / "validation",
+                stage="validation",
+                vasp_ml=True,
+            ),
+            "validation",
+            "valid.extxyz",
+        ),
+        (
+            _write_collect_cli_config(tmp_path / "md", stage="md", vasp_ml=False),
+            "md",
+            "MD_data.extxyz",
+        ),
+    )
+    real_load_config = collect_module.load_config
+    loaded_configs = []
+    manifest_reads = []
+
+    def tracking_load_config(config_path):
+        loaded_configs.append(Path(config_path))
+        return real_load_config(config_path)
+
+    def forbidden_manifest_read(*args, **kwargs):
+        manifest_reads.append((args, kwargs))
+        raise AssertionError("stage manifest was read before full-dedup rejection")
+
+    monkeypatch.setattr(collect_module, "load_config", tracking_load_config)
+    monkeypatch.setattr(collect_module, "read_manifest", forbidden_manifest_read)
+
+    observed = []
+    for config_path, stage, output_basename in cases:
+        exit_code = _main_exit_code(
+            [
+                "collect",
+                str(config_path),
+                "--stage",
+                stage,
+                "--mlff-collect-mode",
+                "full-dedup",
+            ]
+        )
+        captured = capsys.readouterr()
+        observed.append(
+            (
+                exit_code,
+                captured.out,
+                captured.err,
+                output_basename,
+            )
+        )
+
+    assert loaded_configs == [case[0] for case in cases]
+    assert manifest_reads == []
+    for exit_code, stdout, stderr, output_basename in observed:
+        assert exit_code == 1
+        assert stdout == ""
+        assert len(stderr.splitlines()) == 1
+        assert stderr == (
+            "collect status=fatal frames=0 sources=0 complete=0 partial=0 skipped=0 "
+            f"failed=0 output={output_basename} "
+            "diagnostic=full-dedup collection requires MLFF MD mode\n"
+        )
 
 
 def test_build_help_marks_wait_temporarily_disabled_for_submitted_workflows(capsys):

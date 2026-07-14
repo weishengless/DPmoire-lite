@@ -208,9 +208,26 @@ DPmoireLite collect config.yaml --stage validation
 work_dir/valid.extxyz
 ```
 
-收集逻辑是宽容的。缺失或无法读取的来源会尽量跳过，manifest 会记录收集帧数、跳过路径和失败路径。
+CLI 只向 stderr 输出一行简短汇总；所选结果 manifest 保留详细的逐来源诊断。
 
-对于 `vasp_ml: true` 的 MD，DPmoire-lite 读取 `ML_ABN`，只收集 ab initio 帧。如果 `ML_AB` 已存在，会跳过已经出现过的构型，避免重复收集种子数据。
+| 退出码 | 状态 | 结果 |
+| ---: | --- | --- |
+| `0` | `complete` | 已发布帧，且预期来源覆盖完整。 |
+| `1` | `fatal` | 配置、provenance、manifest、恢复或发布失败。 |
+| `2` | `degraded` | 已发布帧，但覆盖存在 partial、skipped、failed 或未知。 |
+| `3` | `no_data` | 没有发布新帧。 |
+
+所有非零退出码都是 shell 失败。`no_data` 不会创建、删除或替换 extxyz；已有输出保持逐字节不变。
+
+对于 `vasp_ml: true` 的 MD，默认 `seed-aware` 模式验证 Stage1 中不可变的 seed provenance，绝不会从当前 `md/ML_AB` 推断。旧版续算目录可显式运行：
+
+```bash
+DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
+```
+
+`full-dedup` 读取每个可接受的最终 `ML_ABN`，对重复构型保留第一份精确副本（包括一份共享 seed），因此会产生更多 I/O。它只适用于 MLFF MD；用于弛豫、validation 或非 ML MD 时会 fatal 并返回 1。
+
+当前 Manifest v2 始终具有最高权威。旧版或缺失 manifest 的兼容收集写入 `MD_data.collect.yaml`，不会伪造或重写 build provenance。缺失 manifest 扫描只允许 `full-dedup`；即使产生帧，由于预期来源覆盖未知，状态至多为 `degraded`。
 
 对于弛豫和 `vasp_ml: false` 的 MD，DPmoire-lite 读取 OUTCAR 系列。默认 OUTCAR 匹配规则是：
 
