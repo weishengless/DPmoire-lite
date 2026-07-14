@@ -1,3 +1,5 @@
+import hashlib
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -22,7 +24,8 @@ from dpmoire_lite.collect_models import (
     SourceStatus,
 )
 from dpmoire_lite.config import ConfigError
-from dpmoire_lite.manifest import Manifest, write_manifest
+from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
+from dpmoire_lite.paths import manifest_path
 
 
 @contextmanager
@@ -60,7 +63,13 @@ def test_collect_requires_stage(capsys):
     assert "--stage" in captured.err
 
 
-def _write_collect_cli_config(root, *, stage="rlx", vasp_ml=False):
+def _write_collect_cli_config(
+    root,
+    *,
+    stage="rlx",
+    vasp_ml=False,
+    outcar_collect_freq=8,
+):
     input_dir = root / "input"
     script_dir = root / "scripts"
     potcar_dir = root / "potcars"
@@ -82,7 +91,7 @@ def _write_collect_cli_config(root, *, stage="rlx", vasp_ml=False):
                 "submit": False,
                 "auto_resub": False,
                 "vasp_ml": vasp_ml,
-                "outcar_collect_freq": 8,
+                "outcar_collect_freq": outcar_collect_freq,
                 "do_relaxation": True,
                 "init_mlff": True,
                 "sc_rlx": True,
@@ -505,6 +514,142 @@ def test_collect_cli_rejects_full_dedup_for_rlx_validation_or_non_ml_md(
             f"failed=0 output={output_basename} "
             "diagnostic=full-dedup collection requires MLFF MD mode\n"
         )
+
+
+TASK6_CLI_OUTCAR_FIXTURE = (
+    Path(__file__).parent / "data" / "outcar" / "complete_two_frame.OUTCAR"
+)
+
+
+def _prepare_task6_cli_rlx_case(root, directories):
+    config_path = _write_collect_cli_config(
+        root,
+        stage="rlx",
+        vasp_ml=False,
+        outcar_collect_freq=1,
+    )
+    work = root / "work"
+    write_manifest(
+        work,
+        Manifest(
+            stage="rlx",
+            generated_at="task6-cli-e2e",
+            directories=list(directories),
+        ),
+    )
+    return config_path, work
+
+
+def _task6_cli_output_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_complete_degraded_no_data_fatal_end_to_end_exit_codes(
+    tmp_path,
+    capsys,
+):
+    exit_codes = []
+
+    complete_config, complete_work = _prepare_task6_cli_rlx_case(
+        tmp_path / "complete",
+        ["rlx/complete"],
+    )
+    complete_source = complete_work / "rlx" / "complete"
+    complete_source.mkdir(parents=True)
+    shutil.copy2(TASK6_CLI_OUTCAR_FIXTURE, complete_source / "OUTCAR")
+    exit_codes.append(main(["collect", str(complete_config), "--stage", "rlx"]))
+    complete_cli = capsys.readouterr()
+    complete_manifest = read_manifest(complete_work, "rlx").manifest
+    complete_output = complete_work / "rlx_data.extxyz"
+    assert complete_manifest is not None
+    assert complete_manifest.collect["status"] == "complete"
+    assert complete_manifest.collect["frames"] == 2
+    assert complete_manifest.collect["written"] is True
+    assert [
+        source["status"] for source in complete_manifest.collect["sources"]
+    ] == ["complete"]
+    assert complete_output.is_file()
+    assert complete_manifest.collect["output_sha256"] == _task6_cli_output_sha256(
+        complete_output
+    )
+    assert complete_cli.out == ""
+    assert complete_cli.err == (
+        "collect status=complete frames=2 sources=1 complete=1 partial=0 "
+        "skipped=0 failed=0 output=rlx_data.extxyz\n"
+    )
+
+    degraded_config, degraded_work = _prepare_task6_cli_rlx_case(
+        tmp_path / "degraded",
+        ["rlx/complete", "rlx/missing"],
+    )
+    degraded_source = degraded_work / "rlx" / "complete"
+    degraded_source.mkdir(parents=True)
+    shutil.copy2(TASK6_CLI_OUTCAR_FIXTURE, degraded_source / "OUTCAR")
+    exit_codes.append(main(["collect", str(degraded_config), "--stage", "rlx"]))
+    degraded_cli = capsys.readouterr()
+    degraded_manifest = read_manifest(degraded_work, "rlx").manifest
+    degraded_output = degraded_work / "rlx_data.extxyz"
+    assert degraded_manifest is not None
+    assert degraded_manifest.collect["status"] == "degraded"
+    assert degraded_manifest.collect["frames"] == 2
+    assert degraded_manifest.collect["source_order"] == [
+        "rlx/complete/OUTCAR",
+        "rlx/missing",
+    ]
+    assert [
+        source["status"] for source in degraded_manifest.collect["sources"]
+    ] == ["complete", "skipped"]
+    assert degraded_output.is_file()
+    assert degraded_manifest.collect["output_sha256"] == _task6_cli_output_sha256(
+        degraded_output
+    )
+    assert degraded_cli.out == ""
+    assert degraded_cli.err == (
+        "collect status=degraded frames=2 sources=2 complete=1 partial=0 "
+        "skipped=1 failed=0 output=rlx_data.extxyz\n"
+    )
+
+    no_data_config, no_data_work = _prepare_task6_cli_rlx_case(
+        tmp_path / "no-data",
+        ["rlx/missing"],
+    )
+    exit_codes.append(main(["collect", str(no_data_config), "--stage", "rlx"]))
+    no_data_cli = capsys.readouterr()
+    no_data_manifest = read_manifest(no_data_work, "rlx").manifest
+    assert no_data_manifest is not None
+    assert no_data_manifest.collect["status"] == "no_data"
+    assert no_data_manifest.collect["frames"] == 0
+    assert no_data_manifest.collect["written"] is False
+    assert no_data_manifest.collect["preserved_previous_output"] is False
+    assert no_data_manifest.collect["sources"][0]["status"] == "skipped"
+    assert "Missing declared directory" in no_data_manifest.collect["sources"][0][
+        "reason"
+    ]
+    assert not (no_data_work / "rlx_data.extxyz").exists()
+    assert no_data_cli.out == ""
+    assert no_data_cli.err == (
+        "collect status=no_data frames=0 sources=1 complete=0 partial=0 "
+        "skipped=1 failed=0 output=rlx_data.extxyz\n"
+    )
+
+    fatal_config, fatal_work = _prepare_task6_cli_rlx_case(
+        tmp_path / "fatal",
+        [],
+    )
+    fatal_manifest_path = manifest_path(fatal_work, "rlx")
+    fatal_manifest_path.unlink()
+    exit_codes.append(main(["collect", str(fatal_config), "--stage", "rlx"]))
+    fatal_cli = capsys.readouterr()
+    assert not fatal_manifest_path.exists()
+    assert not (fatal_work / "rlx_data.extxyz").exists()
+    assert fatal_cli.out == ""
+    assert fatal_cli.err == (
+        "collect status=fatal frames=0 sources=0 complete=0 partial=0 skipped=0 "
+        "failed=0 output=rlx_data.extxyz diagnostic=stage manifest for 'rlx' "
+        "is missing; only explicit MD full-dedup may use compatibility discovery\n"
+    )
+
+    assert tuple(exit_codes) == (0, 2, 3, 1)
 
 
 def test_build_help_marks_wait_temporarily_disabled_for_submitted_workflows(capsys):

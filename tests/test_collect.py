@@ -15,13 +15,17 @@ import dpmoire_lite.collect as collect_module
 import dpmoire_lite.collect_publish as collect_publish_module
 import dpmoire_lite.dataset as dataset_module
 from dpmoire_lite import atomic_io
+from dpmoire_lite.build import run_build
+from dpmoire_lite.cli import main
 from dpmoire_lite import collect_models as models
 from dpmoire_lite.dataset import Dataset
 from dpmoire_lite.collect import run_collect
 from dpmoire_lite.file_lock import CollectFileLock, CollectLockError
 from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
-from dpmoire_lite.mlab import MlabConfiguration
+from dpmoire_lite.mlab import MlabConfiguration, parse_mlab
 from dpmoire_lite.paths import manifest_path
+
+from test_stage_provenance import prepare_stage1_case
 
 
 def write_collect_config(root, **overrides):
@@ -357,23 +361,847 @@ def test_status_selection_does_not_parse_log_text():
     assert select_collect_status(partial_candidate) is CollectStatus.DEGRADED
 
 
-def test_load_ml_abn_sample_counts_frames(tmp_path, sample_dir):
-    source = sample_dir / "ML_ABN"
-    target = tmp_path / "ML_ABN"
-    shutil.copy2(source, target)
-    dataset = Dataset()
-    dataset.load_ml_ab(target)
-    assert dataset.n_configs > 0
-    assert len(dataset.data) == dataset.n_configs
+TASK6_MLAB_FIXTURES = Path(__file__).parent / "data" / "mlab"
+TASK6_OUTCAR_FIXTURE = (
+    Path(__file__).parent / "data" / "outcar" / "complete_two_frame.OUTCAR"
+)
 
 
-def test_load_outcar_sample_counts_frames(tmp_path, sample_dir):
-    source = sample_dir / "lambda_p0p00" / "OUTCAR"
-    target = tmp_path / "OUTCAR"
-    shutil.copy2(source, target)
+def _prepare_task6_seeded_stage1(root: Path):
+    config_path = prepare_stage1_case(
+        root,
+        stage0_overrides={"n_sectors": [1, 1]},
+        stage1_overrides={"vasp_ml": True},
+    )
+    work = root / "work"
+    init_mlff = work / "init_mlff"
+    init_mlff.mkdir(parents=True)
+    shutil.copy2(
+        TASK6_MLAB_FIXTURES / "complete_vasp_651.mlab",
+        init_mlff / "ML_ABN",
+    )
+    (init_mlff / "ML_FFN").write_text(
+        "synthetic-initial-force-field\n",
+        encoding="utf-8",
+    )
+
+    run_build(config_path, wait=False)
+
+    manifest = read_manifest(work, "md").manifest
+    assert manifest is not None
+    assert manifest.directories == ["md/0_0"]
+    assert manifest.mlff_seed["configurations"] == 1
+    return config_path, work, work / "md" / "0_0", manifest
+
+
+def _copy_task6_final_mlab(directory: Path) -> Path:
+    target = directory / "ML_ABN"
+    shutil.copy2(TASK6_MLAB_FIXTURES / "complete_multi.mlab", target)
+    return target
+
+
+def _write_task6_three_configuration_mlab(target: Path) -> None:
+    text = (TASK6_MLAB_FIXTURES / "complete_multi.mlab").read_text(
+        encoding="utf-8"
+    )
+    lines = text.splitlines(keepends=True)
+    label_index = next(
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == "The number of configurations"
+    )
+    value_index = next(
+        index
+        for index in range(label_index + 1, len(lines))
+        if lines[index].strip()
+    )
+    newline = "\n" if lines[value_index].endswith("\n") else ""
+    lines[value_index] = f"         3{newline}"
+    text = "".join(lines)
+
+    second_marker = "     Configuration num.      2"
+    third_block = text[text.index(second_marker) :]
+    third_block = third_block.replace(
+        second_marker,
+        "     Configuration num.      3",
+        1,
+    )
+    third_block = third_block.replace("synthetic-b", "synthetic-c", 1)
+    third_block = third_block.replace(
+        "  -1.200000000000000E+000",
+        "  -1.100000000000000E+000",
+        1,
+    )
+    target.write_text(text + third_block, encoding="utf-8")
+
+
+def test_stage1_seed_manifest_is_accepted_by_md_collect(tmp_path):
+    config_path, work, md_directory, producer_manifest = (
+        _prepare_task6_seeded_stage1(tmp_path)
+    )
+    _copy_task6_final_mlab(md_directory)
+    seed_evidence = dict(producer_manifest.mlff_seed)
+
+    result = run_collect(config_path, stage="md")
+
+    source = result.source_results[0]
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 1
+    assert result.source_count == 1
+    assert source.source_path == "md/0_0/ML_ABN"
+    assert source.status is models.SourceStatus.COMPLETE
+    assert source.complete_count == 2
+    assert source.accepted_count == 1
+    assert source.seed_identity is not None
+    assert source.seed_identity.sha256 == seed_evidence["seed_prefix_sha256"]
+    assert published_manifest.mlff_seed == seed_evidence
+    assert published_manifest.collect["status"] == "complete"
+    assert published_manifest.collect["collection_mode"] == "seed-aware"
+    assert published_manifest.collect["frames"] == 1
+
+
+def test_multiple_restart_mlab_collects_all_post_initial_seed_frames(tmp_path):
+    config_path, work, md_directory, producer_manifest = (
+        _prepare_task6_seeded_stage1(tmp_path)
+    )
+    current_restart = md_directory / "ML_AB"
+    shutil.copy2(TASK6_MLAB_FIXTURES / "complete_multi.mlab", current_restart)
+    final_source = md_directory / "ML_ABN"
+    _write_task6_three_configuration_mlab(final_source)
+    parsed_final = parse_mlab(final_source)
+    seed_evidence = dict(producer_manifest.mlff_seed)
+    current_restart_bytes = current_restart.read_bytes()
+
+    result = run_collect(config_path, stage="md")
+
+    source = result.source_results[0]
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert parsed_final.status == "complete"
+    assert parsed_final.complete_count == 3
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert source.complete_count == 3
+    assert source.accepted_count == 2
+    assert source.seed_identity is not None
+    assert source.seed_identity.sha256 == seed_evidence["seed_prefix_sha256"]
+    assert published_manifest.mlff_seed == seed_evidence
+    assert published_manifest.collect["frames"] == 2
+    assert current_restart.read_bytes() == current_restart_bytes
+
+
+def test_default_and_explicit_seed_aware_outputs_match(tmp_path, capsys):
+    default_config, default_work, default_md, _ = _prepare_task6_seeded_stage1(
+        tmp_path / "default"
+    )
+    explicit_config, explicit_work, explicit_md, _ = _prepare_task6_seeded_stage1(
+        tmp_path / "explicit"
+    )
+    _copy_task6_final_mlab(default_md)
+    _copy_task6_final_mlab(explicit_md)
+
+    default_exit = main(
+        ["collect", str(default_config), "--stage", "md"]
+    )
+    default_cli = capsys.readouterr()
+    explicit_exit = main(
+        [
+            "collect",
+            str(explicit_config),
+            "--stage",
+            "md",
+            "--mlff-collect-mode",
+            "seed-aware",
+        ]
+    )
+    explicit_cli = capsys.readouterr()
+
+    default_manifest = read_manifest(default_work, "md").manifest
+    explicit_manifest = read_manifest(explicit_work, "md").manifest
+    assert default_manifest is not None
+    assert explicit_manifest is not None
+    assert default_exit == explicit_exit == 0
+    assert default_cli.out == explicit_cli.out == ""
+    assert default_cli.err == explicit_cli.err
+    assert (default_work / "MD_data.extxyz").read_bytes() == (
+        explicit_work / "MD_data.extxyz"
+    ).read_bytes()
+    stable_fields = (
+        "status",
+        "frames",
+        "sources",
+        "source_order",
+        "collection_mode",
+        "expected_directories",
+        "output_sha256",
+    )
+    assert {
+        field: default_manifest.collect[field] for field in stable_fields
+    } == {
+        field: explicit_manifest.collect[field] for field in stable_fields
+    }
+    assert default_manifest.collect["collection_mode"] == "seed-aware"
+
+
+def test_build_then_collect_uses_only_manifest_declared_directories(tmp_path):
+    config_path, work, md_directory, producer_manifest = (
+        _prepare_task6_seeded_stage1(tmp_path)
+    )
+    _copy_task6_final_mlab(md_directory)
+    undeclared = work / "md" / "undeclared"
+    undeclared.mkdir()
+    _copy_task6_final_mlab(undeclared)
+
+    result = run_collect(config_path, stage="md")
+
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.accepted_frame_count == len(output_frames) == 1
+    assert result.candidate is not None
+    assert result.candidate.expected_directories == ("md/0_0",)
+    assert tuple(source.source_path for source in result.source_results) == (
+        "md/0_0/ML_ABN",
+    )
+    assert published_manifest.directories == producer_manifest.directories
+    assert published_manifest.collect["expected_directories"] == ["md/0_0"]
+    assert published_manifest.collect["source_order"] == ["md/0_0/ML_ABN"]
+    assert published_manifest.collect["inventory"] == {
+        "manifest_kind": "current",
+        "directory_discovery": "declared",
+        "directories": ["md/0_0"],
+        "coverage_known": True,
+        "warnings": [],
+    }
+
+
+def _prepare_task6_full_dedup_case(
+    root: Path,
+    sources: tuple[tuple[str, str], ...],
+):
+    config_path = write_collect_config(root, vasp_ml=True)
+    work = root / "work"
+    directories = []
+    for directory_name, fixture_name in sources:
+        directory = work / "md" / directory_name
+        directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            TASK6_MLAB_FIXTURES / fixture_name,
+            directory / "ML_ABN",
+        )
+        directories.append(f"md/{directory_name}")
+    write_manifest(
+        work,
+        Manifest(
+            stage="md",
+            generated_at="task6-full-dedup",
+            directories=directories,
+        ),
+    )
+    return config_path, work
+
+
+def test_full_dedup_fresh_restart_keeps_pre_restart_configurations(tmp_path):
+    config_path, work = _prepare_task6_full_dedup_case(
+        tmp_path,
+        (("restart", "complete_multi.mlab"),),
+    )
+    current_restart = work / "md" / "restart" / "ML_AB"
+    shutil.copy2(
+        TASK6_MLAB_FIXTURES / "complete_vasp_651.mlab",
+        current_restart,
+    )
+    current_restart_bytes = current_restart.read_bytes()
+
+    result = run_collect(
+        config_path,
+        stage="md",
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+    )
+
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert result.source_count == 1
+    source = result.source_results[0]
+    assert source.source_path == "md/restart/ML_ABN"
+    assert source.status is models.SourceStatus.COMPLETE
+    assert source.complete_count == source.accepted_count == 2
+    np.testing.assert_allclose(
+        output_frames[0].get_positions(),
+        [[0.0, 0.0, 1.0], [2.0, 2.0, 2.0]],
+    )
+    np.testing.assert_allclose(
+        output_frames[1].get_positions(),
+        [[0.0, 0.0, 1.1], [2.1, 2.0, 2.0]],
+    )
+    assert current_restart.read_bytes() == current_restart_bytes
+    collect = published_manifest.collect
+    assert collect["status"] == "complete"
+    assert collect["frames"] == 2
+    assert collect["collection_mode"] == "full-dedup"
+    assert (
+        collect["dedup"]["seen"],
+        collect["dedup"]["unique"],
+        collect["dedup"]["duplicates_removed"],
+    ) == (2, 2, 0)
+
+
+def test_full_dedup_repeated_seed_is_published_once(tmp_path):
+    config_path, work = _prepare_task6_full_dedup_case(
+        tmp_path,
+        (
+            ("seed", "complete_vasp_651.mlab"),
+            ("restart", "complete_multi.mlab"),
+        ),
+    )
+
+    result = run_collect(
+        config_path,
+        stage="md",
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+    )
+
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert tuple(source.source_path for source in result.source_results) == (
+        "md/seed/ML_ABN",
+        "md/restart/ML_ABN",
+    )
+    assert [source.complete_count for source in result.source_results] == [1, 2]
+    assert [source.accepted_count for source in result.source_results] == [1, 2]
+    assert [frame.get_potential_energy() for frame in output_frames] == pytest.approx(
+        [-1.25, -1.2]
+    )
+    collect = published_manifest.collect
+    assert collect["status"] == "complete"
+    assert collect["source_order"] == [
+        "md/seed/ML_ABN",
+        "md/restart/ML_ABN",
+    ]
+    assert collect["dedup"] == {
+        "applied": True,
+        "schema": "mlab-config-v1",
+        "seen": 3,
+        "unique": 2,
+        "duplicates_removed": 1,
+        "candidate_frame_count": 2,
+        "per_source": [
+            {
+                "source_path": "md/seed/ML_ABN",
+                "seen": 1,
+                "retained": 1,
+                "duplicates_removed": 0,
+            },
+            {
+                "source_path": "md/restart/ML_ABN",
+                "seen": 2,
+                "retained": 1,
+                "duplicates_removed": 1,
+            },
+        ],
+    }
+
+
+def test_vasp_641_and_651_mlab_fixtures_collect_end_to_end(tmp_path):
+    config_path, work = _prepare_task6_full_dedup_case(
+        tmp_path,
+        (
+            ("vasp-641", "complete_vasp_641.mlab"),
+            ("vasp-651", "complete_vasp_651.mlab"),
+        ),
+    )
+
+    result = run_collect(
+        config_path,
+        stage="md",
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+    )
+
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert tuple(source.source_path for source in result.source_results) == (
+        "md/vasp-641/ML_ABN",
+        "md/vasp-651/ML_ABN",
+    )
+    assert all(
+        source.status is models.SourceStatus.COMPLETE
+        and source.complete_count == source.accepted_count == 1
+        for source in result.source_results
+    )
+    assert [frame.get_chemical_symbols() for frame in output_frames] == [
+        ["C"],
+        ["O", "Pt"],
+    ]
+    assert [frame.get_potential_energy() for frame in output_frames] == pytest.approx(
+        [-1.0, -1.25]
+    )
+    np.testing.assert_allclose(output_frames[0].get_positions(), [[0.0, 0.0, 1.0]])
+    np.testing.assert_allclose(
+        output_frames[1].get_positions(),
+        [[0.0, 0.0, 1.0], [2.0, 2.0, 2.0]],
+    )
+    collect = published_manifest.collect
+    assert collect["source_order"] == [
+        "md/vasp-641/ML_ABN",
+        "md/vasp-651/ML_ABN",
+    ]
+    assert collect["inventory"] == {
+        "manifest_kind": "current",
+        "directory_discovery": "declared",
+        "directories": ["md/vasp-641", "md/vasp-651"],
+        "coverage_known": True,
+        "warnings": [],
+    }
+    assert (
+        collect["dedup"]["seen"],
+        collect["dedup"]["unique"],
+        collect["dedup"]["duplicates_removed"],
+    ) == (2, 2, 0)
+
+
+def test_missing_manifest_full_dedup_writes_degraded_compatibility_result(
+    tmp_path,
+):
+    config_path = write_collect_config(tmp_path, vasp_ml=True)
+    work = tmp_path / "work"
+    source_directory = work / "md" / "run-a"
+    source_directory.mkdir(parents=True)
+    shutil.copy2(
+        TASK6_MLAB_FIXTURES / "complete_multi.mlab",
+        source_directory / "ML_ABN",
+    )
+
+    result = run_collect(
+        config_path,
+        stage="md",
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+    )
+
+    output = work / "MD_data.extxyz"
+    output_frames = ase_read(output, format="extxyz", index=":")
+    compatibility = yaml.safe_load(
+        (work / "MD_data.collect.yaml").read_text(encoding="utf-8")
+    )
+    collect = compatibility["collect"]
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert result.sources_complete == 1
+    assert not manifest_path(work, "md").exists()
+    assert compatibility["schema_version"] == 1
+    assert compatibility["kind"] == "dpmoire-lite-collect-result"
+    assert compatibility["stage"] == "md"
+    assert compatibility["input_layout"] == "missing-stage-manifest"
+    assert compatibility["directory_discovery"] == "legacy-scan"
+    assert compatibility["declared_directories"] == []
+    assert compatibility["discovered_directories"] == ["md/run-a"]
+    assert compatibility["collection_mode"] == "full-dedup"
+    assert collect["status"] == "degraded"
+    assert collect["frames"] == 2
+    assert collect["written"] is True
+    assert collect["output"] == "MD_data.extxyz"
+    assert collect["output_sha256"] == atomic_io.sha256_file(output)
+    assert collect["source_order"] == ["md/run-a/ML_ABN"]
+    assert {
+        key: collect["inventory"][key]
+        for key in (
+            "manifest_kind",
+            "directory_discovery",
+            "directories",
+            "coverage_known",
+        )
+    } == {
+        "manifest_kind": "missing",
+        "directory_discovery": "legacy-scan",
+        "directories": ["md/run-a"],
+        "coverage_known": False,
+    }
+    inventory_warnings = collect["inventory"]["warnings"]
+    assert len(inventory_warnings) == 1
+    assert "bounded direct-child legacy scan" in inventory_warnings[0]
+    assert "unknown source coverage" in inventory_warnings[0]
+    assert compatibility["dedup"] == collect["dedup"]
+    assert (
+        collect["dedup"]["seen"],
+        collect["dedup"]["unique"],
+        collect["dedup"]["duplicates_removed"],
+    ) == (2, 2, 0)
+
+
+def _write_task6_marked_outcar(target: Path, first_x: float) -> None:
+    text = TASK6_OUTCAR_FIXTURE.read_text(encoding="utf-8")
+    replacements = (
+        (
+            "   0.00000000   0.00000000   0.00000000      "
+            "0.10000000  -0.20000000   0.30000000",
+            f"   {first_x:.8f}   0.00000000   0.00000000      "
+            "0.10000000  -0.20000000   0.30000000",
+        ),
+        (
+            "   0.05000000   0.00000000   0.00000000     "
+            "-0.05000000   0.10000000  -0.15000000",
+            f"   {first_x + 0.05:.8f}   0.00000000   0.00000000     "
+            "-0.05000000   0.10000000  -0.15000000",
+        ),
+    )
+    for original, replacement in replacements:
+        assert text.count(original) == 1
+        text = text.replace(original, replacement, 1)
+    target.write_text(text, encoding="utf-8")
+
+
+def test_rlx_multiple_outcar_segments_record_deterministic_order(tmp_path):
+    config_path = write_collect_config(
+        tmp_path,
+        vasp_ml=False,
+        outcar_collect_freq=1,
+        outcar_patterns=[r"^OUTCAR\d+$", r"^OUTCAR$"],
+    )
+    work = tmp_path / "work"
+    first_directory = work / "rlx" / "z-declared-first"
+    second_directory = work / "rlx" / "a-declared-second"
+    first_directory.mkdir(parents=True)
+    second_directory.mkdir(parents=True)
+    _write_task6_marked_outcar(first_directory / "OUTCAR2", 0.20)
+    _write_task6_marked_outcar(first_directory / "OUTCAR10", 1.00)
+    _write_task6_marked_outcar(first_directory / "OUTCAR", 2.00)
+    _write_task6_marked_outcar(second_directory / "OUTCAR", 3.00)
+    declared_directories = [
+        "rlx/z-declared-first",
+        "rlx/a-declared-second",
+    ]
+    write_manifest(
+        work,
+        Manifest(
+            stage="rlx",
+            generated_at="task6-rlx-order",
+            directories=declared_directories,
+        ),
+    )
+    input_manifest = read_manifest(work, "rlx")
+    assert input_manifest.kind == "current"
+    assert input_manifest.manifest is not None
+    assert input_manifest.manifest.schema_version == 2
+
+    result = run_collect(config_path, stage="rlx")
+
+    expected_sources = (
+        ("rlx/z-declared-first/OUTCAR2", r"^OUTCAR\d+$", 0, 0),
+        ("rlx/z-declared-first/OUTCAR10", r"^OUTCAR\d+$", 0, 1),
+        ("rlx/z-declared-first/OUTCAR", r"^OUTCAR$", 1, 2),
+        ("rlx/a-declared-second/OUTCAR", r"^OUTCAR$", 1, 0),
+    )
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == 8
+    assert result.sources_complete == 4
+    assert all(
+        source.status is models.SourceStatus.COMPLETE
+        and source.complete_count == source.accepted_count == 2
+        for source in result.source_results
+    )
+    assert tuple(
+        (source.source_path, source.pattern, source.pattern_index, source.order)
+        for source in result.source_results
+    ) == expected_sources
+
+    output_frames = ase_read(work / "rlx_data.extxyz", format="extxyz", index=":")
+    assert len(output_frames) == 8
+    assert [frame.positions[0, 0] for frame in output_frames] == pytest.approx(
+        [0.20, 0.25, 1.00, 1.05, 2.00, 2.05, 3.00, 3.05]
+    )
+    published_manifest = read_manifest(work, "rlx").manifest
+    assert published_manifest is not None
+    assert published_manifest.schema_version == 2
+    assert published_manifest.directories == declared_directories
+    collect = published_manifest.collect
+    assert collect["expected_directories"] == declared_directories
+    assert collect["source_order"] == [source[0] for source in expected_sources]
+    assert tuple(
+        (
+            source["path"],
+            source["pattern"],
+            source["pattern_index"],
+            source["order"],
+        )
+        for source in collect["sources"]
+    ) == expected_sources
+
+
+def test_collect_fault_after_data_replace_recovers_manifest_next_run(
+    tmp_path,
+    monkeypatch,
+):
+    config_path, work = _prepare_task6_full_dedup_case(
+        tmp_path,
+        (("recover", "complete_multi.mlab"),),
+    )
+    output = work / "MD_data.extxyz"
+    stage_manifest = manifest_path(work, "md")
+    journal_path = work / ".MD_data.extxyz.collect-journal.yaml"
+    baseline_manifest_bytes = stage_manifest.read_bytes()
+    baseline_manifest_sha256 = atomic_io.sha256_file(stage_manifest)
+    output_destination = output.resolve(strict=False)
+    manifest_destination = stage_manifest.resolve(strict=False)
+    real_replace = collect_publish_module.os.replace
+    events = []
+
+    def interrupting_replace(source, destination, *args, **kwargs):
+        resolved_destination = Path(destination).resolve(strict=False)
+        if resolved_destination == output_destination:
+            result = real_replace(source, destination, *args, **kwargs)
+            events.append("data-replaced")
+            return result
+        if resolved_destination == manifest_destination:
+            assert events == ["data-replaced"]
+            events.append("manifest-fault")
+            raise OSError("synthetic Task 6 fault after data replace")
+        return real_replace(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            collect_publish_module.os,
+            "replace",
+            interrupting_replace,
+        )
+        interrupted = run_collect(
+            config_path,
+            stage="md",
+            collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        )
+
+    assert interrupted.status is models.CollectStatus.FATAL
+    assert interrupted.publication_committed is False
+    assert interrupted.candidate is not None
+    assert interrupted.accepted_frame_count == 2
+    assert interrupted.source_count == interrupted.sources_complete == 1
+    assert interrupted.source_results[0].source_path == "md/recover/ML_ABN"
+    assert "synthetic Task 6 fault after data replace" in (
+        interrupted.fatal_diagnostic
+    )
+    assert events == ["data-replaced", "manifest-fault"]
+
+    journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+    data_candidate = work / Path(journal["data_candidate_path"])
+    manifest_candidate = work / Path(journal["manifest_candidate_path"])
+    assert journal["state"] == "pending"
+    assert journal["stage"] == "md"
+    assert journal["final_output"] == "MD_data.extxyz"
+    assert journal["result_manifest_target_kind"] == "current-stage"
+    assert journal["result_manifest_path"] == "md/manifest.yaml"
+    assert journal["previous_output_sha256"] is None
+    assert journal["previous_manifest_sha256"] == baseline_manifest_sha256
+    assert journal["backup_path"] is None
+    assert journal["backup_sha256"] is None
+    assert output.is_file()
+    assert atomic_io.sha256_file(output) == journal["data_candidate_sha256"]
+    assert not data_candidate.exists()
+    assert manifest_candidate.is_file()
+    assert (
+        atomic_io.sha256_file(manifest_candidate)
+        == journal["manifest_candidate_sha256"]
+    )
+    assert stage_manifest.read_bytes() == baseline_manifest_bytes
+    interrupted_output_bytes = output.read_bytes()
+
+    source_calls = []
+
+    def unexpected_full_dedup_build(*args, **kwargs):
+        source_calls.append((args, kwargs))
+        raise AssertionError(
+            "new source collection started after a recoverable transaction"
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            collect_module,
+            "build_full_dedup_candidate",
+            unexpected_full_dedup_build,
+        )
+        recovered = run_collect(
+            config_path,
+            stage="md",
+            collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+        )
+
+    recovered_evidence = recovered.recovered_evidence
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert recovered.status is models.CollectStatus.COMPLETE
+    assert recovered.publication_committed is True
+    assert recovered.candidate is None
+    assert isinstance(recovered_evidence, models.RecoveredCollectionEvidence)
+    assert recovered_evidence.transaction_id == journal["transaction_id"]
+    assert recovered.accepted_frame_count == collect["frames"] == 2
+    assert recovered.source_count == recovered.sources_complete == 1
+    assert recovered.sources_partial == 0
+    assert recovered.sources_skipped == 0
+    assert recovered.sources_failed == 0
+    assert source_calls == []
+    assert collect["transaction_id"] == journal["transaction_id"]
+    assert collect["status"] == "complete"
+    assert collect["collection_mode"] == "full-dedup"
+    assert collect["output_sha256"] == journal["data_candidate_sha256"]
+    assert atomic_io.sha256_file(stage_manifest) == journal[
+        "manifest_candidate_sha256"
+    ]
+    assert output.read_bytes() == interrupted_output_bytes
+    assert not journal_path.exists()
+    assert not data_candidate.exists()
+    assert not manifest_candidate.exists()
+
+
+def test_committed_journal_residual_is_cleaned_next_run(tmp_path, monkeypatch):
+    config_path = write_collect_config(
+        tmp_path,
+        vasp_ml=False,
+        outcar_collect_freq=2,
+    )
+    work = tmp_path / "work"
+    source_directory = work / "md" / "run-a"
+    source_directory.mkdir(parents=True)
+    source = source_directory / "OUTCAR"
+    shutil.copy2(TASK6_OUTCAR_FIXTURE, source)
+    write_manifest(
+        work,
+        Manifest(
+            stage="md",
+            generated_at="task6-committed-residual",
+            directories=["md/run-a"],
+        ),
+    )
+    output = work / "MD_data.extxyz"
+    stage_manifest = manifest_path(work, "md")
+    journal_path = work / ".MD_data.extxyz.collect-journal.yaml"
+    resolved_journal = journal_path.resolve(strict=False)
+    real_unlink = Path.unlink
+
+    def interrupting_unlink(path, *args, **kwargs):
+        candidate = Path(path)
+        if (
+            candidate.resolve(strict=False) == resolved_journal
+            and candidate.exists()
+        ):
+            record = yaml.safe_load(candidate.read_text(encoding="utf-8"))
+            if record["state"] == "committed":
+                raise OSError(
+                    "synthetic Task 6 interruption before committed journal unlink"
+                )
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "unlink", interrupting_unlink)
+        interrupted = run_collect(config_path, stage="md")
+
+    assert interrupted.status is models.CollectStatus.FATAL
+    assert interrupted.publication_committed is False
+    assert interrupted.candidate is not None
+    assert interrupted.accepted_frame_count == 1
+    assert interrupted.source_count == interrupted.sources_complete == 1
+    assert "synthetic Task 6 interruption before committed journal unlink" in (
+        interrupted.fatal_diagnostic
+    )
+
+    committed_journal = yaml.safe_load(journal_path.read_text(encoding="utf-8"))
+    first_manifest = read_manifest(work, "md").manifest
+    assert first_manifest is not None
+    first_collect = first_manifest.collect
+    first_output_bytes = output.read_bytes()
+    first_output_sha256 = atomic_io.sha256_file(output)
+    first_manifest_sha256 = atomic_io.sha256_file(stage_manifest)
+    first_transaction_id = committed_journal["transaction_id"]
+    assert committed_journal["state"] == "committed"
+    assert committed_journal["data_candidate_sha256"] == first_output_sha256
+    assert committed_journal["manifest_candidate_sha256"] == first_manifest_sha256
+    assert committed_journal["previous_output_sha256"] is None
+    assert committed_journal["backup_path"] is None
+    assert first_collect["transaction_id"] == first_transaction_id
+    assert first_collect["status"] == "complete"
+    assert first_collect["frames"] == 1
+    assert first_collect["output_sha256"] == first_output_sha256
+    assert not (work / Path(committed_journal["data_candidate_path"])).exists()
+    assert not (work / Path(committed_journal["manifest_candidate_path"])).exists()
+
+    updated_config_path = write_collect_config(
+        tmp_path,
+        vasp_ml=False,
+        outcar_collect_freq=1,
+    )
+    assert updated_config_path == config_path
+    journal_state_at_collection = []
+    real_builder = collect_module.build_seed_aware_candidate
+
+    def observing_builder(*args, **kwargs):
+        journal_state_at_collection.append(journal_path.exists())
+        return real_builder(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            collect_module,
+            "build_seed_aware_candidate",
+            observing_builder,
+        )
+        result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    output_frames = ase_read(output, format="extxyz", index=":")
+    assert journal_state_at_collection == [False]
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.candidate is not None
+    assert result.recovered_evidence is None
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert result.source_count == result.sources_complete == 1
+    assert collect["transaction_id"] != first_transaction_id
+    assert collect["status"] == "complete"
+    assert collect["frames"] == 2
+    assert collect["source_order"] == ["md/run-a/OUTCAR"]
+    assert collect["output_sha256"] == atomic_io.sha256_file(output)
+    assert collect["output_sha256"] != first_output_sha256
+    assert collect["previous_sha256"] == first_output_sha256
+    assert collect["previous_manifest_sha256"] == first_manifest_sha256
+    assert collect["previous_frames"] == 1
+    assert collect["backup_sha256"] == first_output_sha256
+    backup = work / Path(collect["backup"])
+    assert backup.is_file()
+    assert backup.read_bytes() == first_output_bytes
+    assert not journal_path.exists()
+
+
+def test_load_ml_abn_sample_counts_frames():
     dataset = Dataset()
-    dataset.load_outcar(target, freq=1)
-    assert dataset.n_configs > 0
+    dataset.load_ml_ab(TASK6_MLAB_FIXTURES / "complete_multi.mlab")
+
+    assert dataset.n_configs == len(dataset.data) == 2
+
+
+def test_load_outcar_sample_counts_frames():
+    dataset = Dataset()
+    dataset.load_outcar(TASK6_OUTCAR_FIXTURE, freq=1)
+
+    assert dataset.n_configs == len(dataset.data) == 2
 
 
 def test_load_outcar_rejects_non_positive_frequency():
@@ -381,24 +1209,34 @@ def test_load_outcar_rejects_non_positive_frequency():
         Dataset().load_outcar(Path("whatever"), freq=0)
 
 
-def test_collect_ml_md_writes_extxyz_and_manifest_counts(tmp_path, sample_dir):
-    config_path = write_collect_config(tmp_path, stage=0, vasp_ml=True)
-    work = tmp_path / "work"
-    md_dir = work / "md" / "0_0"
-    md_dir.mkdir(parents=True)
-    shutil.copy2(sample_dir / "ML_ABN", md_dir / "ML_ABN")
-    write_manifest(
-        work,
-        Manifest(stage="md", generated_at="test", directories=["md/0_0"]),
+def test_collect_ml_md_writes_extxyz_and_manifest_counts(tmp_path):
+    config_path, work, md_directory, producer_manifest = (
+        _prepare_task6_seeded_stage1(tmp_path)
     )
+    _copy_task6_final_mlab(md_directory)
 
-    run_collect(config_path, stage="md")
+    result = run_collect(config_path, stage="md")
 
-    assert (work / "MD_data.extxyz").is_file()
-    manifest = read_manifest(work, "md")
-    assert manifest.schema_version == 2
-    assert manifest.collect["frames"] > 0
-    assert manifest.collect["output"] == "MD_data.extxyz"
+    output = work / "MD_data.extxyz"
+    output_frames = ase_read(output, format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert output.is_file()
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 1
+    assert result.source_count == result.sources_complete == 1
+    assert result.sources_partial == 0
+    assert result.sources_skipped == 0
+    assert result.sources_failed == 0
+    assert published_manifest.mlff_seed == producer_manifest.mlff_seed
+    collect = published_manifest.collect
+    assert collect["frames"] == 1
+    assert collect["output"] == "MD_data.extxyz"
+    assert collect["sources_attempted"] == collect["sources_complete"] == 1
+    assert collect["sources_partial"] == 0
+    assert collect["sources_skipped"] == 0
+    assert collect["sources_failed"] == 0
 
 
 def test_collect_ml_md_records_missing_ml_abn_without_crashing(tmp_path):
@@ -431,49 +1269,61 @@ def test_collect_ml_md_records_missing_ml_abn_without_crashing(tmp_path):
     assert any("ML_ABN" in record["reason"] for record in records)
 
 
-def test_collect_ml_md_skips_existing_ml_ab_prefix(tmp_path, sample_dir):
-    config_path = write_collect_config(tmp_path, vasp_ml=True)
-    work = tmp_path / "work"
-    md_dir = work / "md" / "0_0"
-    md_dir.mkdir(parents=True)
-    shutil.copy2(sample_dir / "ML_ABN", md_dir / "ML_ABN")
-    shutil.copy2(sample_dir / "ML_ABN", md_dir / "ML_AB")
-    write_manifest(
-        work,
-        Manifest(stage="md", generated_at="test", directories=["md/0_0"]),
+def test_collect_ml_md_uses_immutable_manifest_seed_after_ml_ab_growth(tmp_path):
+    config_path, work, md_directory, producer_manifest = (
+        _prepare_task6_seeded_stage1(tmp_path)
     )
+    current_ml_ab = md_directory / "ML_AB"
+    shutil.copy2(TASK6_MLAB_FIXTURES / "complete_multi.mlab", current_ml_ab)
+    _copy_task6_final_mlab(md_directory)
+    current_ml_ab_bytes = current_ml_ab.read_bytes()
 
-    run_collect(config_path, stage="md")
+    result = run_collect(config_path, stage="md")
 
-    manifest = read_manifest(work, "md")
-    assert manifest.collect["frames"] == 0
-    assert manifest.collect["sources"] == 1
-
-
-def test_collect_ml_md_skips_source_when_ml_ab_count_fails(tmp_path, sample_dir):
-    config_path = write_collect_config(tmp_path, vasp_ml=True)
-    work = tmp_path / "work"
-    md_dir = work / "md" / "0_0"
-    md_dir.mkdir(parents=True)
-    shutil.copy2(sample_dir / "ML_ABN", md_dir / "ML_ABN")
-    (md_dir / "ML_AB").write_text("not\nan\nML_AB\nfile\nbad-count\n", encoding="utf-8")
-    write_manifest(
-        work,
-        Manifest(stage="md", generated_at="test", directories=["md/0_0"]),
+    source = result.source_results[0]
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 1
+    assert source.status is models.SourceStatus.COMPLETE
+    assert source.complete_count == 2
+    assert source.accepted_count == 1
+    assert source.seed_identity is not None
+    assert (
+        source.seed_identity.sha256
+        == producer_manifest.mlff_seed["seed_prefix_sha256"]
     )
+    assert published_manifest.collect["frames"] == 1
+    assert current_ml_ab.read_bytes() == current_ml_ab_bytes
 
-    run_collect(config_path, stage="md")
 
-    manifest = read_manifest(work, "md")
-    assert not (work / "MD_data.extxyz").exists()
-    assert manifest.collect["frames"] == 0
-    assert manifest.collect["sources"] == 0
-    assert manifest.collect["written"] is False
-    assert any(
-        record["path"] == "md/0_0/ML_AB"
-        and "Could not read ML_AB count" in record["reason"]
-        for record in manifest.failed
+def test_collect_ml_md_ignores_unparseable_current_ml_ab(tmp_path):
+    config_path, work, md_directory, _ = _prepare_task6_seeded_stage1(tmp_path)
+    _copy_task6_final_mlab(md_directory)
+    current_ml_ab = md_directory / "ML_AB"
+    current_ml_ab.write_text(
+        "not\nan\nML_AB\nfile\nbad-count\n",
+        encoding="utf-8",
     )
+    current_ml_ab_bytes = current_ml_ab.read_bytes()
+
+    result = run_collect(config_path, stage="md")
+
+    source = result.source_results[0]
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.publication_committed is True
+    assert result.accepted_frame_count == len(output_frames) == 1
+    assert result.sources_failed == 0
+    assert source.source_path == "md/0_0/ML_ABN"
+    assert source.status is models.SourceStatus.COMPLETE
+    assert published_manifest.collect["sources_failed"] == 0
+    assert published_manifest.collect["sources"] == [source.as_diagnostic()]
+    assert current_ml_ab.read_bytes() == current_ml_ab_bytes
 
 
 def _no_data_publication_api():
