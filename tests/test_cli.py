@@ -940,6 +940,65 @@ def test_wheel_contains_no_potcar_or_private_sample_paths(_fg2_wheel_path):
     assert forbidden_members == []
 
 
+def test_distributed_example_contents_exclude_private_cluster_identifiers(
+    _fg2_wheel_path,
+):
+    repo_root = Path(__file__).resolve().parents[1]
+    rules = (
+        ("gpfs-root", re.compile(r"/gpfs/", re.IGNORECASE)),
+        (
+            "unix-user-home",
+            re.compile(r"/(?:gpfs/)?home/[A-Za-z0-9._-]+/", re.IGNORECASE),
+        ),
+        (
+            "windows-users-profile",
+            re.compile(
+                r"[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+[\\/]",
+                re.IGNORECASE,
+            ),
+        ),
+        (
+            "numeric-slurm-afterok",
+            re.compile(r"^\s*#{1,2}SBATCH\b[^\r\n]*\bafterok:\d+\b", re.MULTILINE),
+        ),
+    )
+    findings = []
+
+    def audit_text(surface, relative_path, text):
+        for rule_name, pattern in rules:
+            if pattern.search(text):
+                findings.append((surface, relative_path, rule_name))
+
+    for surface, root in (
+        ("root", repo_root / "example"),
+        ("bundled", repo_root / "src" / "dpmoire_lite" / "example"),
+    ):
+        for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+            audit_text(
+                surface,
+                path.relative_to(root).as_posix(),
+                path.read_text(encoding="utf-8"),
+            )
+
+    prefix = PurePosixPath("dpmoire_lite/example")
+    with zipfile.ZipFile(_fg2_wheel_path) as wheel:
+        for member in sorted(wheel.infolist(), key=lambda item: item.filename):
+            if member.is_dir():
+                continue
+            member_path = PurePosixPath(member.filename)
+            try:
+                relative_path = member_path.relative_to(prefix)
+            except ValueError:
+                continue
+            audit_text(
+                "wheel",
+                relative_path.as_posix(),
+                wheel.read(member).decode("utf-8"),
+            )
+
+    assert findings == [], "private cluster identifiers: " + repr(findings)
+
+
 def test_user_facing_automation_docs_remain_fail_closed():
     repo_root = Path(__file__).resolve().parents[1]
     config_paths = (
