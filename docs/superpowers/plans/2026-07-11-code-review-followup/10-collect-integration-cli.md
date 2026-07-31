@@ -8,6 +8,11 @@ Authoritative specs:
 - [Approved full-dedup design](../../specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
 - [Testing and tooling scope](../../../code-review-notes/testing-and-tooling-scope.md)
 
+Post-completion correction:
+[VASP seed-prefix equivalence tickets](../2026-07-31-vasp-seed-prefix-equivalence/README.md).
+Ticket 05 owns structured verification publication and the real VASP rewrite
+regression without changing CLI options or exit-code meanings.
+
 Consumes:
 
 - [Plan 06 MD normalization and seed staging](06-md-normalization-seed-staging.md)

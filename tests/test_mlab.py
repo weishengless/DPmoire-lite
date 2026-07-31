@@ -39,6 +39,26 @@ FIXTURE_NAMES = (
     "format_variant_b.mlab",
     "complete_vasp_641.mlab",
     "complete_vasp_651.mlab",
+    "seed_input_vasp_641.mlab",
+    "seed_rewrite_vasp_641.mlab",
+    "seed_input_vasp_651.mlab",
+    "seed_rewrite_vasp_651.mlab",
+    "seed_rewrite_postseed_vasp_651.mlab",
+)
+
+SEED_REWRITE_PAIRS = (
+    (
+        "seed_input_vasp_641.mlab",
+        "seed_rewrite_vasp_641.mlab",
+        8.673617379884036e-19,
+        6.938893903907228e-18,
+    ),
+    (
+        "seed_input_vasp_651.mlab",
+        "seed_rewrite_vasp_651.mlab",
+        1.012523398458143e-13,
+        1.3877787807814457e-17,
+    ),
 )
 
 
@@ -84,6 +104,112 @@ def test_mlab_fixtures_contain_no_private_path_or_potcar_marker():
         payload = path.read_text(encoding="utf-8")
         for marker in forbidden_markers:
             assert marker not in payload, f"{marker!r} found in {path.name}"
+
+
+def _require_fixture(name: str) -> Path:
+    path = FIXTURE_ROOT / name
+    assert path.is_file(), f"missing portable ML_AB fixture: {name}"
+    return path
+
+
+def _flatten_numeric(value):
+    if isinstance(value, tuple):
+        for item in value:
+            yield from _flatten_numeric(item)
+        return
+    yield float(value)
+
+
+def _max_field_delta(reference, rewritten, field: str) -> tuple[float, float]:
+    expected = tuple(_flatten_numeric(getattr(reference, field)))
+    actual = tuple(_flatten_numeric(getattr(rewritten, field)))
+    assert len(expected) == len(actual)
+    absolute = tuple(abs(left - right) for left, right in zip(expected, actual, strict=True))
+    scaled = tuple(
+        delta / max(1.0, abs(left), abs(right))
+        for left, right, delta in zip(expected, actual, absolute, strict=True)
+    )
+    return max(absolute, default=0.0), max(scaled, default=0.0)
+
+
+def test_seed_rewrite_fixture_inventory_records_paired_provenance():
+    text = INVENTORY.read_text(encoding="utf-8")
+
+    for name in FIXTURE_NAMES[-5:]:
+        assert f"`{name}`" in text
+    assert "Paired provenance:" in text
+    assert "Constructed transformation:" in text
+    assert "VASP 6.4.1" in text
+    assert "VASP 6.5.1" in text
+
+
+def test_seed_rewrite_fixtures_parse_complete_canonical_fields():
+    expected_counts = {
+        "seed_input_vasp_641.mlab": 1,
+        "seed_rewrite_vasp_641.mlab": 1,
+        "seed_input_vasp_651.mlab": 1,
+        "seed_rewrite_vasp_651.mlab": 1,
+        "seed_rewrite_postseed_vasp_651.mlab": 2,
+    }
+
+    for name, expected_count in expected_counts.items():
+        parsed = parse_mlab(_require_fixture(name))
+        assert parsed.status == "complete"
+        assert parsed.declared_count == parsed.complete_count == expected_count
+
+
+def test_seed_rewrite_pairs_have_exact_structure_and_bounded_numeric_deltas():
+    for input_name, output_name, position_delta, force_delta in SEED_REWRITE_PAIRS:
+        reference = parse_mlab(_require_fixture(input_name)).configurations[0]
+        rewritten = parse_mlab(_require_fixture(output_name)).configurations[0]
+
+        assert reference.elements == rewritten.elements
+        assert reference.counts == rewritten.counts
+        assert reference.n_atoms == rewritten.n_atoms
+        assert _config_identity(reference) != _config_identity(rewritten)
+
+        deltas = {
+            field: _max_field_delta(reference, rewritten, field)
+            for field in ("lattice", "positions", "energy", "forces", "stress_kbar")
+        }
+        assert deltas["positions"][0] == pytest.approx(position_delta, rel=0.0, abs=1e-28)
+        assert deltas["forces"][0] == pytest.approx(force_delta, rel=0.0, abs=1e-28)
+        assert deltas["lattice"] == (0.0, 0.0)
+        assert deltas["energy"] == (0.0, 0.0)
+        assert deltas["stress_kbar"] == (0.0, 0.0)
+        assert max(scaled for _, scaled in deltas.values()) < 1e-12
+
+
+def test_seed_rewrite_postseed_fixture_contains_one_distinct_new_configuration():
+    rewritten = parse_mlab(
+        _require_fixture("seed_rewrite_vasp_651.mlab")
+    ).configurations[0]
+    final = parse_mlab(_require_fixture("seed_rewrite_postseed_vasp_651.mlab"))
+
+    assert final.complete_count == 2
+    assert _config_identity(final.configurations[0]) == _config_identity(rewritten)
+    assert _config_identity(final.configurations[1]) != _config_identity(rewritten)
+
+
+def test_seed_rewrite_fixtures_contain_no_private_or_potcar_markers():
+    forbidden_markers = (
+        "POTCAR",
+        "potpaw",
+        "WAVECAR",
+        "CHGCAR",
+        "C:\\Users\\",
+        "E:\\",
+        "/home/",
+        "SBATCH",
+        "SLURM",
+        "hostname",
+        "account",
+        "partition",
+    )
+
+    for name in FIXTURE_NAMES[-5:]:
+        payload = _require_fixture(name).read_text(encoding="utf-8")
+        assert all(marker not in payload for marker in forbidden_markers)
 
 
 def _write_variant(tmp_path: Path, source_name: str, old: str, new: str) -> Path:

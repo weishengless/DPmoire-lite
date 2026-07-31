@@ -262,6 +262,16 @@ For `vasp_ml: true` MD, the default `seed-aware` mode validates the immutable
 Stage1 seed provenance and never derives it from the current `md/ML_AB`. Older
 restart trees can explicitly request:
 
+The exact fast path preserves `mlab-seed-v1`. When VASP rewrites the trusted
+seed prefix with numerically insignificant differences, the versioned fallback
+requires identical elements, counts, atom order, and configuration order, then
+checks every numeric component with
+`abs(a-b) <= 1e-12 * max(1, abs(a), abs(b))`. Manifest v2 fallback reads only a
+path-contained, raw-hash-verified reference; legacy fallback reads only complete
+`init_mlff/ML_ABN` evidence and emits its compatibility warning. VASP-equivalent
+verification is accepted as complete coverage and removes exactly the recorded
+seed count once.
+
 ```bash
 DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
 ```
@@ -275,6 +285,13 @@ Current Manifest v2 is authoritative. Legacy or missing-manifest compatibility
 collection writes `MD_data.collect.yaml` without fabricating or rewriting build
 provenance. Missing-manifest scanning is full-dedup-only and is at best
 `degraded` when it produces frames because expected-source coverage is unknown.
+
+For nonzero seed-aware publication, `collect.dedup.seed_verification` reports
+aggregate `exact`, `vasp_equivalent`, and `mismatch` counts. Each verified source
+has a bounded `collect.sources[].seed_verification` record containing identities,
+reference trust, maximum absolute/scaled deltas, and an optional first mismatch.
+Complete seed configurations are never serialized. Exact `mlab-seed-v1`, exact
+`mlab-config-v1`, and explicit full-dedup remain independent and unchanged.
 
 For relaxation and `vasp_ml: false` MD, DPmoire-lite reads OUTCAR series. The
 default OUTCAR patterns are:

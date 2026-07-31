@@ -7,6 +7,11 @@ Authoritative specs:
 - [P2-5 OUTCAR streaming](../../../code-review-notes/P2-5-outcar-streaming.md)
 - [P2-6 source-status mapping](../../../code-review-notes/P2-6-collect-exit-codes.md)
 
+Post-completion correction:
+[VASP seed-prefix equivalence tickets](../2026-07-31-vasp-seed-prefix-equivalence/README.md).
+Ticket 04 owns the bounded seed-aware source integration; this plan's exact
+source-local commit and status contracts remain authoritative.
+
 Consumes:
 
 - [Plan 02 Manifest v2](02-manifest-v2.md)

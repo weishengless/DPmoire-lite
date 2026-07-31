@@ -88,6 +88,39 @@ Every entry records the required provenance and expected parser boundary.
 - **Redistribution confirmation:** the committed file is a newly written minimal scientific block; it contains no POTCAR or licensed potential content.
 - **Expected parser behavior:** complete; one accepted configuration.
 
+## `seed_input_vasp_641.mlab` and `seed_rewrite_vasp_641.mlab`
+
+- **Source type:** paired, synthetic one-atom ML_AB-style sources representing an initial seed and the prefix rewritten by VASP 6.4.1.
+- **Paired provenance:** the associated ignored OUTCAR identifies VASP 6.4.1; the ignored input/output pair contained 78/110 configurations and preserved structure and ordering across the 78-configuration prefix.
+- **Constructed transformation:** the committed pair was newly written from the existing portable carbon fixture, with only one position scalar and one force scalar changed by the measured pair maxima (`8.673617379884036e-19` angstrom and `6.938893903907228e-18` eV/angstrom). It is not a copied raw configuration.
+- **Reason for cropping:** retain the smallest redistributable pair that proves a VASP seed rewrite can change canonical numeric content without changing structure or order.
+- **Retained blocks:** portable header plus one complete lattice, position, energy, force, and stress record in each file.
+- **Removed private data:** raw structures, paths, users, hosts, jobs, accounts, cluster details, unrelated output, and all potential data were excluded.
+- **Redistribution confirmation:** all scientific values except the two measured delta magnitudes are synthetic; neither file contains potential content or calculation identifiers.
+- **Expected parser behavior:** both files are complete with one configuration; canonical identities differ, while structure and ordering match exactly.
+
+## `seed_input_vasp_651.mlab` and `seed_rewrite_vasp_651.mlab`
+
+- **Source type:** paired, synthetic two-atom ML_AB-style sources representing an initial seed and the prefix rewritten by VASP 6.5.1.
+- **Paired provenance:** the associated ignored OUTCAR identifies VASP 6.5.1; the ignored input/output pair contained 63/294 configurations and preserved structure and ordering across the 63-configuration prefix.
+- **Constructed transformation:** the committed pair was newly written from the existing portable O/Pt fixture, with only one position scalar and one force scalar changed by the measured pair maxima (`1.012523398458143e-13` angstrom and `1.3877787807814457e-17` eV/angstrom). It is not a copied raw configuration.
+- **Reason for cropping:** retain the smallest redistributable pair that proves the observed 6.5.1 seed rewrite while preserving an independently checkable scientific boundary.
+- **Retained blocks:** portable two-type header plus one complete lattice, position, energy, force, and stress record in each file.
+- **Removed private data:** raw structures, paths, users, hosts, jobs, accounts, cluster details, unrelated output, and all potential data were excluded.
+- **Redistribution confirmation:** all scientific values except the two measured delta magnitudes are synthetic; neither file contains potential content or calculation identifiers.
+- **Expected parser behavior:** both files are complete with one configuration; canonical identities differ, while structure and ordering match exactly.
+
+## `seed_rewrite_postseed_vasp_651.mlab`
+
+- **Source type:** constructed synthetic ML_ABN-style source containing the 6.5.1 rewrite fixture followed by one new configuration.
+- **Paired provenance:** its first configuration is canonically identical to `seed_rewrite_vasp_651.mlab`; the VASP-version label inherits only that pair's ignored OUTCAR evidence.
+- **Constructed transformation:** the first configuration is the sanitized rewrite member above, and the second is a distinct fully synthetic O/Pt configuration created for later collection-boundary tests.
+- **Reason for cropping:** model the smallest final ML_ABN containing a rewritten seed prefix and one publishable post-seed configuration.
+- **Retained blocks:** portable two-type header plus two complete lattice, position, energy, force, and stress records.
+- **Removed private data:** no raw post-seed calculation was copied; paths, users, hosts, jobs, accounts, cluster details, unrelated output, and all potential data are absent.
+- **Redistribution confirmation:** the source is constructed and redistributable, with no licensed potential content.
+- **Expected parser behavior:** complete; two accepted configurations, with the first equal to the rewrite fixture and the second canonically distinct.
+
 The VASP version labels are provenance labels from the associated local OUTCAR
 evidence, not executable-version claims encoded in the ML_ABN header. The raw
 evidence remains ignored and is never a test dependency.

@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-import warnings
 
 from ase.io import ParseError
 import yaml
@@ -45,7 +44,12 @@ from .mlff_collect import (
     build_mlff_source_inventory,
     fold_exact_configurations,
 )
-from .mlab import MlabParseError, parse_mlab, seed_prefix_identity
+from .mlab import MlabParseError, parse_mlab
+from .mlff_seed import (
+    SEED_PREFIX_EQUIVALENCE_SCHEMA,
+    SeedPrefixVerification,
+    SeedPrefixVerifier,
+)
 from .outcar import (
     OutcarSelection,
     _find_outcar_tail_evidence,
@@ -788,7 +792,7 @@ def _no_data_dedup_evidence(
         for source_result in candidate.source_results
     ]
     seen = sum(source["seen"] for source in per_source)
-    return {
+    evidence = {
         "applied": False,
         "schema": None,
         "seen": seen,
@@ -796,6 +800,37 @@ def _no_data_dedup_evidence(
         "duplicates_removed": 0,
         "candidate_frame_count": candidate.frame_count,
         "per_source": per_source,
+    }
+    seed_verification = _seed_verification_counts(candidate)
+    if seed_verification is not None:
+        evidence["seed_verification"] = seed_verification
+    return evidence
+
+
+def _seed_verification_counts(
+    candidate: CollectionCandidate,
+) -> dict[str, object] | None:
+    counts = {"exact": 0, "vasp_equivalent": 0, "mismatch": 0}
+    observed = False
+    for source_result in candidate.source_results:
+        verification = source_result.seed_verification
+        if verification is None:
+            continue
+        if verification.schema != SEED_PREFIX_EQUIVALENCE_SCHEMA:
+            raise ValueError(
+                "source seed verification schema does not match the supported schema"
+            )
+        if verification.outcome not in counts:
+            raise ValueError(
+                f"unknown seed verification outcome: {verification.outcome!r}"
+            )
+        counts[verification.outcome] += 1
+        observed = True
+    if not observed:
+        return None
+    return {
+        "schema": SEED_PREFIX_EQUIVALENCE_SCHEMA,
+        **counts,
     }
 
 
@@ -1329,13 +1364,20 @@ def collect_current_mlab_source(
     work_dir: Path,
     source_path: Path,
     manifest: Manifest,
+    verifier: SeedPrefixVerifier | None = None,
 ) -> SourceResult:
-    seed_count, expected_digest = _current_seed_evidence(manifest)
-    return _collect_mlab_seed_prefix(
+    _current_seed_evidence(manifest)
+    if verifier is None:
+        verifier = SeedPrefixVerifier.from_current_manifest(
+            work_dir=work_dir,
+            evidence=manifest.mlff_seed,
+        )
+    elif not isinstance(verifier, SeedPrefixVerifier):
+        raise TypeError("verifier must be a SeedPrefixVerifier or None")
+    return _collect_verified_mlab_seed_prefix(
         work_dir=work_dir,
         source_path=source_path,
-        seed_count=seed_count,
-        expected_digest=expected_digest,
+        verifier=verifier,
     )
 
 
@@ -1344,56 +1386,17 @@ def collect_legacy_mlab_source(
     work_dir: Path,
     source_path: Path,
     manifest: ManifestReadResult,
+    verifier: SeedPrefixVerifier | None = None,
 ) -> SourceResult:
     _validate_legacy_manifest_result(manifest)
-
-    source_path = Path(source_path)
-    relative_source_path = relative_to_workdir(work_dir, source_path)
-    seed_path = Path(work_dir) / "init_mlff" / "ML_ABN"
-    if not seed_path.is_file():
-        return _legacy_seed_failure(
-            relative_source_path,
-            "legacy seed evidence missing: init_mlff/ML_ABN",
-        )
-
-    try:
-        parsed_seed = parse_mlab(seed_path)
-    except MlabParseError as error:
-        details = [error.reason]
-        if error.configuration_number is not None:
-            details.append(f"configuration {error.configuration_number}")
-        if error.block:
-            details.append(f"block {error.block}")
-        if error.line_number is not None:
-            details.append(f"line {error.line_number}")
-        return _legacy_seed_failure(
-            relative_source_path,
-            "legacy seed evidence at init_mlff/ML_ABN is invalid: "
-            + ", ".join(details),
-        )
-
-    if parsed_seed.status == "partial":
-        reason = parsed_seed.discarded_reason or "parser returned partial evidence"
-        return _legacy_seed_failure(
-            relative_source_path,
-            "legacy seed evidence at init_mlff/ML_ABN must be complete: " + reason,
-        )
-    if parsed_seed.status != "complete":
-        raise ValueError(f"unknown ML_ABN parser status: {parsed_seed.status!r}")
-
-    seed_count = parsed_seed.complete_count
-    seed_identity = seed_prefix_identity(parsed_seed.configurations)
-    warnings.warn(
-        "Legacy seed evidence was rebuilt from init_mlff/ML_ABN using "
-        "mlab-seed-v1; the final prefix is being verified.",
-        UserWarning,
-        stacklevel=2,
-    )
-    return _collect_mlab_seed_prefix(
+    if verifier is None:
+        verifier = SeedPrefixVerifier.from_legacy_work_dir(work_dir=work_dir)
+    elif not isinstance(verifier, SeedPrefixVerifier):
+        raise TypeError("verifier must be a SeedPrefixVerifier or None")
+    return _collect_verified_mlab_seed_prefix(
         work_dir=work_dir,
         source_path=source_path,
-        seed_count=seed_count,
-        expected_digest=seed_identity.sha256,
+        verifier=verifier,
     )
 
 
@@ -1501,11 +1504,15 @@ def build_seed_aware_candidate(
         stage=stage,
     )
     is_mlab_mode = stage == "md" and config.vasp_ml
+    seed_verifier = None
+    current_manifest = None
     if is_mlab_mode and manifest.kind == "current":
         current_manifest = manifest.manifest
         if current_manifest is None:
             raise ValueError("current manifest result has no Manifest")
         _current_seed_evidence(current_manifest)
+    elif is_mlab_mode and manifest.kind == "legacy":
+        _validate_legacy_manifest_result(manifest)
 
     work_dir = Path(config.work_dir)
     source_results: list[SourceResult] = []
@@ -1539,19 +1546,29 @@ def build_seed_aware_candidate(
                 continue
 
             if manifest.kind == "current":
-                current_manifest = manifest.manifest
                 if current_manifest is None:
                     raise ValueError("current manifest result has no Manifest")
+                if seed_verifier is None:
+                    seed_verifier = SeedPrefixVerifier.from_current_manifest(
+                        work_dir=work_dir,
+                        evidence=current_manifest.mlff_seed,
+                    )
                 source_result = collect_current_mlab_source(
                     work_dir=work_dir,
                     source_path=source_path,
                     manifest=current_manifest,
+                    verifier=seed_verifier,
                 )
             else:
+                if seed_verifier is None:
+                    seed_verifier = SeedPrefixVerifier.from_legacy_work_dir(
+                        work_dir=work_dir,
+                    )
                 source_result = collect_legacy_mlab_source(
                     work_dir=work_dir,
                     source_path=source_path,
                     manifest=manifest,
+                    verifier=seed_verifier,
                 )
             source_results.append(source_result)
             _append_candidate_payload(source_result, accepted_frames)
@@ -1686,34 +1703,27 @@ def _validate_legacy_manifest_result(manifest: ManifestReadResult) -> None:
         raise ValueError("legacy collection requires a valid legacy ManifestReadResult")
 
 
-def _legacy_seed_failure(source_path: str, reason: str) -> SourceResult:
-    return SourceResult(
-        source_path=source_path,
-        source_kind=SourceKind.MLAB,
-        status=SourceStatus.FAILED,
-        complete_count=0,
-        reason=reason,
-    )
-
-
-def _collect_mlab_seed_prefix(
+def _collect_verified_mlab_seed_prefix(
     *,
     work_dir: Path,
     source_path: Path,
-    seed_count: int,
-    expected_digest: str,
+    verifier: SeedPrefixVerifier,
 ) -> SourceResult:
+    if not isinstance(verifier, SeedPrefixVerifier):
+        raise TypeError("verifier must be a SeedPrefixVerifier")
     raw_result = collect_mlab_source(work_dir=work_dir, source_path=source_path)
-
     if raw_result.status is SourceStatus.FAILED:
         return raw_result
 
-    if raw_result.complete_count < seed_count:
-        reason = (
-            "source is shorter than the initial seed: "
-            f"{raw_result.complete_count} complete configurations available, "
-            f"{seed_count} required"
+    verification = verifier.verify(raw_result.parsed_configurations)
+    if not isinstance(verification, SeedPrefixVerification):
+        raise TypeError("SeedPrefixVerifier.verify must return SeedPrefixVerification")
+    if verification.outcome == "mismatch":
+        short_prefix = (
+            verification.first_mismatch is not None
+            and verification.first_mismatch.reason == "short_prefix"
         )
+        reason = _seed_verification_failure_reason(verification)
         if raw_result.reason:
             reason = f"{reason}; {raw_result.reason}"
         return replace(
@@ -1722,34 +1732,53 @@ def _collect_mlab_seed_prefix(
             accepted_frames=(),
             parsed_configurations=(),
             reason=reason,
-            seed_identity=None,
+            seed_identity=(
+                None if short_prefix else verification.actual_exact_identity
+            ),
+            seed_verification=verification,
         )
-
-    actual_identity = seed_prefix_identity(
-        raw_result.parsed_configurations,
-        n_configurations=seed_count,
-    )
-    if actual_identity.sha256 != expected_digest:
-        reason = (
-            "seed prefix mismatch: "
-            f"expected {expected_digest}, actual {actual_identity.sha256}"
-        )
-        if raw_result.reason:
-            reason = f"{reason}; {raw_result.reason}"
-        return replace(
-            raw_result,
-            status=SourceStatus.FAILED,
-            accepted_frames=(),
-            parsed_configurations=(),
-            reason=reason,
-            seed_identity=actual_identity,
-        )
-
+    if verification.outcome not in {"exact", "vasp_equivalent"}:
+        raise ValueError(f"unknown seed verification outcome: {verification.outcome!r}")
+    seed_count = verification.configurations
+    if not isinstance(seed_count, int) or seed_count < 0:
+        raise ValueError("accepted seed verification requires a configuration count")
     return replace(
         raw_result,
         parsed_configurations=raw_result.parsed_configurations[seed_count:],
-        seed_identity=actual_identity,
+        seed_identity=verification.actual_exact_identity,
+        seed_verification=verification,
     )
+
+
+def _seed_verification_failure_reason(
+    verification: SeedPrefixVerification,
+) -> str:
+    mismatch = verification.first_mismatch
+    if mismatch is not None and mismatch.reason == "short_prefix":
+        return (
+            "source is shorter than the initial seed: "
+            f"{mismatch.actual} complete configurations available, "
+            f"{mismatch.expected} required"
+        )
+
+    expected = verification.expected_exact_identity
+    actual = verification.actual_exact_identity
+    if expected is not None and actual is not None:
+        reason = (
+            "seed prefix mismatch: "
+            f"expected {expected.sha256}, actual {actual.sha256}"
+        )
+    else:
+        reason = "seed prefix verification failed"
+    if verification.reference_failure is not None:
+        failure = verification.reference_failure
+        return (
+            f"{reason}; reference failure {failure.code} at {failure.source}: "
+            f"{failure.reason}"
+        )
+    if mismatch is not None:
+        return f"{reason}; {mismatch.reason} at {mismatch.field}"
+    return reason
 
 
 def _current_seed_evidence(manifest: Manifest) -> tuple[int, str]:

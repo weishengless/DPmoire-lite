@@ -3,6 +3,11 @@
 Authoritative spec:
 [P2-1 Partial collection and MLFF seed](../../../code-review-notes/P2-1-partial-collection-and-mlff-seed.md)
 
+Post-completion extension:
+[VASP seed-prefix equivalence tickets](../2026-07-31-vasp-seed-prefix-equivalence/README.md).
+This historical plan continues to own exact parsing and identity; the extension
+adds a separate verifier without changing `mlab-seed-v1` or `mlab-config-v1`.
+
 Depends on: Plan 00
 
 Unlocks: Plans 04, 06, 08, and 08A

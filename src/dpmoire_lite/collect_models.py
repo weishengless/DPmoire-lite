@@ -8,6 +8,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from ase import Atoms
 
 from .mlab import MlabConfiguration, MlabIdentity
+from .mlff_seed import SeedPrefixVerification
 
 
 class SourceKind(str, Enum):
@@ -162,6 +163,7 @@ class SourceResult:
     pattern_index: int | None = None
     order: int | None = None
     seed_identity: MlabIdentity | None = None
+    seed_verification: SeedPrefixVerification | None = None
 
     def __post_init__(self) -> None:
         _validate_relative_source_path(self.source_path)
@@ -245,6 +247,27 @@ class SourceResult:
             MlabIdentity,
         ):
             raise TypeError("seed_identity must be an MlabIdentity or None")
+        if self.seed_verification is not None and not isinstance(
+            self.seed_verification,
+            SeedPrefixVerification,
+        ):
+            raise TypeError(
+                "seed_verification must be a SeedPrefixVerification or None"
+            )
+        if (
+            self.seed_verification is not None
+            and self.source_kind is not SourceKind.MLAB
+        ):
+            raise ValueError("only MLAB sources can carry seed_verification")
+        if (
+            self.seed_verification is not None
+            and self.seed_identity is not None
+            and self.seed_verification.actual_exact_identity is not None
+            and self.seed_identity != self.seed_verification.actual_exact_identity
+        ):
+            raise ValueError(
+                "seed_identity must match seed_verification actual exact identity"
+            )
 
     @property
     def accepted_count(self) -> int:
@@ -276,6 +299,10 @@ class SourceResult:
                 "schema": self.seed_identity.schema,
                 "sha256": self.seed_identity.sha256,
             }
+        if self.seed_verification is not None:
+            diagnostic["seed_verification"] = (
+                self.seed_verification.as_diagnostic()
+            )
         return diagnostic
 
 

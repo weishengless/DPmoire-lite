@@ -367,7 +367,11 @@ TASK6_OUTCAR_FIXTURE = (
 )
 
 
-def _prepare_task6_seeded_stage1(root: Path):
+def _prepare_task6_seeded_stage1(
+    root: Path,
+    *,
+    seed_fixture: str = "complete_vasp_651.mlab",
+):
     config_path = prepare_stage1_case(
         root,
         stage0_overrides={"n_sectors": [1, 1]},
@@ -377,7 +381,7 @@ def _prepare_task6_seeded_stage1(root: Path):
     init_mlff = work / "init_mlff"
     init_mlff.mkdir(parents=True)
     shutil.copy2(
-        TASK6_MLAB_FIXTURES / "complete_vasp_651.mlab",
+        TASK6_MLAB_FIXTURES / seed_fixture,
         init_mlff / "ML_ABN",
     )
     (init_mlff / "ML_FFN").write_text(
@@ -392,6 +396,28 @@ def _prepare_task6_seeded_stage1(root: Path):
     assert manifest.directories == ["md/0_0"]
     assert manifest.mlff_seed["configurations"] == 1
     return config_path, work, work / "md" / "0_0", manifest
+
+
+def _prepare_ticket5_vasp_rewrite_case(root: Path):
+    config_path, work, md_directory, manifest = _prepare_task6_seeded_stage1(
+        root,
+        seed_fixture="seed_input_vasp_651.mlab",
+    )
+    shutil.copy2(
+        TASK6_MLAB_FIXTURES / "seed_rewrite_postseed_vasp_651.mlab",
+        md_directory / "ML_ABN",
+    )
+    return config_path, work, md_directory, manifest
+
+
+def _walk_manifest_values(value):
+    yield value
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_manifest_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _walk_manifest_values(item)
 
 
 def _copy_task6_final_mlab(directory: Path) -> Path:
@@ -462,6 +488,253 @@ def test_stage1_seed_manifest_is_accepted_by_md_collect(tmp_path):
     assert published_manifest.collect["status"] == "complete"
     assert published_manifest.collect["collection_mode"] == "seed-aware"
     assert published_manifest.collect["frames"] == 1
+    assert published_manifest.collect["dedup"]["seed_verification"] == {
+        "schema": "vasp-seed-prefix-equivalence-v1",
+        "exact": 1,
+        "vasp_equivalent": 0,
+        "mismatch": 0,
+    }
+    assert published_manifest.collect["sources"][0]["seed_verification"][
+        "status"
+    ] == "exact"
+
+
+def test_collect_manifest_records_seed_verification_counts_and_deltas(tmp_path):
+    config_path, work, _md_directory, _manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+
+    result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert result.status is models.CollectStatus.COMPLETE
+    assert collect["dedup"]["seed_verification"] == {
+        "schema": "vasp-seed-prefix-equivalence-v1",
+        "exact": 0,
+        "vasp_equivalent": 1,
+        "mismatch": 0,
+    }
+    verification = collect["sources"][0]["seed_verification"]
+    assert verification["status"] == "vasp_equivalent"
+    assert verification["configurations"] == 1
+    assert verification["max_deltas"]["positions"]["absolute"] == pytest.approx(
+        1.0125233984581428e-13
+    )
+    assert verification["max_deltas"]["forces"]["absolute"] == pytest.approx(
+        1.3877787807814457e-17
+    )
+
+
+def test_vasp_equivalent_source_publishes_complete_when_coverage_is_complete(
+    tmp_path,
+):
+    config_path, work, _md_directory, _manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+
+    result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.sources_complete == 1
+    assert result.sources_partial == 0
+    assert result.sources_skipped == 0
+    assert result.sources_failed == 0
+    assert result.coverage_declined is False
+    assert collect["status"] == "complete"
+    assert collect["sources"][0]["seed_verification"]["status"] == (
+        "vasp_equivalent"
+    )
+
+
+def test_vasp_equivalent_source_publishes_degraded_only_for_missing_coverage(
+    tmp_path,
+):
+    config_path, work, _md_directory, manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+    manifest.directories.append("md/missing")
+    write_manifest(work, manifest)
+
+    result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.accepted_frame_count == 1
+    assert result.sources_complete == 1
+    assert result.sources_partial == 0
+    assert result.sources_skipped == 1
+    assert result.sources_failed == 0
+    assert result.coverage_declined is False
+    assert collect["status"] == "degraded"
+    assert collect["dedup"]["seed_verification"] == {
+        "schema": "vasp-seed-prefix-equivalence-v1",
+        "exact": 0,
+        "vasp_equivalent": 1,
+        "mismatch": 0,
+    }
+    assert collect["sources"][0]["seed_verification"]["status"] == (
+        "vasp_equivalent"
+    )
+    assert collect["sources"][1]["status"] == "skipped"
+    assert "seed_verification" not in collect["sources"][1]
+
+
+def test_seed_verification_mismatch_publishes_source_failure_diagnostic(tmp_path):
+    config_path, work, _md_directory, manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+    mismatch_directory = work / "md" / "mismatch"
+    mismatch_directory.mkdir()
+    shutil.copy2(
+        TASK6_MLAB_FIXTURES / "complete_vasp_641.mlab",
+        mismatch_directory / "ML_ABN",
+    )
+    manifest.directories.append("md/mismatch")
+    write_manifest(work, manifest)
+
+    result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert result.status is models.CollectStatus.DEGRADED
+    assert result.accepted_frame_count == 1
+    assert result.sources_complete == 1
+    assert result.sources_failed == 1
+    assert collect["dedup"]["seed_verification"] == {
+        "schema": "vasp-seed-prefix-equivalence-v1",
+        "exact": 0,
+        "vasp_equivalent": 1,
+        "mismatch": 1,
+    }
+    failure = collect["sources"][1]
+    assert failure["path"] == "md/mismatch/ML_ABN"
+    assert failure["status"] == "failed"
+    assert failure["accepted_count"] == 0
+    assert failure["seed_verification"]["status"] == "mismatch"
+    assert failure["seed_verification"]["first_mismatch"] == {
+        "configuration_index": 0,
+        "field": "elements",
+        "component": [0],
+        "expected": "O",
+        "actual": "C",
+        "absolute": None,
+        "scaled": None,
+        "reason": "structural_mismatch",
+    }
+
+
+def test_no_data_and_previous_output_preservation_are_unchanged(tmp_path):
+    config_path, work, md_directory, _manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+    shutil.copy2(
+        TASK6_MLAB_FIXTURES / "complete_vasp_641.mlab",
+        md_directory / "ML_ABN",
+    )
+    output = work / "MD_data.extxyz"
+    previous_bytes = _write_previous_extxyz(output, frame_count=2)
+    previous_sha256 = atomic_io.sha256_file(output)
+
+    result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert result.status is models.CollectStatus.NO_DATA
+    assert result.accepted_frame_count == 0
+    assert result.sources_failed == 1
+    assert result.publication_committed is True
+    assert output.read_bytes() == previous_bytes
+    assert atomic_io.sha256_file(output) == previous_sha256
+    assert collect["status"] == "no_data"
+    assert collect["written"] is False
+    assert collect["preserved_previous_output"] is True
+    assert collect["output_sha256"] == previous_sha256
+    assert collect["backup"] is None
+    assert collect["sources"][0]["status"] == "failed"
+    assert collect["sources"][0]["seed_verification"]["status"] == "mismatch"
+    assert not (work / "backups").exists()
+
+
+def test_vasp_rewrite_regression_publishes_only_post_seed_frames(tmp_path):
+    config_path, work, md_directory, _manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+    parsed_final = parse_mlab(md_directory / "ML_ABN")
+
+    result = run_collect(config_path, stage="md")
+
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.accepted_frame_count == len(output_frames) == 1
+    assert result.source_results[0].complete_count == 2
+    assert result.source_results[0].accepted_count == 1
+    assert published_manifest.collect["frames"] == 1
+    np.testing.assert_allclose(
+        output_frames[0].get_positions(),
+        parsed_final.configurations[1].positions,
+        rtol=0.0,
+        atol=1e-14,
+    )
+    assert output_frames[0].get_potential_energy() == pytest.approx(
+        parsed_final.configurations[1].energy
+    )
+    assert output_frames[0].get_potential_energy() != pytest.approx(
+        parsed_final.configurations[0].energy
+    )
+
+
+def test_result_manifest_never_dumps_full_seed_configurations(tmp_path):
+    config_path, work, _md_directory, _manifest = (
+        _prepare_ticket5_vasp_rewrite_case(tmp_path)
+    )
+
+    result = run_collect(config_path, stage="md")
+
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    assert result.status is models.CollectStatus.COMPLETE
+    verification = published_manifest.collect["sources"][0]["seed_verification"]
+    assert set(verification) == {
+        "status",
+        "schema",
+        "configurations",
+        "expected_exact_sha256",
+        "actual_exact_sha256",
+        "reference",
+        "max_deltas",
+    }
+    assert set(verification["reference"]) == {
+        "source",
+        "raw_sha256",
+        "trust",
+    }
+    assert set(verification["max_deltas"]) == {
+        "lattice",
+        "positions",
+        "energy",
+        "forces",
+        "stress_kbar",
+    }
+    assert all(
+        set(delta) == {"absolute", "scaled"}
+        and all(isinstance(value, float) for value in delta.values())
+        for delta in verification["max_deltas"].values()
+    )
+    assert not any(
+        isinstance(value, (list, tuple))
+        for value in _walk_manifest_values(verification)
+    )
 
 
 def test_multiple_restart_mlab_collects_all_post_initial_seed_frames(tmp_path):
@@ -606,6 +879,55 @@ def _prepare_task6_full_dedup_case(
         ),
     )
     return config_path, work
+
+
+def test_full_dedup_output_and_dedup_counts_are_unchanged(tmp_path):
+    config_path, work = _prepare_task6_full_dedup_case(
+        tmp_path,
+        (
+            ("seed", "complete_vasp_651.mlab"),
+            ("restart", "complete_multi.mlab"),
+        ),
+    )
+
+    result = run_collect(
+        config_path,
+        stage="md",
+        collection_mode=models.MLFFCollectMode.FULL_DEDUP,
+    )
+
+    output_frames = ase_read(work / "MD_data.extxyz", format="extxyz", index=":")
+    published_manifest = read_manifest(work, "md").manifest
+    assert published_manifest is not None
+    collect = published_manifest.collect
+    assert result.status is models.CollectStatus.COMPLETE
+    assert result.accepted_frame_count == len(output_frames) == 2
+    assert [frame.get_potential_energy() for frame in output_frames] == pytest.approx(
+        [-1.25, -1.2]
+    )
+    assert collect["dedup"] == {
+        "applied": True,
+        "schema": "mlab-config-v1",
+        "seen": 3,
+        "unique": 2,
+        "duplicates_removed": 1,
+        "candidate_frame_count": 2,
+        "per_source": [
+            {
+                "source_path": "md/seed/ML_ABN",
+                "seen": 1,
+                "retained": 1,
+                "duplicates_removed": 0,
+            },
+            {
+                "source_path": "md/restart/ML_ABN",
+                "seen": 2,
+                "retained": 1,
+                "duplicates_removed": 1,
+            },
+        ],
+    }
+    assert all("seed_verification" not in source for source in collect["sources"])
 
 
 def test_full_dedup_fresh_restart_keeps_pre_restart_configurations(tmp_path):

@@ -25,6 +25,7 @@ from dpmoire_lite.collect_models import (
 )
 from dpmoire_lite.config import ConfigError, DEFAULT_OUTCAR_PATTERNS
 from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
+from dpmoire_lite.mlab import parse_mlab, seed_prefix_identity
 from dpmoire_lite.paths import manifest_path
 
 
@@ -650,6 +651,61 @@ def test_complete_degraded_no_data_fatal_end_to_end_exit_codes(
     )
 
     assert tuple(exit_codes) == (0, 2, 3, 1)
+
+
+def test_default_seed_aware_cli_collects_vasp_rewritten_prefix(tmp_path, capsys):
+    config_path = _write_collect_cli_config(
+        tmp_path,
+        stage="md",
+        vasp_ml=True,
+    )
+    work = tmp_path / "work"
+    fixtures = Path(__file__).parent / "data" / "mlab"
+    seed_path = work / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(fixtures / "seed_input_vasp_651.mlab", seed_path)
+    source_directory = work / "md" / "0_0"
+    source_directory.mkdir(parents=True)
+    shutil.copy2(
+        fixtures / "seed_rewrite_postseed_vasp_651.mlab",
+        source_directory / "ML_ABN",
+    )
+    parsed_seed = parse_mlab(seed_path)
+    write_manifest(
+        work,
+        Manifest(
+            stage="md",
+            generated_at="ticket5-cli-vasp-rewrite",
+            directories=["md/0_0"],
+            mlff_seed={
+                "source": "init_mlff/ML_ABN",
+                "configurations": 1,
+                "digest_schema": "mlab-seed-v1",
+                "seed_prefix_sha256": seed_prefix_identity(
+                    parsed_seed.configurations
+                ).sha256,
+                "ml_ab_sha256": hashlib.sha256(seed_path.read_bytes()).hexdigest(),
+                "ml_ff_sha256": hashlib.sha256(b"synthetic-ML_FF").hexdigest(),
+            },
+        ),
+    )
+
+    exit_code = main(["collect", str(config_path), "--stage", "md"])
+
+    captured = capsys.readouterr()
+    published = read_manifest(work, "md").manifest
+    assert published is not None
+    assert exit_code == 0
+    assert captured.out == ""
+    assert captured.err == (
+        "collect status=complete frames=1 sources=1 complete=1 partial=0 "
+        "skipped=0 failed=0 output=MD_data.extxyz\n"
+    )
+    assert (work / "MD_data.extxyz").is_file()
+    assert published.collect["collection_mode"] == "seed-aware"
+    assert published.collect["sources"][0]["seed_verification"]["status"] == (
+        "vasp_equivalent"
+    )
 
 
 def test_build_help_marks_wait_temporarily_disabled_for_submitted_workflows(capsys):

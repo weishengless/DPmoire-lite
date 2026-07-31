@@ -113,6 +113,7 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 对于 MD 数据：
 
 - `seed-aware` 是默认模式。对于 `vasp_ml: true`，它会验证 Stage1 中不可变的 seed provenance 并排除该前缀；绝不会从当前 `md/ML_AB` 推断前缀。
+- 精确 seed 匹配继续使用不变的 `mlab-seed-v1` identity。如果 VASP 只对可信 seed 前缀中的数值进行了重写，fallback 会要求结构和顺序完全一致，并逐分量使用固定、带版本的规则 `abs(a-b) <= 1e-12 * max(1, abs(a), abs(b))`。Manifest v2 reference 必须通过原始文件哈希验证；legacy 情况只能从完整的 `init_mlff/ML_ABN` 明确重建。通过批准的 VASP equivalence 本身仍为 `complete`；只有来源覆盖出现 missing、partial 或 failed 才会 `degraded`。
 - 显式 `--mlff-collect-mode full-dedup` 只适用于 MLFF MD。它读取每个可接受的最终 `ML_ABN`，对重复构型保留第一份精确副本（包括一份共享 seed），因此比 `seed-aware` 产生更多 I/O。
 - 对弛豫、validation 或非 ML MD 使用 `full-dedup` 会 fatal 并返回 1。
 - 如果 `vasp_ml: false`，DPmoire-lite 读取 OUTCAR，并使用 `outcar_collect_freq` 控制采样间隔。
@@ -120,6 +121,8 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 对于 validation 数据，会以频率 1 收集所有 OUTCAR ionic step。
 
 有效的当前 Manifest v2 始终具有最高权威。旧版或显式兼容的缺失 manifest MLFF 收集会写入 `MD_data.collect.yaml`，绝不会伪造或重写 build provenance。缺失 manifest 扫描只允许显式 `full-dedup`；即使扫描产生了帧，由于预期来源覆盖未知，状态至多为 `degraded`。
+
+结果 manifest 在 `collect.dedup.seed_verification` 记录 exact、VASP-equivalent 和 mismatch 聚合计数，并在 `collect.sources[].seed_verification` 记录每个来源的有界证据。diagnostic 只包含哈希、计数、reference trust、首个 mismatch 字段和最大 delta，绝不会包含完整 seed configuration。canonical `mlab-seed-v1`、`mlab-config-v1` 输出以及 full-dedup 行为保持不变。
 
 ## 配置项说明
 

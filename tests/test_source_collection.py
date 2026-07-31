@@ -481,6 +481,120 @@ def test_seed_prefix_match_skips_exact_initial_count(tmp_path):
     assert result.seed_identity == seed_prefix_identity(parsed.configurations[:1])
 
 
+def test_current_vasp_rewritten_prefix_collects_post_seed_frames(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(
+        tmp_path,
+        "seed_rewrite_postseed_vasp_651.mlab",
+    )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    parsed_seed = parse_mlab(seed_path)
+    parsed_final = parse_mlab(source_path)
+    manifest = _current_manifest_for_seed(parsed_seed.configurations)
+    manifest.mlff_seed["ml_ab_sha256"] = hashlib.sha256(
+        seed_path.read_bytes()
+    ).hexdigest()
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 2
+    assert result.accepted_count == 1
+    assert result.parsed_configurations == (parsed_final.configurations[1],)
+    assert result.seed_identity == seed_prefix_identity(
+        parsed_final.configurations,
+        n_configurations=1,
+    )
+    assert result.seed_verification.outcome == "vasp_equivalent"
+    assert result.seed_verification.reference.trust == "manifest-v2"
+
+
+def test_source_result_exposes_structured_seed_verification(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(
+        tmp_path,
+        "seed_rewrite_postseed_vasp_651.mlab",
+    )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    parsed_seed = parse_mlab(seed_path)
+    parsed_final = parse_mlab(source_path)
+    manifest = _current_manifest_for_seed(parsed_seed.configurations)
+    manifest.mlff_seed["ml_ab_sha256"] = hashlib.sha256(
+        seed_path.read_bytes()
+    ).hexdigest()
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    diagnostic = result.as_diagnostic()
+    verification = diagnostic["seed_verification"]
+    assert list(verification) == [
+        "status",
+        "schema",
+        "configurations",
+        "expected_exact_sha256",
+        "actual_exact_sha256",
+        "reference",
+        "max_deltas",
+    ]
+    assert verification["status"] == "vasp_equivalent"
+    assert verification["schema"] == "vasp-seed-prefix-equivalence-v1"
+    assert verification["configurations"] == 1
+    assert verification["expected_exact_sha256"] == seed_prefix_identity(
+        parsed_seed.configurations
+    ).sha256
+    assert verification["actual_exact_sha256"] == seed_prefix_identity(
+        parsed_final.configurations,
+        n_configurations=1,
+    ).sha256
+    assert verification["reference"] == {
+        "source": "init_mlff/ML_ABN",
+        "raw_sha256": hashlib.sha256(seed_path.read_bytes()).hexdigest(),
+        "trust": "manifest-v2",
+    }
+    assert list(verification["max_deltas"]) == [
+        "lattice",
+        "positions",
+        "energy",
+        "forces",
+        "stress_kbar",
+    ]
+    assert verification["max_deltas"]["lattice"] == {
+        "absolute": 0.0,
+        "scaled": 0.0,
+    }
+    assert verification["max_deltas"]["positions"]["absolute"] == pytest.approx(
+        1.0125233984581428e-13
+    )
+    assert verification["max_deltas"]["positions"]["scaled"] == pytest.approx(
+        3.462600963201334e-14
+    )
+    assert verification["max_deltas"]["forces"] == {
+        "absolute": pytest.approx(1.3877787807814457e-17),
+        "scaled": pytest.approx(1.3877787807814457e-17),
+    }
+    assert verification["max_deltas"]["energy"] == {
+        "absolute": 0.0,
+        "scaled": 0.0,
+    }
+    assert verification["max_deltas"]["stress_kbar"] == {
+        "absolute": 0.0,
+        "scaled": 0.0,
+    }
+    assert yaml.safe_load(yaml.safe_dump(diagnostic)) == diagnostic
+
+
 def test_seed_prefix_mismatch_fails_source_with_zero_new_frames(tmp_path):
     collect_current_mlab_source = _collect_current_mlab_source_api()
     work_dir, source_path = _runtime_mlab_source(tmp_path, "complete_multi.mlab")
@@ -676,6 +790,53 @@ def test_new_data_tail_partial_preserves_complete_new_frames(tmp_path):
     )
 
 
+def test_equivalent_tail_partial_keeps_complete_post_seed_frames(tmp_path):
+    collect_current_mlab_source = _collect_current_mlab_source_api()
+    work_dir, source_path = _runtime_mlab_source(
+        tmp_path,
+        "seed_rewrite_postseed_vasp_651.mlab",
+    )
+    complete_text = source_path.read_text(encoding="utf-8")
+    tail_text = _mlab_fixture_path("tail_position_crop.mlab").read_text(
+        encoding="utf-8"
+    )
+    tail_block = tail_text[tail_text.index("Configuration num.      2") :].replace(
+        "Configuration num.      2",
+        "Configuration num.      3",
+        1,
+    )
+    source_path.write_text(
+        _replace_declared_count(complete_text, 3).rstrip() + "\n" + tail_block,
+        encoding="utf-8",
+    )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    parsed_seed = parse_mlab(seed_path)
+    manifest = _current_manifest_for_seed(parsed_seed.configurations)
+    manifest.mlff_seed["ml_ab_sha256"] = hashlib.sha256(
+        seed_path.read_bytes()
+    ).hexdigest()
+
+    result = collect_current_mlab_source(
+        work_dir=work_dir,
+        source_path=source_path,
+        manifest=manifest,
+    )
+
+    assert result.status is models.SourceStatus.PARTIAL
+    assert result.complete_count == 2
+    assert result.accepted_count == 1
+    assert tuple(
+        configuration.source_configuration_number
+        for configuration in result.parsed_configurations
+    ) == (2,)
+    assert result.discarded_configuration_number == 3
+    assert result.discarded_block == "positions"
+    assert "end of file" in result.reason.lower()
+    assert result.seed_verification.outcome == "vasp_equivalent"
+
+
 def _collect_legacy_mlab_source_api():
     collector = getattr(collect_module, "collect_legacy_mlab_source", None)
     assert callable(
@@ -748,6 +909,36 @@ def test_legacy_seed_identity_rebuilt_from_complete_init_mlff_mlabn(tmp_path):
     assert result.seed_identity == expected_identity
 
 
+def test_legacy_vasp_rewritten_prefix_collects_post_seed_frames(tmp_path):
+    collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
+    work_dir, source_path = _legacy_runtime_source(
+        tmp_path,
+        "seed_rewrite_postseed_vasp_651.mlab",
+        "seed_input_vasp_651.mlab",
+    )
+    manifest = _legacy_manifest_result(work_dir)
+    parsed_final = parse_mlab(source_path)
+
+    with pytest.warns(UserWarning) as observed:
+        result = collect_legacy_mlab_source(
+            work_dir=work_dir,
+            source_path=source_path,
+            manifest=manifest,
+        )
+
+    assert len(observed) == 1
+    assert result.status is models.SourceStatus.COMPLETE
+    assert result.complete_count == 2
+    assert result.accepted_count == 1
+    assert result.parsed_configurations == (parsed_final.configurations[1],)
+    assert result.seed_identity == seed_prefix_identity(
+        parsed_final.configurations,
+        n_configurations=1,
+    )
+    assert result.seed_verification.outcome == "vasp_equivalent"
+    assert result.seed_verification.reference.trust == "legacy-rebuilt"
+
+
 def test_legacy_seed_rebuild_warns_and_verifies_final_prefix(tmp_path):
     collect_legacy_mlab_source = _collect_legacy_mlab_source_api()
     work_dir, source_path = _legacy_runtime_source(
@@ -802,11 +993,12 @@ def test_legacy_missing_init_seed_fails_without_using_md_ml_ab(tmp_path):
     )
 
     assert result.status is models.SourceStatus.FAILED
-    assert result.complete_count == 0
+    assert result.complete_count == 2
     assert result.accepted_count == 0
     assert result.accepted_frames == ()
     assert result.parsed_configurations == ()
     assert result.seed_identity is None
+    assert result.seed_verification.reference_failure.code == "source_missing"
     assert result.reason is not None
     assert "init_mlff/ML_ABN" in result.reason
     assert "legacy" in result.reason.lower()
@@ -839,11 +1031,15 @@ def test_legacy_partial_or_invalid_init_seed_fails(tmp_path):
             "legacy" in str(item.message).lower() for item in observed
         )
         assert result.status is models.SourceStatus.FAILED
-        assert result.complete_count == 0
+        assert result.complete_count == 1
         assert result.accepted_count == 0
         assert result.accepted_frames == ()
         assert result.parsed_configurations == ()
         assert result.seed_identity is None
+        assert result.seed_verification.reference_failure.code in {
+            "reference_incomplete",
+            "parse_failed",
+        }
         assert result.reason is not None
         assert "init_mlff/ML_ABN" in result.reason
         assert any(
@@ -1156,6 +1352,18 @@ def _build_seed_aware_candidate_api():
     return builder
 
 
+def _build_full_dedup_candidate_api():
+    builder = getattr(
+        collect_module,
+        "build_full_dedup_candidate",
+        None,
+    )
+    assert callable(
+        builder
+    ), "build_full_dedup_candidate is not implemented"
+    return builder
+
+
 def _task6_config(
     tmp_path: Path,
     *,
@@ -1298,6 +1506,271 @@ def test_candidate_uses_manifest_directories_only(tmp_path):
         source_result.source_path for source_result in candidate.source_results
     }
     assert candidate.frame_count == 2
+
+
+def test_collection_candidate_reuses_one_verifier_for_all_sources(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    directories = ("md/0_0", "md/0_1")
+    for directory in directories:
+        source_dir = work_dir / directory
+        source_dir.mkdir(parents=True)
+        shutil.copy2(
+            _mlab_fixture_path("seed_rewrite_postseed_vasp_651.mlab"),
+            source_dir / "ML_ABN",
+        )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    manifest = _task6_legacy_manifest(work_dir, "md", list(directories))
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    with pytest.warns(UserWarning) as observed:
+        candidate = builder(config=config, stage="md", manifest=manifest)
+
+    assert len(observed) == 1
+    assert candidate.frame_count == 2
+    assert candidate.sources_complete == 2
+    assert tuple(
+        result.seed_verification.outcome for result in candidate.source_results
+    ) == ("vasp_equivalent", "vasp_equivalent")
+    assert (
+        candidate.source_results[0].seed_verification.reference
+        == candidate.source_results[1].seed_verification.reference
+    )
+
+
+def test_exact_and_vasp_equivalent_sources_skip_same_seed_count(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    exact_dir = work_dir / "md" / "exact"
+    equivalent_dir = work_dir / "md" / "equivalent"
+    exact_dir.mkdir(parents=True)
+    equivalent_dir.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("complete_multi.mlab"), exact_dir / "ML_ABN")
+    shutil.copy2(
+        _mlab_fixture_path("seed_rewrite_postseed_vasp_651.mlab"),
+        equivalent_dir / "ML_ABN",
+    )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        ["md/exact", "md/equivalent"],
+        seed_fixture="seed_input_vasp_651.mlab",
+    )
+    manifest.manifest.mlff_seed["ml_ab_sha256"] = hashlib.sha256(
+        seed_path.read_bytes()
+    ).hexdigest()
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    candidate = builder(config=config, stage="md", manifest=manifest)
+
+    assert candidate.frame_count == 2
+    assert tuple(result.accepted_count for result in candidate.source_results) == (
+        1,
+        1,
+    )
+    assert tuple(
+        result.seed_verification.outcome for result in candidate.source_results
+    ) == ("exact", "vasp_equivalent")
+    assert tuple(
+        result.seed_verification.configurations
+        for result in candidate.source_results
+    ) == (1, 1)
+    assert tuple(
+        configuration.source_configuration_number
+        for result in candidate.source_results
+        for configuration in result.parsed_configurations
+    ) == (2, 2)
+
+
+def test_seed_mismatch_source_contributes_zero_frames(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    accepted_dir = work_dir / "md" / "accepted"
+    mismatched_dir = work_dir / "md" / "mismatched"
+    accepted_dir.mkdir(parents=True)
+    mismatched_dir.mkdir(parents=True)
+    shutil.copy2(
+        _mlab_fixture_path("seed_rewrite_postseed_vasp_651.mlab"),
+        accepted_dir / "ML_ABN",
+    )
+    shutil.copy2(
+        _mlab_fixture_path("complete_vasp_641.mlab"),
+        mismatched_dir / "ML_ABN",
+    )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        ["md/accepted", "md/mismatched"],
+        seed_fixture="seed_input_vasp_651.mlab",
+    )
+    manifest.manifest.mlff_seed["ml_ab_sha256"] = hashlib.sha256(
+        seed_path.read_bytes()
+    ).hexdigest()
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    candidate = builder(config=config, stage="md", manifest=manifest)
+
+    accepted, mismatched = candidate.source_results
+    assert candidate.frame_count == 1
+    assert candidate.frame_count == sum(
+        result.accepted_count for result in candidate.source_results
+    )
+    assert accepted.status is models.SourceStatus.COMPLETE
+    assert accepted.accepted_count == 1
+    assert mismatched.status is models.SourceStatus.FAILED
+    assert mismatched.accepted_count == 0
+    assert mismatched.parsed_configurations == ()
+    assert mismatched.seed_verification.outcome == "mismatch"
+    assert mismatched.seed_verification.first_mismatch.field == "elements"
+    mismatch_diagnostic = mismatched.as_diagnostic()["seed_verification"]
+    assert mismatch_diagnostic["status"] == "mismatch"
+    assert mismatch_diagnostic["first_mismatch"] == {
+        "configuration_index": 0,
+        "field": "elements",
+        "component": [0],
+        "expected": "O",
+        "actual": "C",
+        "absolute": None,
+        "scaled": None,
+        "reason": "structural_mismatch",
+    }
+    assert yaml.safe_load(yaml.safe_dump(mismatch_diagnostic)) == (
+        mismatch_diagnostic
+    )
+
+
+def test_reference_failure_is_source_local_and_reused(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    directories = ("md/first", "md/second")
+    for directory in directories:
+        source_dir = work_dir / directory
+        source_dir.mkdir(parents=True)
+        shutil.copy2(
+            _mlab_fixture_path("seed_rewrite_postseed_vasp_651.mlab"),
+            source_dir / "ML_ABN",
+        )
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        list(directories),
+        seed_fixture="seed_input_vasp_651.mlab",
+    )
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    candidate = builder(config=config, stage="md", manifest=manifest)
+
+    first, second = candidate.source_results
+    assert candidate.frame_count == 0
+    assert candidate.sources_failed == 2
+    assert tuple(result.source_path for result in (first, second)) == (
+        "md/first/ML_ABN",
+        "md/second/ML_ABN",
+    )
+    assert tuple(result.complete_count for result in (first, second)) == (2, 2)
+    assert all(result.accepted_count == 0 for result in (first, second))
+    assert all(result.parsed_configurations == () for result in (first, second))
+    assert (
+        first.seed_verification.reference_failure
+        == second.seed_verification.reference_failure
+    )
+    assert first.seed_verification.reference_failure.code == "source_missing"
+    assert first.seed_verification.reference_failure.source == "init_mlff/ML_ABN"
+    failure_diagnostic = first.as_diagnostic()["seed_verification"]
+    assert failure_diagnostic["status"] == "mismatch"
+    assert failure_diagnostic["first_mismatch"]["field"] == "reference"
+    assert failure_diagnostic["first_mismatch"]["reason"] == "reference_failure"
+    assert failure_diagnostic["reference_failure"] == {
+        "code": "source_missing",
+        "source": "init_mlff/ML_ABN",
+        "reason": "reference source is missing or is not a regular file",
+        "expected": None,
+        "actual": None,
+    }
+    assert yaml.safe_load(yaml.safe_dump(failure_diagnostic)) == failure_diagnostic
+
+
+def test_early_md_collection_keeps_missing_sources_skipped(tmp_path):
+    builder = _build_seed_aware_candidate_api()
+    work_dir = tmp_path / "work"
+    complete_dir = work_dir / "md" / "complete"
+    empty_dir = work_dir / "md" / "empty"
+    complete_dir.mkdir(parents=True)
+    empty_dir.mkdir(parents=True)
+    shutil.copy2(
+        _mlab_fixture_path("seed_rewrite_postseed_vasp_651.mlab"),
+        complete_dir / "ML_ABN",
+    )
+    seed_path = work_dir / "init_mlff" / "ML_ABN"
+    seed_path.parent.mkdir(parents=True)
+    shutil.copy2(_mlab_fixture_path("seed_input_vasp_651.mlab"), seed_path)
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        ["md/complete", "md/missing", "md/empty"],
+        seed_fixture="seed_input_vasp_651.mlab",
+    )
+    manifest.manifest.mlff_seed["ml_ab_sha256"] = hashlib.sha256(
+        seed_path.read_bytes()
+    ).hexdigest()
+    config = _task6_config(tmp_path, vasp_ml=True)
+
+    candidate = builder(config=config, stage="md", manifest=manifest)
+
+    assert candidate.frame_count == 1
+    assert candidate.sources_complete == 1
+    assert candidate.sources_skipped == 2
+    assert candidate.sources_failed == 0
+    complete, missing, empty = candidate.source_results
+    assert complete.seed_verification.outcome == "vasp_equivalent"
+    assert tuple(result.status for result in (missing, empty)) == (
+        models.SourceStatus.SKIPPED,
+        models.SourceStatus.SKIPPED,
+    )
+    assert tuple(result.seed_verification for result in (missing, empty)) == (
+        None,
+        None,
+    )
+    assert missing.source_path == "md/missing"
+    assert empty.source_path == "md/empty/ML_ABN"
+
+
+def test_full_dedup_never_calls_seed_equivalence_verifier(tmp_path):
+    builder = _build_full_dedup_candidate_api()
+    work_dir = tmp_path / "work"
+    source_dir = work_dir / "md" / "source"
+    source_dir.mkdir(parents=True)
+    shutil.copy2(
+        _mlab_fixture_path("seed_rewrite_postseed_vasp_651.mlab"),
+        source_dir / "ML_ABN",
+    )
+    manifest = _task6_current_manifest(
+        work_dir,
+        "md",
+        ["md/source"],
+        seed_fixture="seed_input_vasp_651.mlab",
+    )
+
+    candidate = builder(work_dir=work_dir, manifest=manifest)
+
+    assert candidate.collection_mode is models.MLFFCollectMode.FULL_DEDUP
+    assert candidate.frame_count == 2
+    assert candidate.dedup_stats.seen == 2
+    assert candidate.dedup_stats.unique == 2
+    assert candidate.dedup_stats.duplicates_removed == 0
+    (source_result,) = candidate.source_results
+    assert source_result.complete_count == 2
+    assert source_result.accepted_count == 2
+    assert source_result.seed_identity is None
+    assert source_result.seed_verification is None
 
 
 def test_missing_directory_and_file_are_skipped_with_reason(tmp_path):
@@ -1479,7 +1952,7 @@ def test_candidate_frames_equal_complete_plus_partial_contributions(tmp_path):
                     stage="md",
                     manifest=manifest,
                 )
-            assert len(observed) == 2
+            assert len(observed) == 1
             assert all(
                 "legacy" in str(item.message).lower() for item in observed
             )

@@ -221,6 +221,8 @@ CLI 只向 stderr 输出一行简短汇总；所选结果 manifest 保留详细�
 
 对于 `vasp_ml: true` 的 MD，默认 `seed-aware` 模式验证 Stage1 中不可变的 seed provenance，绝不会从当前 `md/ML_AB` 推断。旧版续算目录可显式运行：
 
+精确 fast path 保持 `mlab-seed-v1` 不变。当 VASP 对可信 seed 前缀产生数值上可忽略的重写时，带版本的 fallback 要求元素、计数、原子顺序和 configuration 顺序完全一致，然后逐数值分量检查 `abs(a-b) <= 1e-12 * max(1, abs(a), abs(b))`。Manifest v2 fallback 只读取路径受限且通过原始哈希验证的 reference；legacy fallback 只读取完整的 `init_mlff/ML_ABN`，并发出兼容性警告。VASP-equivalent verification 视为完整覆盖，并且只排除一次 manifest 记录的 seed 数量。
+
 ```bash
 DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
 ```
@@ -228,6 +230,8 @@ DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
 `full-dedup` 读取每个可接受的最终 `ML_ABN`，对重复构型保留第一份精确副本（包括一份共享 seed），因此会产生更多 I/O。它只适用于 MLFF MD；用于弛豫、validation 或非 ML MD 时会 fatal 并返回 1。
 
 当前 Manifest v2 始终具有最高权威。旧版或缺失 manifest 的兼容收集写入 `MD_data.collect.yaml`，不会伪造或重写 build provenance。缺失 manifest 扫描只允许 `full-dedup`；即使产生帧，由于预期来源覆盖未知，状态至多为 `degraded`。
+
+对于非零 seed-aware 发布，`collect.dedup.seed_verification` 记录 `exact`、`vasp_equivalent` 和 `mismatch` 聚合计数。每个已验证来源在 `collect.sources[].seed_verification` 中记录有界的 identity、reference trust、最大 absolute/scaled delta，以及可选的首个 mismatch。完整 seed configuration 永远不会被序列化。精确 `mlab-seed-v1`、精确 `mlab-config-v1` 和显式 full-dedup 相互独立且保持不变。
 
 对于弛豫和 `vasp_ml: false` 的 MD，DPmoire-lite 读取 OUTCAR 系列。默认 OUTCAR 匹配规则是：
 

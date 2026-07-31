@@ -31,3 +31,9 @@
   legacy/missing compatibility writes `MD_data.collect.yaml` without rewriting
   build provenance, and missing-manifest scans are full-dedup-only and at best
   degraded when they produce frames.
+- Seed-aware MLFF collection now accepts VASP-rewritten seed prefixes only when
+  a trusted reference passes the fixed `vasp-seed-prefix-equivalence-v1`
+  component rule. Exact `mlab-seed-v1`/`mlab-config-v1` identities and
+  full-dedup remain unchanged. Result manifests publish aggregate verification
+  counts and bounded per-source hashes, trust, deltas, and mismatch evidence
+  without serializing complete seed configurations.

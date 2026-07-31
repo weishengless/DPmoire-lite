@@ -4,9 +4,12 @@
 - 评审日期：2026-07-11
 - 结论日期：2026-07-11
 - full-dedup 补充决定日期：2026-07-12
+- VASP seed-prefix equivalence 补充决定日期：2026-07-31
 - 优先级：P2
 - 补充设计：
   [`MLFF Full-dedup and Legacy Collection Design`](../superpowers/specs/2026-07-12-mlff-full-dedup-legacy-collection-design.md)
+  和
+  [`VASP MLFF Seed-prefix Equivalence Verification Design`](../superpowers/specs/2026-07-31-vasp-mlff-seed-prefix-equivalence-design.md)
 - 关联位置：
   - `src/dpmoire_lite/dataset.py:17-22`
   - `src/dpmoire_lite/dataset.py:46-111`
@@ -213,6 +216,40 @@ configuration 编号、空白、注释和浮点文本格式不进入 digest，�
 - 不进行容差舍入；解析后的有限 float64 bit pattern 必须一致；
 - 验证 positions/forces shape 与原子数一致，元素类型计数之和等于原子数。
 
+上述“不进行容差舍入”是 `mlab-seed-v1` 和 `mlab-config-v1` 精确 identity
+契约，不能通过修复 collector 改变。VASP 读取 `ML_AB` 后可能在写出最终
+`ML_ABN` 时引入极小的 float64 重序列化差异，因此 seed provenance 另增加
+版本化的一对一验证规则 `vasp-seed-prefix-equivalence-v1`；它不是 identity、
+不产生近似 digest，也不能用于 full-dedup 或任意帧去重。
+
+该规则只将可信 initial seed 与单个 final ML_ABN 的等长有序前缀逐字段比较：
+
+```text
+abs(a - b) <= 1e-12 * max(1.0, abs(a), abs(b))
+```
+
+- 元素、类型计数、原子数、configuration 顺序及数组 shape 必须完全一致；
+- 数值比较覆盖 lattice、Cartesian positions、energy、forces 和原始 kbar
+  stress，沿用上述单位和 stress 分量顺序；
+- 当前 Manifest v2 的非精确回退只能读取 `mlff_seed.source`，且必须先验证
+  其原始 SHA-256 等于 `ml_ab_sha256`、完整 count 和 `mlab-seed-v1` identity
+  均等于 manifest 记录；
+- 精确 digest 匹配仍是快速路径，不要求原始 reference 文件继续存在；
+- reference 只在第一次精确 mismatch 时惰性读取，并在一次 collect 中缓存
+  成功或结构化失败；
+- legacy 仍只信任完整的 `work/init_mlff/ML_ABN`，并记录
+  `legacy-rebuilt`；缺失或不完整时 fail-closed；
+- 容差由 schema 固定，不进入 `config.yaml`，未来变化必须经过新 schema 和
+  科学审查。
+
+批准证据覆盖真实配对数据：VASP 6.4.1 的 78 帧输入是 110 帧输出的有序
+前缀，最大 position/force 差分别为 `8.6737e-19 Å` 和
+`6.9389e-18 eV/Å`；VASP 6.5.1 的 63 帧配对最大差分别为
+`1.0126e-13 Å` 和 `1.3878e-17 eV/Å`，最大 scaled delta 为
+`3.4626e-14`。两者的结构、顺序、lattice、energy 和 stress 均保持一致，
+并满足 v1 规则。原始 ignored calculation 只作证据，自动测试必须使用最小
+脱敏 fixture。
+
 header configuration count 也是结构不变量：
 
 - Stage1 initial seed 必须完整解析，header 声明数量必须等于完整解析数量；
@@ -244,21 +281,29 @@ SHA-256 仍用于证明首次复制字节一致，两种 hash 不能互相替代
    因为正常 restart 会用较新的 ML_ABN 替换 ML_AB；
 3. 顺序解析最终 ML_ABN 的前 N 个完整 configurations，并按相同 schema
    计算 prefix digest；
-4. digest 与 manifest 不一致时，该来源按 seed provenance failure 处理，
-   贡献 0 帧，不能只按 header count 跳过；
-5. digest 一致后，无论 restart 多少次，最终 ML_ABN 始终只跳过这 N 个
-   Stage1 initial seed configurations；
-6. seed 前缀之后的完整新 configuration 正常加入数据集，其中包括此前各次
+4. digest 一致时记录 `exact`，无需读取 reference；
+5. digest 不一致时，只能在验证可信 reference 后执行
+   `vasp-seed-prefix-equivalence-v1` 一对一比较；通过则记录
+   `vasp_equivalent`，否则该来源按 seed provenance failure 处理并贡献 0 帧；
+6. `exact` 或 `vasp_equivalent` 后，无论 restart 多少次，最终 ML_ABN 始终
+   只跳过这 N 个 Stage1 initial seed configurations；
+7. seed 前缀之后的完整新 configuration 正常加入数据集，其中包括此前各次
    restart 已经积累的数据；
-7. 新数据区最后一帧截断时执行 EOF 尾部抢救；
-8. 如果 ML_ABN 中完整 configuration 总数少于 initial seed 数量，则 seed
+8. 新数据区最后一帧截断时执行 EOF 尾部抢救；
+9. 如果 ML_ABN 中完整 configuration 总数少于 initial seed 数量，则 seed
    本身未完整写出，来源失败且贡献 0 个新帧；
-9. 旧 manifest 没有 seed 信息时，优先完整解析
+10. 旧 manifest 没有 seed 信息时，优先完整解析
    `work/init_mlff/ML_ABN`，现场计算 count 和 canonical digest，再复核最终
    ML_ABN prefix；
-10. 旧计算的 init_mlff seed 文件缺失时，不能使用可能已经增长的当前
+11. 旧计算的 init_mlff seed 文件缺失时，不能使用可能已经增长的当前
    `md/ML_AB` 静默推断。应要求用户恢复原始 seed 文件，或通过后续设计的
    明确 legacy migration 输入提供 count、schema 和 digest。
+
+每个来源的结构化诊断必须区分 `exact`、`vasp_equivalent` 和 `mismatch`，
+记录 expected/actual exact digest、验证 schema、reference trust、最大 absolute/
+scaled delta，以及 mismatch 的首个 configuration/field/component；不得写出
+完整私有 configuration。批准的 VASP 等价本身不使 aggregate degraded，来源
+缺失、partial 或 failed 等既有覆盖信号仍按原规则选择 aggregate status。
 
 ### 显式 full-dedup 兼容收集
 
@@ -350,7 +395,14 @@ partial:
 - initial seed header count 等于完整解析数量；
 - partial 只允许 `declared_count == complete_count + 1` 且唯一尾块不完整；
 - 真实格式截断 fixture 覆盖 position、force 和 stress 尾部；
-- 收集器只有在 final ML_ABN prefix digest 一致后才跳过 init_mlff 前缀；
+- 收集器只有在 final ML_ABN prefix 获得 `exact` 或经可信 reference 验证的
+  `vasp_equivalent` 后才跳过 init_mlff 前缀；
+- `vasp-seed-prefix-equivalence-v1` 只用于 reference 与单个 final prefix 的
+  一对一验证，不改变 exact identity 或 full-dedup；
+- exact 路径不读取 reference，非精确路径验证 raw hash/count/exact digest 并
+  在一次 collect 中缓存 reference；
+- VASP 6.4.1/6.5.1 配对脱敏 fixtures 覆盖重序列化等价，阈值外和结构变化
+  均 fail-closed；
 - 多次执行 `cp ML_ABN ML_AB` 续算后仍只跳过 Stage1 initial seed；
 - collect 不因当前 MD/ML_AB hash 已随 restart 变化而拒绝合法来源；
 - ML_ABN 短于 seed 前缀时不产生新帧；
@@ -366,5 +418,6 @@ partial:
   之和；`full-dedup` 最终帧数等于 unique retained 之和，且
   `seen == unique + duplicates_removed`；
 - 测试覆盖完整文件、尾部截断、内部损坏、seed-only、短于 seed、多次
-  restart、相同 count 不同 prefix、文本格式变化但 canonical 内容相同、旧
-  init seed 回退和 initial seed 证据缺失。
+  restart、相同 count 不同 prefix、文本格式变化但 canonical 内容相同、真实
+  VASP read/rewrite 等价、阈值外 mismatch、旧 init seed 回退和 initial seed
+  证据缺失。

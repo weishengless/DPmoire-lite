@@ -154,6 +154,14 @@ For MD data:
 - `seed-aware` is the default. For `vasp_ml: true`, it validates the immutable
   Stage1 seed provenance and excludes that prefix; it never infers the prefix
   from the current `md/ML_AB`.
+- Exact seed matching keeps the existing `mlab-seed-v1` identity unchanged. If
+  VASP rewrites only numeric values in the trusted seed prefix, the fallback
+  requires identical structure and order and applies the fixed, versioned rule
+  `abs(a-b) <= 1e-12 * max(1, abs(a), abs(b))` component by component. The
+  reference must be raw-hash verified for Manifest v2, or explicitly rebuilt
+  from complete legacy `init_mlff/ML_ABN` evidence. Approved VASP equivalence
+  alone remains `complete`; missing, partial, or failed source coverage causes
+  `degraded`.
 - Explicit `--mlff-collect-mode full-dedup` is valid only for MLFF MD. It reads
   every accepted final `ML_ABN`, retains the first exact copy of repeated
   configurations (including one shared seed), and performs more I/O than
@@ -169,6 +177,13 @@ missing-manifest MLFF collection writes `MD_data.collect.yaml`; it never
 fabricates or rewrites build provenance. Missing-manifest scanning is available
 only with explicit `full-dedup`, and a scan that produces frames is at best
 `degraded` because expected-source coverage is unknown.
+
+The result manifest records aggregate exact/VASP-equivalent/mismatch counts at
+`collect.dedup.seed_verification` and bounded per-source evidence at
+`collect.sources[].seed_verification`. Diagnostics contain hashes, counts,
+reference trust, first-mismatch fields, and maximum deltas; they never contain
+complete seed configurations. Canonical `mlab-seed-v1` and `mlab-config-v1`
+outputs and full-dedup behavior are unchanged.
 
 ## Config Tags
 
