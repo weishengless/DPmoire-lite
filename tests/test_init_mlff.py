@@ -7,6 +7,8 @@ import yaml
 from ase import Atoms
 from ase.io.vasp import write_vasp
 
+import dpmoire_lite.atomic_io as atomic_io_module
+import dpmoire_lite.build as build_module
 import dpmoire_lite.init_mlff as init_mlff_module
 from dpmoire_lite.build import run_build
 from dpmoire_lite.init_mlff import (
@@ -52,12 +54,12 @@ def _write_phase_templates(input_dir):
         )
 
 
-def _write_op_layer(path):
+def _write_op_layer(path, positions):
     write_vasp(
         path,
         Atoms(
             ["O", "Pt"],
-            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            positions=positions,
             cell=[4.0, 4.0, 12.0],
             pbc=True,
         ),
@@ -79,8 +81,14 @@ def _prepare_workflow(tmp_path, *, do_relaxation=False):
     )
     input_dir = tmp_path / "input"
     _write_phase_templates(input_dir)
-    _write_op_layer(input_dir / "bot_layer.poscar")
-    _write_op_layer(input_dir / "top_layer.poscar")
+    _write_op_layer(
+        input_dir / "bot_layer.poscar",
+        [[0.0, 0.0, 1.0], [2.0, 2.0, 2.0]],
+    )
+    _write_op_layer(
+        input_dir / "top_layer.poscar",
+        [[0.0, 0.0, 1.1], [2.1, 2.0, 2.0]],
+    )
     for element in ("O", "Pt"):
         potcar = tmp_path / "potcars" / element / "POTCAR"
         potcar.parent.mkdir(parents=True)
@@ -115,6 +123,23 @@ def _manifest(work_dir):
 
 def _assert_no_seed_candidates(root):
     assert list(root.rglob("*.candidate")) == []
+
+
+def test_phase_position_evidence_accepts_periodic_image_coordinates():
+    configuration = init_mlff_module.parse_mlab(
+        MLAB_FIXTURES / "complete_vasp_651.mlab"
+    ).configurations[0]
+    periodic_image = Atoms(
+        ["O", "Pt"],
+        positions=[[0.0, 0.0, 13.0], [2.0, 2.0, 2.0]],
+        cell=[4.0, 4.0, 12.0],
+        pbc=True,
+    )
+
+    assert init_mlff_module._configuration_matches_periodic_positions(
+        configuration,
+        periodic_image,
+    )
 
 
 def test_workflow_runs_both_phases_through_one_adapter_and_publishes_final_seed(tmp_path):
@@ -223,6 +248,8 @@ def test_adapter_exception_is_recorded_without_exposing_private_message(tmp_path
         ("partial", "complete"),
         ("malformed", "malformed"),
         ("phase-mismatch", "phase structure"),
+        ("species-order-mismatch", "species order"),
+        ("position-mismatch", "positions"),
         ("missing-ff", "ML_FFN"),
         ("empty-ff", "ML_FFN"),
     ],
@@ -243,6 +270,26 @@ def test_zero_step1_rejects_untrusted_outputs_before_step2(
             shutil.copy2(MLAB_FIXTURES / "internal_corruption.mlab", directory / "ML_ABN")
         elif case == "phase-mismatch":
             shutil.copy2(MLAB_FIXTURES / "complete_vasp_641.mlab", directory / "ML_ABN")
+        elif case == "species-order-mismatch":
+            text = (MLAB_FIXTURES / "complete_vasp_651.mlab").read_text(
+                encoding="utf-8"
+            )
+            text = text.replace(
+                "     O      1\n     Pt     1",
+                "     Pt     1\n     O      1",
+                1,
+            )
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
+        elif case == "position-mismatch":
+            text = (MLAB_FIXTURES / "complete_vasp_651.mlab").read_text(
+                encoding="utf-8"
+            )
+            text = text.replace(
+                "   0.000000000000000E+000  0.000000000000000E+000  1.000000000000000E+000",
+                "   0.000000000000000E+000  0.000000000000000E+000  1.500000000000000E+000",
+                1,
+            )
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
         elif case in {"missing-ff", "empty-ff"}:
             shutil.copy2(
                 MLAB_FIXTURES / "complete_vasp_651.mlab",
@@ -277,7 +324,7 @@ def test_handoff_interruption_leaves_no_formal_or_partial_top_seed(
     monkeypatch,
 ):
     _config_path, work_dir = _prepare_workflow(tmp_path)
-    real_publish = init_mlff_module.atomic_file_publish_no_replace
+    real_publish = atomic_io_module.atomic_file_publish_no_replace
     calls = 0
 
     def fail_second_file(candidate, destination):
@@ -288,7 +335,7 @@ def test_handoff_interruption_leaves_no_formal_or_partial_top_seed(
         return real_publish(candidate, destination)
 
     monkeypatch.setattr(
-        init_mlff_module,
+        atomic_io_module,
         "atomic_file_publish_no_replace",
         fail_second_file,
     )
@@ -305,6 +352,42 @@ def test_handoff_interruption_leaves_no_formal_or_partial_top_seed(
     assert not (root / "top" / "ML_FF").exists()
     assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
     assert [call[0] for call in adapter.calls] == ["step1"]
+    _assert_no_seed_candidates(root)
+
+
+def test_handoff_post_rename_failure_rolls_back_the_unregistered_copy(
+    tmp_path,
+    monkeypatch,
+):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    real_publish = atomic_io_module.atomic_file_publish_no_replace
+    failed = False
+
+    def fail_after_first_rename(candidate, destination):
+        nonlocal failed
+        result = real_publish(candidate, destination)
+        if not failed:
+            failed = True
+            raise OSError("synthetic post-rename interruption")
+        return result
+
+    monkeypatch.setattr(
+        atomic_io_module,
+        "atomic_file_publish_no_replace",
+        fail_after_first_rename,
+    )
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step1 handoff invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    assert not (root / "top" / "ML_AB").exists()
+    assert not (root / "top" / "ML_FF").exists()
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
     _assert_no_seed_candidates(root)
 
 
@@ -370,6 +453,8 @@ def test_nonzero_step2_preserves_bottom_evidence_and_failed_top_directory(tmp_pa
         ("malformed", "malformed"),
         ("no-new", "new top"),
         ("prefix-mismatch", "seed prefix"),
+        ("species-order-mismatch", "species order"),
+        ("position-mismatch", "positions"),
     ],
 )
 def test_zero_step2_rejects_invalid_final_outputs(tmp_path, case, expected):
@@ -386,6 +471,24 @@ def test_zero_step2_rejects_invalid_final_outputs(tmp_path, case, expected):
         elif case == "prefix-mismatch":
             text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
             text = text.replace("-1.250000000000000E+000", "-9.250000000000000E+000", 1)
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
+        elif case == "species-order-mismatch":
+            text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+            prefix, separator, suffix = text.rpartition(
+                "     O      1\n     Pt     1"
+            )
+            assert separator
+            (directory / "ML_ABN").write_text(
+                prefix + "     Pt     1\n     O      1" + suffix,
+                encoding="utf-8",
+            )
+        elif case == "position-mismatch":
+            text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+            text = text.replace(
+                "   0.000000000000000E+000  0.000000000000000E+000  1.100000000000000E+000",
+                "   0.000000000000000E+000  0.000000000000000E+000  1.600000000000000E+000",
+                1,
+            )
             (directory / "ML_ABN").write_text(text, encoding="utf-8")
         if case != "missing":
             (directory / "ML_FFN").write_bytes(b"synthetic-step2-force-field\n")
@@ -411,7 +514,7 @@ def test_zero_step2_rejects_invalid_final_outputs(tmp_path, case, expected):
 
 def test_final_publication_interruption_rolls_back_root_seed(tmp_path, monkeypatch):
     _config_path, work_dir = _prepare_workflow(tmp_path)
-    real_publish = init_mlff_module.atomic_file_publish_no_replace
+    real_publish = atomic_io_module.atomic_file_publish_no_replace
     calls = 0
 
     def fail_final_second_file(candidate, destination):
@@ -422,7 +525,7 @@ def test_final_publication_interruption_rolls_back_root_seed(tmp_path, monkeypat
         return real_publish(candidate, destination)
 
     monkeypatch.setattr(
-        init_mlff_module,
+        atomic_io_module,
         "atomic_file_publish_no_replace",
         fail_final_second_file,
     )
@@ -611,6 +714,45 @@ def test_stage1_consumes_the_hash_verified_published_seed_unchanged(tmp_path):
     assert (md_dir / "ML_AB").read_bytes() == (root / "ML_ABN").read_bytes()
     assert (md_dir / "ML_FF").read_bytes() == (root / "ML_FFN").read_bytes()
     assert _manifest(work_dir).mlff_seed == read_manifest(work_dir, "md").manifest.mlff_seed
+
+
+def test_stage1_rejects_published_seed_mutation_after_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    config_path, work_dir = _prepare_workflow(tmp_path, do_relaxation=True)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+    InitMlffWorkflow(work_dir).run(adapter)
+
+    relaxation = work_dir / "rlx" / "0_0"
+    shutil.copy2(relaxation / "POSCAR", relaxation / "CONTCAR")
+    (relaxation / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["stage"] = 1
+    config_path.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    real_preflight = build_module.preflight_stage1
+
+    def mutate_after_preflight(config):
+        result = real_preflight(config)
+        force_field = work_dir / "init_mlff" / "ML_FFN"
+        payload = bytearray(force_field.read_bytes())
+        payload[0] ^= 1
+        force_field.write_bytes(payload)
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage1", mutate_after_preflight)
+
+    with pytest.raises(RuntimeError, match="Prepared source identity changed since preflight"):
+        run_build(config_path, wait=False)
+
+    assert not (work_dir / "md" / "manifest.yaml").exists()
 
 
 def test_published_seed_hash_evidence_rejects_post_publication_tampering(tmp_path):

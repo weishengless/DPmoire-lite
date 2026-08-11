@@ -10,8 +10,8 @@ from ase.constraints import FixScaled
 from ase.constraints import FixedLine
 import pytest
 
+import dpmoire_lite.build as build_module
 from dpmoire_lite.build import run_build
-import dpmoire_lite.inputs as inputs_module
 from dpmoire_lite.manifest import read_manifest
 from dpmoire_lite.manifest import write_manifest
 from dpmoire_lite.mlab import parse_mlab
@@ -721,15 +721,15 @@ class TestSeedStaging:
 
     def test_stage1_verifies_copied_size_and_hash(self, tmp_path, monkeypatch):
         config, _ = _prepare_seed_stage1(tmp_path)
-        real_copy2 = inputs_module.shutil.copy2
+        real_copy = build_module.copy_prepared_source
 
-        def corrupt_copy(source, destination, *args, **kwargs):
-            result = real_copy2(source, destination, *args, **kwargs)
+        def corrupt_copy(source, destination):
+            result = real_copy(source, destination)
             if Path(destination).name == "ML_FF":
                 Path(destination).write_bytes(b"corrupted-seed-copy")
             return result
 
-        monkeypatch.setattr(inputs_module.shutil, "copy2", corrupt_copy)
+        monkeypatch.setattr(build_module, "copy_prepared_source", corrupt_copy)
 
         with pytest.raises(RuntimeError, match="hash|size|ML_FF"):
             run_build(config, wait=False)
@@ -738,17 +738,17 @@ class TestSeedStaging:
         self, tmp_path, monkeypatch
     ):
         config, _ = _prepare_seed_stage1(tmp_path, n_sectors=(2, 1))
-        real_copy2 = inputs_module.shutil.copy2
+        real_copy = build_module.copy_prepared_source
 
-        def skip_second_seed_copy(source, destination, *args, **kwargs):
+        def skip_second_seed_copy(source, destination):
             if (
                 Path(destination).name == "ML_AB"
                 and Path(destination).parent.name == "1_0"
             ):
-                return destination
-            return real_copy2(source, destination, *args, **kwargs)
+                return None
+            return real_copy(source, destination)
 
-        monkeypatch.setattr(inputs_module.shutil, "copy2", skip_second_seed_copy)
+        monkeypatch.setattr(build_module, "copy_prepared_source", skip_second_seed_copy)
 
         with pytest.raises(RuntimeError, match="hash|size|ML_AB"):
             run_build(config, wait=False)

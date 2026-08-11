@@ -79,6 +79,23 @@ class Manifest:
     partial: list[dict[str, Any]] = field(default_factory=list)
 
 
+def set_init_workflow_state(manifest: Manifest, state: str) -> None:
+    """Apply one valid workflow state and its owned bottom/top phase states."""
+    try:
+        bottom_state, top_state = _INIT_WORKFLOW_STATE_PHASES[state]
+    except KeyError as exc:
+        raise ValueError(f"Unknown init workflow state: {state!r}") from exc
+    workflow = manifest.init_workflow
+    if not workflow:
+        raise ValueError("Cannot set init workflow state without workflow evidence")
+    phases = workflow.get("phases")
+    if not isinstance(phases, dict) or set(phases) != set(_INIT_PHASE_ROLES):
+        raise ValueError("Cannot set init workflow state without bottom/top phases")
+    workflow["state"] = state
+    phases["bottom"]["state"] = bottom_state
+    phases["top"]["state"] = top_state
+
+
 @dataclass
 class ManifestReadResult:
     kind: str

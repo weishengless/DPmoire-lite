@@ -135,6 +135,7 @@ class BuildPreflightResult:
     stage_targets: tuple[tuple[str, Path], ...] = ()
     output_dirs: tuple[Path, ...] = ()
     initial_seed: MlabParseResult | None = None
+    initial_seed_sources: tuple[PreparedSource, ...] = ()
     relaxations: tuple[PreparedRelaxation, ...] = ()
     validation_structures: tuple[PreparedValidationStructure, ...] = ()
     init_mlff_workflow: PreparedInitMlffWorkflow | None = None
@@ -574,8 +575,12 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
         )
 
     initial_seed = None
+    initial_seed_sources: tuple[PreparedSource, ...] = ()
     if config.vasp_ml:
-        initial_seed = _validate_initial_seed(config, diagnostics)
+        initial_seed, initial_seed_sources = _validate_initial_seed(
+            config,
+            diagnostics,
+        )
 
     output_dirs = _stage1_output_dirs(config, stackings)
     _validate_output_dirs(
@@ -596,6 +601,7 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
         stage_targets=stage_targets,
         output_dirs=output_dirs,
         initial_seed=initial_seed,
+        initial_seed_sources=initial_seed_sources,
         relaxations=relaxations,
         warnings=tuple(warning_diagnostics),
         provenance=provenance,
@@ -1058,7 +1064,7 @@ def _validate_relaxation(
 def _validate_initial_seed(
     config: DPmoireLiteConfig,
     diagnostics: list[PreflightDiagnostic],
-) -> MlabParseResult | None:
+) -> tuple[MlabParseResult | None, tuple[PreparedSource, ...]]:
     init_dir = config.work_dir / "init_mlff"
     try:
         published_seed = validate_published_init_mlff_seed(config.work_dir)
@@ -1070,9 +1076,9 @@ def _validate_initial_seed(
                 reason=str(exc),
             )
         )
-        return None
+        return None, ()
     if published_seed is not None:
-        return published_seed
+        return published_seed.parsed, (published_seed.ml_ab, published_seed.ml_ff)
 
     seed_path = init_dir / "ML_ABN"
     force_field_path = init_dir / "ML_FFN"
@@ -1112,8 +1118,13 @@ def _validate_initial_seed(
             )
         )
 
-    if not seed_path.is_file() or seed_path.stat().st_size == 0:
-        return None
+    if (
+        not seed_path.is_file()
+        or seed_path.stat().st_size == 0
+        or not force_field_path.is_file()
+        or force_field_path.stat().st_size == 0
+    ):
+        return None, ()
     try:
         result = parse_mlab(seed_path)
     except Exception as exc:
@@ -1124,7 +1135,7 @@ def _validate_initial_seed(
                 reason=str(exc),
             )
         )
-        return None
+        return None, ()
     if result.status != "complete" or result.declared_count != result.complete_count:
         diagnostics.append(
             PreflightDiagnostic(
@@ -1137,8 +1148,22 @@ def _validate_initial_seed(
                 ),
             )
         )
-        return None
-    return result
+        return None, ()
+    try:
+        sources = (
+            prepare_source(seed_path),
+            prepare_source(force_field_path),
+        )
+    except (OSError, RuntimeError) as exc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="mlff",
+                path=Path("init_mlff"),
+                reason=f"initial MLFF seed identity could not be prepared: {exc}",
+            )
+        )
+        return None, ()
+    return result, sources
 
 
 def _raise_if_failed(diagnostics: list[PreflightDiagnostic]) -> None:

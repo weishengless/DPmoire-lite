@@ -170,3 +170,47 @@ def test_atomic_file_publish_refuses_existing_destination(tmp_path):
 
     assert candidate.read_bytes() == b"candidate\n"
     assert destination.read_bytes() == b"existing\n"
+
+
+def test_atomic_copy_pair_rolls_back_when_fsync_fails_after_first_rename(
+    tmp_path,
+    monkeypatch,
+):
+    first_source = tmp_path / "source-ML_ABN"
+    second_source = tmp_path / "source-ML_FFN"
+    first_destination = tmp_path / "ML_AB"
+    second_destination = tmp_path / "ML_FF"
+    first_source.write_bytes(b"seed\n")
+    second_source.write_bytes(b"force-field\n")
+    real_fsync_directory = atomic_io._fsync_directory
+    failed = False
+
+    def fail_once(directory):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("post-rename fsync failed")
+        return real_fsync_directory(directory)
+
+    monkeypatch.setattr(atomic_io, "_fsync_directory", fail_once)
+
+    with pytest.raises(OSError, match="post-rename fsync failed"):
+        with atomic_io.atomic_copy_pair_transaction_no_replace(
+            atomic_io.AtomicCopyPlan(
+                source=first_source,
+                destination=first_destination,
+                sha256=atomic_io.sha256_file(first_source),
+            ),
+            atomic_io.AtomicCopyPlan(
+                source=second_source,
+                destination=second_destination,
+                sha256=atomic_io.sha256_file(second_source),
+            ),
+        ):
+            pass
+
+    assert first_source.read_bytes() == b"seed\n"
+    assert second_source.read_bytes() == b"force-field\n"
+    assert not first_destination.exists()
+    assert not second_destination.exists()
+    assert list(tmp_path.glob("*.candidate")) == []

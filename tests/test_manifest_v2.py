@@ -5,7 +5,12 @@ import pytest
 import yaml
 
 import dpmoire_lite.atomic_io as atomic_io
-from dpmoire_lite.manifest import Manifest, read_manifest, write_manifest
+from dpmoire_lite.manifest import (
+    Manifest,
+    read_manifest,
+    set_init_workflow_state,
+    write_manifest,
+)
 from dpmoire_lite.paths import manifest_path
 
 
@@ -171,9 +176,6 @@ def test_init_workflow_v1_round_trip_accepts_transactional_lifecycle_states(
 ):
     work_dir = tmp_path / "work"
     workflow = deepcopy(_valid_init_workflow())
-    workflow["state"] = workflow_state
-    workflow["phases"]["bottom"]["state"] = bottom_state
-    workflow["phases"]["top"]["state"] = top_state
     manifest = Manifest(
         stage="init_mlff",
         generated_at="2026-08-11T12:00:00",
@@ -183,6 +185,10 @@ def test_init_workflow_v1_round_trip_accepts_transactional_lifecycle_states(
         ),
         init_workflow=workflow,
     )
+    set_init_workflow_state(manifest, workflow_state)
+
+    assert workflow["phases"]["bottom"]["state"] == bottom_state
+    assert workflow["phases"]["top"]["state"] == top_state
 
     write_manifest(work_dir, manifest)
 

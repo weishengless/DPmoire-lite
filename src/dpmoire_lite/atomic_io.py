@@ -5,16 +5,31 @@ import errno
 import hashlib
 import os
 import platform
+import shutil
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, TextIO
+from typing import BinaryIO, Iterator, TextIO
 
 
 @dataclass(frozen=True)
 class AtomicPublishResult:
     destination: Path
     sha256: str | None
+
+
+@dataclass(frozen=True)
+class AtomicCopyPlan:
+    source: Path
+    destination: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _PublishedCopy:
+    destination: Path
+    sha256: str
 
 
 def sha256_file(path: Path) -> str:
@@ -127,6 +142,99 @@ def atomic_file_publish_no_replace(candidate: Path, destination: Path) -> None:
             str(destination),
         )
     _fsync_directory(destination.parent)
+
+
+@contextmanager
+def atomic_copy_pair_transaction_no_replace(
+    first: AtomicCopyPlan,
+    second: AtomicCopyPlan,
+) -> Iterator[None]:
+    """Publish two verified copies and roll both back unless the caller commits.
+
+    The caller's context is the formal commit boundary (for example, a manifest
+    transition). A failure reported after a rename is reconciled before rollback
+    so it cannot leave an unregistered half-pair.
+    """
+    prepared: list[tuple[Path, AtomicCopyPlan]] = []
+    published: list[_PublishedCopy] = []
+    try:
+        for plan in (first, second):
+            source = Path(plan.source)
+            destination = Path(plan.destination)
+            if source.is_symlink() or not source.is_file():
+                raise OSError(f"source is not a regular file: {source.name}")
+            if destination.exists() or destination.is_symlink():
+                raise FileExistsError(destination)
+            if sha256_file(source) != plan.sha256:
+                raise OSError(f"validated source changed: {source.name}")
+            expected_size = source.stat().st_size
+            candidate = create_candidate(destination)
+            prepared.append((candidate, plan))
+            shutil.copyfile(source, candidate)
+            fsync_path(candidate)
+            if (
+                candidate.stat().st_size != expected_size
+                or sha256_file(candidate) != plan.sha256
+            ):
+                raise OSError(
+                    f"candidate copy verification failed: {destination.name}"
+                )
+        for candidate, plan in prepared:
+            destination = Path(plan.destination)
+            try:
+                atomic_file_publish_no_replace(candidate, destination)
+            except BaseException:
+                _record_completed_rename(candidate, plan, published)
+                raise
+            published.append(
+                _PublishedCopy(destination=destination, sha256=plan.sha256)
+            )
+            if sha256_file(destination) != plan.sha256:
+                raise OSError(
+                    f"published copy verification failed: {destination.name}"
+                )
+
+        yield
+    except BaseException:
+        _rollback_published_copies(tuple(published))
+        raise
+    finally:
+        for candidate, _plan in prepared:
+            candidate.unlink(missing_ok=True)
+
+
+def _record_completed_rename(
+    candidate: Path,
+    plan: AtomicCopyPlan,
+    published: list[_PublishedCopy],
+) -> None:
+    destination = Path(plan.destination)
+    if candidate.exists() or candidate.is_symlink():
+        return
+    if destination.exists() or destination.is_symlink():
+        published.append(
+            _PublishedCopy(destination=destination, sha256=plan.sha256)
+        )
+
+
+def _rollback_published_copies(published: tuple[_PublishedCopy, ...]) -> None:
+    parents: set[Path] = set()
+    for record in reversed(published):
+        destination = record.destination
+        if destination.is_symlink() or not destination.is_file():
+            raise OSError(
+                "atomic copy rollback refused a changed published destination: "
+                f"{destination.name}"
+            )
+        if sha256_file(destination) != record.sha256:
+            raise OSError(
+                "atomic copy rollback refused a changed published hash: "
+                f"{destination.name}"
+            )
+        destination.unlink()
+        parents.add(destination.parent)
+    for parent in parents:
+        fsync_directory(parent)
 
 
 def _linux_rename_no_replace(candidate: Path, destination: Path) -> None:
