@@ -54,7 +54,7 @@ def _fail_once_on_second_relaxation_target(monkeypatch):
         atoms,
         incar_template,
         rcut,
-        potcars,
+        workflow_cutoff,
         submit_script,
     ):
         nonlocal failed
@@ -67,7 +67,7 @@ def _fail_once_on_second_relaxation_target(monkeypatch):
             atoms,
             incar_template,
             rcut,
-            potcars,
+            workflow_cutoff,
             submit_script,
         )
 
@@ -300,6 +300,67 @@ def test_stage0_preflight_aggregates_incar_potcar_and_script_errors(tmp_path):
     assert "init_INCAR" in message
     assert "POTCAR" in message
     assert "DFT_script.sh" in message
+    assert not (tmp_path / "work").exists()
+
+
+def test_stage0_preflight_rejects_nonpositive_enmax_before_writing(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+    )
+    (tmp_path / "potcars" / "H" / "POTCAR").write_text(
+        "synthetic invalid potential\n ENMAX = 0;\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="ENMAX must be finite and positive"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work").exists()
+
+
+def test_stage0_preflight_rejects_multiple_enmax_values_before_writing(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+    )
+    (tmp_path / "potcars" / "H" / "POTCAR").write_text(
+        "synthetic ambiguous potential\n ENMAX = 100;\n ENMAX = 200;\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one ENMAX"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work").exists()
+
+
+def test_stage0_preflight_rejects_ambiguous_minimal_potcar_before_writing(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        do_relaxation=False,
+        twist_val=False,
+        potcar_policy="minimal",
+    )
+    potcars = tmp_path / "potcars"
+    (potcars / "H" / "POTCAR").write_text(
+        "synthetic plain potential\n ENMAX = 100; ZVAL = 1;\n",
+        encoding="utf-8",
+    )
+    (potcars / "H_sv").mkdir()
+    (potcars / "H_sv" / "POTCAR").write_text(
+        "synthetic alternate potential\n ENMAX = 120; ZVAL = 1;\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="Ambiguous minimal POTCAR candidates"):
+        run_build(config, wait=False)
+
     assert not (tmp_path / "work").exists()
 
 
@@ -613,7 +674,7 @@ def test_stage1_generation_consumes_preflight_structures_relaxations_and_rcut(
         atoms,
         incar_template,
         rcut,
-        potcars,
+        workflow_cutoff,
         submit_script,
     ):
         observed_rcuts.append(rcut)
@@ -623,7 +684,7 @@ def test_stage1_generation_consumes_preflight_structures_relaxations_and_rcut(
             atoms,
             incar_template,
             rcut,
-            potcars,
+            workflow_cutoff,
             submit_script,
         )
 

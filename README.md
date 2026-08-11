@@ -195,7 +195,7 @@ rejected.
 | --- | --- | --- |
 | `dft_script` | string | Slurm submit script filename. The file is copied from `script_dir` into each generated calculation folder and submitted with `sbatch`. |
 | `potcar_dir` | path | Root directory containing POTCAR subfolders. |
-| `potcar_policy` | `recommend` or `minimal` | POTCAR selection policy. `recommend` uses VASP recommended element-folder mapping and is the default. `minimal` scans regular POTCAR variants in `potcar_dir` and uses the lowest-`ZVAL` candidate. |
+| `potcar_policy` | `recommend` or `minimal` | POTCAR selection policy. `recommend` uses VASP recommended element-folder mapping and is the default. `minimal` scans regular POTCAR variants in `potcar_dir` and uses the unique lowest-`ZVAL` candidate; a tie fails preflight as ambiguous. |
 | `script_dir` | path | Directory containing prepared submit scripts. |
 | `input_dir` | path | Directory containing layer POSCAR files, INCAR templates, and optional `vdw_kernel.bindat`. |
 | `work_dir` | path | Root output directory for generated stages, manifests, backups, and collected datasets. |
@@ -215,7 +215,7 @@ rejected.
 | `d_mode` | `surface_gap` or `reference_plane_gap` | `surface_gap` sets `min_z(top) - max_z(bot) = d`; `reference_plane_gap` sets the selected reference-plane mean-z distance to `d`. Defaults to `surface_gap`. |
 | `d_reference` | mapping, optional | Reference atom selectors for `reference_plane_gap`, for example `{top: [Mo], bot: [Mo]}` for the bundled MoTe2 example. Omit or use `all` to average all atoms in that layer. |
 | `k_mesh` | int | KPOINTS target. DPmoire-lite writes a Gamma mesh from the generated POSCAR in-plane cell lengths. |
-| `encut_factor` | number | INCAR `ENCUT` is rendered as `encut_factor * max(POTCAR ENMAX)` for the selected elements. |
+| `encut_factor` | number | Before generation, DPmoire-lite resolves the selected POTCAR variants for the union of top- and bottom-layer elements. Every init, relaxation, bilayer/monolayer MD, and validation INCAR uses `encut_factor * max(ENMAX)` from that workflow-wide set. Each generated POTCAR still contains only the elements in its local POSCAR, in local POSCAR order. |
 | `r_cut` | number | Value written to `ML_RCUT1` and `ML_RCUT2`. If negative, DPmoire-lite uses an automatic value based on the largest input-layer in-plane lattice length and `d`. |
 | `symm_reduce` | bool | Reduce stacking shifts by symmetry using `pymatgen`/`spglib` and write `sym_reduced_stackings.txt`. |
 | `twist_val` | bool | Generate twist validation calculation folders in stage0. Validation is not part of the MD timeline. |

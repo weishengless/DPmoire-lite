@@ -62,13 +62,47 @@ class PreparedValidationStructure:
 
 
 @dataclass(frozen=True)
+class PreparedWorkflowCutoff:
+    selected_potcars: tuple[PreparedPotcar, ...]
+    governing_potcar: PreparedPotcar
+    encut_factor: float
+    encut: float
+
+    @property
+    def max_enmax(self) -> float:
+        return self.governing_potcar.enmax
+
+    def audit_record(self) -> dict[str, object]:
+        governing = self.governing_potcar
+        return {
+            "schema": "dpmoire-lite.workflow-cutoff.v1",
+            "selected_potcars": [
+                {
+                    "element": potcar.element,
+                    "directory": potcar.source.path.parent.name,
+                    "enmax": potcar.enmax,
+                }
+                for potcar in sorted(
+                    self.selected_potcars,
+                    key=lambda item: (item.element, item.source.path.parent.name),
+                )
+            ],
+            "governing_element": governing.element,
+            "governing_potcar_directory": governing.source.path.parent.name,
+            "max_enmax": self.max_enmax,
+            "encut_factor": self.encut_factor,
+            "encut": self.encut,
+        }
+
+
+@dataclass(frozen=True)
 class BuildPreflightResult:
     stage: int | str
     structures: StructureHandler | None
     stackings: tuple[tuple[int, int], ...] = ()
     rcut: float | None = None
     templates: tuple[PreparedIncarTemplate, ...] = ()
-    potcars: tuple[PreparedPotcar, ...] = ()
+    workflow_cutoff: PreparedWorkflowCutoff | None = None
     submit_script: PreparedSource | None = None
     stage_targets: tuple[tuple[str, Path], ...] = ()
     output_dirs: tuple[Path, ...] = ()
@@ -77,6 +111,12 @@ class BuildPreflightResult:
     validation_structures: tuple[PreparedValidationStructure, ...] = ()
     warnings: tuple[PreflightDiagnostic, ...] = ()
     provenance: provenance_module.Stage1ProvenanceResult | None = None
+
+    @property
+    def potcars(self) -> tuple[PreparedPotcar, ...]:
+        if self.workflow_cutoff is None:
+            return ()
+        return self.workflow_cutoff.selected_potcars
 
 
 def _stage0_target_stages(
@@ -181,7 +221,7 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
 
     structures = _read_structures(config, diagnostics)
     rcut = None
-    potcars: tuple[PreparedPotcar, ...] = ()
+    workflow_cutoff = None
     if structures is not None:
         try:
             rcut = _resolve_rcut(config, structures)
@@ -196,6 +236,7 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
 
         elements = get_ordered_elements(structures.new_struct)
         potcars = _validate_potcars(config, elements, diagnostics)
+        workflow_cutoff = _prepare_workflow_cutoff(config, potcars)
 
     stackings = tuple(generate_stackings(config.n_sectors))
     validation_structures: tuple[PreparedValidationStructure, ...] = ()
@@ -243,7 +284,7 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
         stackings=stackings,
         rcut=rcut,
         templates=templates,
-        potcars=potcars,
+        workflow_cutoff=workflow_cutoff,
         submit_script=submit_script,
         stage_targets=stage_targets,
         output_dirs=output_dirs,
@@ -267,7 +308,7 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
 
     structures = _read_structures(config, diagnostics)
     rcut = None
-    potcars: tuple[PreparedPotcar, ...] = ()
+    workflow_cutoff = None
     if structures is not None:
         try:
             rcut = _resolve_rcut(config, structures)
@@ -281,8 +322,16 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
             )
         elements = get_ordered_elements(structures.new_struct)
         potcars = _validate_potcars(config, elements, diagnostics)
+        workflow_cutoff = _prepare_workflow_cutoff(config, potcars)
 
     manifest_result = read_manifest(config.work_dir, "rlx")
+    if workflow_cutoff is not None:
+        _validate_workflow_cutoff_provenance(
+            manifest_result,
+            workflow_cutoff,
+            diagnostics,
+            warning_diagnostics,
+        )
     stackings = _stage1_manifest_stackings(manifest_result, diagnostics)
     relaxation_records = []
     for stacking in stackings:
@@ -335,7 +384,7 @@ def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
         stackings=tuple(stackings),
         rcut=rcut,
         templates=templates,
-        potcars=potcars,
+        workflow_cutoff=workflow_cutoff,
         submit_script=submit_script,
         stage_targets=stage_targets,
         output_dirs=output_dirs,
@@ -404,6 +453,43 @@ def _stage1_manifest_stackings(
             )
             return ()
     return tuple(stackings)
+
+
+def _validate_workflow_cutoff_provenance(
+    manifest_result: ManifestReadResult,
+    workflow_cutoff: PreparedWorkflowCutoff,
+    diagnostics: list[PreflightDiagnostic],
+    warning_diagnostics: list[PreflightDiagnostic],
+) -> None:
+    if manifest_result.kind != "current" or manifest_result.manifest is None:
+        return
+
+    manifest_path = Path("rlx") / "manifest.yaml"
+    recorded = manifest_result.manifest.config_summary.get("workflow_cutoff")
+    if recorded is None:
+        warning_diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "relaxation manifest predates workflow cutoff evidence; "
+                    "Stage1 is using a newly resolved cutoff plan"
+                ),
+            )
+        )
+        return
+    if recorded != workflow_cutoff.audit_record():
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="provenance",
+                path=manifest_path,
+                reason=(
+                    "workflow cutoff plan drift between the relaxation manifest "
+                    "and current Stage1 inputs; restore the Stage0 POTCAR/config "
+                    "selection before generating MD"
+                ),
+            )
+        )
 
 
 def _stage0_templates(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
@@ -635,6 +721,10 @@ def _validate_potcars(
             )
             source = prepare_source(source_dir / "POTCAR")
             enmax = read_enmax(source.path)
+            if not np.isfinite(enmax) or enmax <= 0:
+                raise ValueError(
+                    f"ENMAX must be finite and positive in {source.path}"
+                )
             potcars.append(
                 PreparedPotcar(element=element, source=source, enmax=enmax)
             )
@@ -647,6 +737,31 @@ def _validate_potcars(
                 )
             )
     return tuple(potcars)
+
+
+def _prepare_workflow_cutoff(
+    config: DPmoireLiteConfig,
+    potcars: tuple[PreparedPotcar, ...],
+) -> PreparedWorkflowCutoff | None:
+    factor = config.encut_factor
+    if not potcars:
+        return None
+
+    governing_potcar = min(
+        potcars,
+        key=lambda potcar: (
+            -potcar.enmax,
+            potcar.element,
+            potcar.source.path.parent.name,
+        ),
+    )
+    encut = governing_potcar.enmax * factor
+    return PreparedWorkflowCutoff(
+        selected_potcars=potcars,
+        governing_potcar=governing_potcar,
+        encut_factor=factor,
+        encut=float(encut),
+    )
 
 
 def _validate_relaxation(

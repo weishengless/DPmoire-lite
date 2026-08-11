@@ -132,7 +132,7 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 | --- | --- | --- |
 | `dft_script` | 字符串 | Slurm 提交脚本文件名。该文件会从 `script_dir` 复制到每个生成的计算目录中，并用 `sbatch` 提交。 |
 | `potcar_dir` | 路径 | POTCAR 子目录的根目录。 |
-| `potcar_policy` | `recommend` 或 `minimal` | POTCAR 选择策略。`recommend` 使用 VASP 推荐映射并作为默认值；`minimal` 会扫描 `potcar_dir` 中的常规 POTCAR 变体并选择 `ZVAL` 最小的候选。 |
+| `potcar_policy` | `recommend` 或 `minimal` | POTCAR 选择策略。`recommend` 使用 VASP 推荐映射并作为默认值；`minimal` 会扫描 `potcar_dir` 中的常规 POTCAR 变体并选择唯一的最低 `ZVAL` 候选；最低值并列时会因歧义而在 preflight 失败。 |
 | `script_dir` | 路径 | 存放提交脚本的目录。 |
 | `input_dir` | 路径 | 存放单层 POSCAR、INCAR 模板和可选 `vdw_kernel.bindat` 的目录。 |
 | `work_dir` | 路径 | 生成 stage、manifest、备份目录和数据集文件的根目录。 |
@@ -152,7 +152,7 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 | `d_mode` | `surface_gap` 或 `reference_plane_gap` | `surface_gap` 表示 `min_z(top) - max_z(bot) = d`；`reference_plane_gap` 表示所选参考原子的平均 z 坐标差为 `d`。默认值为 `surface_gap`。 |
 | `d_reference` | 映射，可选 | `reference_plane_gap` 使用的参考原子选择器，例如内置 MoTe2 示例可用 `{top: [Mo], bot: [Mo]}`。省略或使用 `all` 表示该层所有原子。 |
 | `k_mesh` | 整数 | KPOINTS 目标值。程序会根据生成后 POSCAR 的面内晶格长度写 Gamma-centered mesh。 |
-| `encut_factor` | 数值 | INCAR 中的 `ENCUT` 会写成 `encut_factor * max(POTCAR ENMAX)`。 |
+| `encut_factor` | 数值 | 生成前，DPmoire-lite 会解析 top layer 与 bottom layer 元素并集所选中的 POTCAR 变体。init、relaxation、双层/单层 MD 和 validation 的所有 INCAR 都统一使用该工作流集合中的 `encut_factor * max(ENMAX)`；每个目录的 POTCAR 仍只包含其本地 POSCAR 中的元素，并保持本地 POSCAR 元素顺序。 |
 | `r_cut` | 数值 | 写入 `ML_RCUT1` 和 `ML_RCUT2` 的值。若为负数，则根据最大输入单层面内晶格长度和 `d` 自动估算。 |
 | `symm_reduce` | 布尔值 | 是否用 `pymatgen`/`spglib` 对堆垛平移做对称性约化，并写出 `sym_reduced_stackings.txt`。 |
 | `twist_val` | 布尔值 | stage0 是否生成 twist validation 计算目录。validation 不属于 MD 时间线。 |

@@ -14,13 +14,13 @@ from ase.io.vasp import read_vasp, write_vasp
 from .atomic_io import sha256_file
 from .build_preflight import (
     PreparedValidationStructure,
+    PreparedWorkflowCutoff,
     preflight_stage0,
     preflight_stage1,
 )
 from .config import ConfigError, DPmoireLiteConfig, load_config
 from .inputs import (
     PreparedIncarTemplate,
-    PreparedPotcar,
     PreparedSource,
     copy_prepared_source,
     get_ordered_elements,
@@ -93,8 +93,11 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
         raise RuntimeError("Stage0 preflight did not return prepared structures and rcut")
     if preflight.submit_script is None:
         raise RuntimeError("Stage0 preflight did not return a prepared submit script")
+    if preflight.workflow_cutoff is None:
+        raise RuntimeError("Stage0 preflight did not return a workflow cutoff plan")
     structures = preflight.structures
     rcut = preflight.rcut
+    workflow_cutoff = preflight.workflow_cutoff
     stackings = preflight.stackings
     templates = {template.name: template for template in preflight.templates}
     output_dirs = iter(preflight.output_dirs)
@@ -126,7 +129,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
             structures,
             init_dir,
             _prepared_template(templates, "init_INCAR"),
-            preflight.potcars,
+            workflow_cutoff,
             preflight.submit_script,
             rcut,
             generated_at,
@@ -140,7 +143,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
             stackings,
             relaxation_dirs,
             _prepared_template(templates, "rlx_INCAR"),
-            preflight.potcars,
+            workflow_cutoff,
             preflight.submit_script,
             rcut,
             generated_at,
@@ -153,7 +156,7 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
             preflight.validation_structures,
             validation_dirs,
             _prepared_template(templates, "val_INCAR"),
-            preflight.potcars,
+            workflow_cutoff,
             preflight.submit_script,
             rcut,
             generated_at,
@@ -169,8 +172,11 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         raise RuntimeError("Stage1 preflight did not return prepared structures and rcut")
     if preflight.submit_script is None:
         raise RuntimeError("Stage1 preflight did not return a prepared submit script")
+    if preflight.workflow_cutoff is None:
+        raise RuntimeError("Stage1 preflight did not return a workflow cutoff plan")
     structures = preflight.structures
     rcut = preflight.rcut
+    workflow_cutoff = preflight.workflow_cutoff
     stackings = preflight.stackings
     templates = {template.name: template for template in preflight.templates}
     output_dirs = iter(preflight.output_dirs)
@@ -231,7 +237,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             atoms,
             _prepared_template(templates, "MD_INCAR"),
             rcut,
-            preflight.potcars,
+            workflow_cutoff,
             preflight.submit_script,
         )
         if config.vasp_ml:
@@ -270,7 +276,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
                 atoms_sc,
                 _prepared_template(templates, "MD_monolayer_INCAR"),
                 rcut,
-                preflight.potcars,
+                workflow_cutoff,
                 preflight.submit_script,
             )
             if config.vasp_ml:
@@ -288,7 +294,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         Manifest(
             stage="md",
             generated_at=generated_at,
-            config_summary=_config_summary(config),
+            config_summary=_config_summary(config, workflow_cutoff),
             directories=[relative_to_workdir(config.work_dir, path) for path in directories],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
@@ -420,7 +426,7 @@ def _build_init_mlff(
     structures: StructureHandler,
     init_dir: Path,
     template: PreparedIncarTemplate,
-    potcars: tuple[PreparedPotcar, ...],
+    workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
@@ -444,7 +450,7 @@ def _build_init_mlff(
         atoms,
         template,
         rcut,
-        potcars,
+        workflow_cutoff,
         submit_script,
     )
     jobs = _submit_dirs(config, runner, [init_dir], wait)
@@ -456,7 +462,7 @@ def _build_init_mlff(
         Manifest(
             stage="init_mlff",
             generated_at=generated_at,
-            config_summary=_config_summary(config),
+            config_summary=_config_summary(config, workflow_cutoff),
             directories=[relative_to_workdir(config.work_dir, init_dir)],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
@@ -470,7 +476,7 @@ def _build_relaxations(
     stackings: tuple[tuple[int, int], ...],
     target_dirs: tuple[Path, ...],
     template: PreparedIncarTemplate,
-    potcars: tuple[PreparedPotcar, ...],
+    workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
@@ -502,7 +508,7 @@ def _build_relaxations(
             atoms,
             template,
             rcut,
-            potcars,
+            workflow_cutoff,
             submit_script,
         )
         directories.append(target)
@@ -518,7 +524,7 @@ def _build_relaxations(
         Manifest(
             stage="rlx",
             generated_at=generated_at,
-            config_summary=_config_summary(config),
+            config_summary=_config_summary(config, workflow_cutoff),
             directories=[relative_to_workdir(config.work_dir, path) for path in directories],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
@@ -534,7 +540,7 @@ def _build_validation(
     validation_structures: tuple[PreparedValidationStructure, ...],
     target_dirs: tuple[Path, ...],
     template: PreparedIncarTemplate,
-    potcars: tuple[PreparedPotcar, ...],
+    workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
@@ -553,7 +559,7 @@ def _build_validation(
             atoms,
             template,
             rcut,
-            potcars,
+            workflow_cutoff,
             submit_script,
         )
     jobs = _submit_dirs(config, runner, directories, wait)
@@ -562,7 +568,7 @@ def _build_validation(
         Manifest(
             stage="validation",
             generated_at=generated_at,
-            config_summary=_config_summary(config),
+            config_summary=_config_summary(config, workflow_cutoff),
             directories=[relative_to_workdir(config.work_dir, path) for path in directories],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
@@ -709,15 +715,19 @@ def _write_vasp_inputs(
     atoms: Atoms,
     template: PreparedIncarTemplate,
     rcut: float,
-    potcars: tuple[PreparedPotcar, ...],
+    workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
 ) -> None:
     elements = _ordered_elements(atoms)
-    max_enmax = write_prepared_potcar(elements, potcars, output_dir / "POTCAR")
+    write_prepared_potcar(
+        elements,
+        workflow_cutoff.selected_potcars,
+        output_dir / "POTCAR",
+    )
     render_prepared_incar(
         template,
         output_dir / "INCAR",
-        encut=max_enmax * config.encut_factor,
+        encut=workflow_cutoff.encut,
         rcut1=rcut,
         rcut2=rcut,
     )
@@ -753,7 +763,10 @@ def _submit_dirs(config: DPmoireLiteConfig, runner: SlurmRunner | None, director
     return runner.wait(jobs) if wait else jobs
 
 
-def _config_summary(config: DPmoireLiteConfig) -> dict[str, object]:
+def _config_summary(
+    config: DPmoireLiteConfig,
+    workflow_cutoff: PreparedWorkflowCutoff,
+) -> dict[str, object]:
     d_reference = None
     if config.d_reference is not None:
         d_reference = {
@@ -770,5 +783,6 @@ def _config_summary(config: DPmoireLiteConfig) -> dict[str, object]:
         "potcar_policy": config.potcar_policy,
         "k_mesh": config.k_mesh,
         "encut_factor": config.encut_factor,
+        "workflow_cutoff": workflow_cutoff.audit_record(),
         "r_cut": config.r_cut,
     }

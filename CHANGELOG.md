@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- All generated stages now share one workflow-wide ENCUT derived from the maximum ENMAX across the selected top- and bottom-layer POTCAR variants, while each generated POTCAR remains local to its POSCAR species and order. Stage1 rejects drift from new relaxation-manifest cutoff evidence, and preflight rejects ambiguous ENMAX or lowest-`ZVAL` selections.
 - Generated POTCAR files are now byte-concatenated from source potentials without inserting extra blank lines.
 - Mo and W now resolve to the VASP-recommended `Mo_sv` and `W_sv` potentials when those directories are available.
 - Generated KPOINTS now use each output POSCAR's actual in-plane cell lengths, so primitive and supercell stages get distinct meshes.

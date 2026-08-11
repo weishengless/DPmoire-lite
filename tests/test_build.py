@@ -10,6 +10,7 @@ import yaml
 import dpmoire_lite.build as build_module
 from dpmoire_lite.build import _ordered_elements, build_stage0, build_stage1, build_stage_all, run_build
 from dpmoire_lite.config import ConfigError, load_config
+from dpmoire_lite.incar import parse_incar
 from dpmoire_lite.manifest import Manifest, write_manifest
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
 
@@ -96,6 +97,41 @@ def write_build_config(root, **overrides):
     return path
 
 
+def write_mixed_layer_inputs(root):
+    input_dir = root / "input"
+    cell = [4.0, 4.0, 12.0]
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=cell,
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=cell,
+            pbc=True,
+        ),
+        direct=True,
+    )
+    potcar_payloads = {
+        "V_sv": "synthetic-v\n ENMAX = 240;\n",
+        "Nb_sv": "synthetic-nb\n ENMAX = 300;\n",
+        "Te": "synthetic-te\n ENMAX = 260;\n",
+    }
+    for directory, payload in potcar_payloads.items():
+        target = root / "potcars" / directory
+        target.mkdir(parents=True)
+        (target / "POTCAR").write_text(payload, encoding="utf-8")
+    return potcar_payloads
+
+
 def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_block=False):
     target = work / "rlx" / name
     target.mkdir(parents=True, exist_ok=True)
@@ -110,6 +146,19 @@ def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_bl
         encoding="utf-8",
     )
     return target
+
+
+def complete_generated_relaxation_and_update_config(root, config, **updates):
+    relaxation = root / "work" / "rlx" / "0_0"
+    shutil.copy2(relaxation / "POSCAR", relaxation / "CONTCAR")
+    (relaxation / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    config_data["stage"] = 1
+    config_data.update(updates)
+    config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
 
 
 def write_relaxation_manifest(work, stackings):
@@ -189,6 +238,187 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "0_0" / "INCAR").exists()
     assert (work / "rlx" / "1_0" / "KPOINTS").exists()
     assert (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+
+    run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    init_dir = work / "init_mlff"
+    rlx_dir = work / "rlx" / "0_0"
+    expected_encut = 450.0
+    for directory in (init_dir, rlx_dir):
+        analysis = parse_incar(
+            (directory / "INCAR").read_text(encoding="utf-8"),
+            source_name=str(directory / "INCAR"),
+        ).analyze()
+        assert float(analysis.effective_value("ENCUT")) == expected_encut
+
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    init_elements = _ordered_elements(read_vasp(init_dir / "POSCAR"))
+    assert (init_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+        payload_by_element[element] for element in init_elements
+    )
+    expected_evidence = {
+        "schema": "dpmoire-lite.workflow-cutoff.v1",
+        "selected_potcars": [
+            {"element": "Nb", "directory": "Nb_sv", "enmax": 300.0},
+            {"element": "Te", "directory": "Te", "enmax": 260.0},
+            {"element": "V", "directory": "V_sv", "enmax": 240.0},
+        ],
+        "governing_element": "Nb",
+        "governing_potcar_directory": "Nb_sv",
+        "max_enmax": 300.0,
+        "encut_factor": 1.5,
+        "encut": expected_encut,
+    }
+    for stage in ("init_mlff", "rlx"):
+        manifest = yaml.safe_load(
+            (work / stage / "manifest.yaml").read_text(encoding="utf-8")
+        )
+        assert manifest["config_summary"]["workflow_cutoff"] == expected_evidence
+
+
+def test_stage0_validation_uses_workflow_wide_encut_and_local_potcar_order(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        init_mlff=False,
+        do_relaxation=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        twist_val=True,
+        min_val_n=1,
+        max_val_n=1,
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+
+    run_build(config, wait=False)
+
+    validation_root = tmp_path / "work" / "validation"
+    manifest = yaml.safe_load(
+        (validation_root / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    validation_dir = validation_root / manifest["angles"][0]
+    analysis = parse_incar(
+        (validation_dir / "INCAR").read_text(encoding="utf-8"),
+        source_name=str(validation_dir / "INCAR"),
+    ).analyze()
+    assert float(analysis.effective_value("ENCUT")) == 450.0
+
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Nb": potcar_payloads["Nb_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    elements = _ordered_elements(read_vasp(validation_dir / "POSCAR"))
+    assert (validation_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+        payload_by_element[element] for element in elements
+    )
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == 450.0
+
+
+def test_stage1_uses_workflow_wide_encut_for_bilayer_and_monolayer_md(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        include_monolayer_md=True,
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+    run_build(config, wait=False)
+    complete_generated_relaxation_and_update_config(tmp_path, config)
+
+    run_build(config, wait=False)
+
+    md_dir = tmp_path / "work" / "md"
+    expected_encut = 450.0
+    for directory in (md_dir / "0_0", md_dir / "top_layer", md_dir / "bot_layer"):
+        analysis = parse_incar(
+            (directory / "INCAR").read_text(encoding="utf-8"),
+            source_name=str(directory / "INCAR"),
+        ).analyze()
+        assert float(analysis.effective_value("ENCUT")) == expected_encut
+
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Nb": potcar_payloads["Nb_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    for layer_name in ("top_layer", "bot_layer"):
+        layer_dir = md_dir / layer_name
+        elements = _ordered_elements(read_vasp(layer_dir / "POSCAR"))
+        assert (layer_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+            payload_by_element[element] for element in elements
+        )
+    manifest = yaml.safe_load((md_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == expected_encut
+    assert manifest["config_summary"]["workflow_cutoff"]["governing_element"] == "Nb"
+
+
+def test_stage1_rejects_workflow_cutoff_drift_from_stage0_manifest(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        include_monolayer_md=False,
+        encut_factor=1.5,
+    )
+    write_mixed_layer_inputs(tmp_path)
+    run_build(config, wait=False)
+    complete_generated_relaxation_and_update_config(
+        tmp_path,
+        config,
+        encut_factor=1.6,
+    )
+
+    with pytest.raises(RuntimeError, match="workflow cutoff.*drift"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_warns_when_manifest_predates_workflow_cutoff_evidence(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+    write_relaxation_manifest(work, [(0, 0)])
+
+    with pytest.warns(UserWarning, match="predates workflow cutoff evidence"):
+        run_build(config, wait=False)
+
+    manifest = yaml.safe_load((work / "md" / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == 150.0
 
 
 @pytest.mark.parametrize(("sc_rlx", "expected_rlx_mesh"), [(False, "5 5 1"), (True, "3 3 1")])

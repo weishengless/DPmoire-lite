@@ -228,7 +228,16 @@ def resolve_minimal_valence_potcar_dir(element: str, potcar_dir: Path) -> Path:
         candidates.append((read_zval(potcar), 0 if path.name == element else 1, path.name, path))
     if not candidates:
         raise FileNotFoundError(f"No regular POTCAR candidates found for {element} in {potcar_dir}")
-    return sorted(candidates)[0][3]
+    ranked = sorted(candidates)
+    minimum_zval = ranked[0][0]
+    minimum_candidates = [candidate for candidate in ranked if candidate[0] == minimum_zval]
+    if len(minimum_candidates) != 1:
+        names = ", ".join(candidate[2] for candidate in minimum_candidates)
+        raise ValueError(
+            f"Ambiguous minimal POTCAR candidates for {element} with "
+            f"ZVAL={minimum_zval}: {names}"
+        )
+    return ranked[0][3]
 
 
 def _is_regular_potcar_variant(element: str, name: str) -> bool:
@@ -239,10 +248,17 @@ def _is_regular_potcar_variant(element: str, name: str) -> bool:
 
 def read_enmax(potcar_file: Path) -> float:
     text = Path(potcar_file).read_text(encoding="utf-8", errors="ignore")
-    match = re.search(r"\bENMAX\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*;", text)
-    if match is None:
+    matches = re.findall(
+        r"\bENMAX\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*;",
+        text,
+    )
+    if not matches:
         raise ValueError(f"ENMAX not found in {potcar_file}")
-    return float(match.group(1))
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one ENMAX in {potcar_file}, found {len(matches)}"
+        )
+    return float(matches[0])
 
 
 def read_zval(potcar_file: Path) -> float:

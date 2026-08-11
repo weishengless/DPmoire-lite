@@ -61,6 +61,19 @@ Each generated folder receives:
 - the configured submit script
 - optional `vdw_kernel.bindat` if required by the INCAR template
 
+Before writing any calculation folder, preflight resolves the selected POTCAR
+variant and ENMAX for the union of all elements in the top and bottom input
+layers. One workflow cutoff is then fixed as
+`ENCUT = encut_factor * max(selected ENMAX)` and reused by init, relaxation,
+bilayer and monolayer MD, and validation inputs. A folder's POTCAR remains local:
+it contains only that folder's POSCAR elements in POSCAR order. Stage manifests
+record the selected POTCAR directory names, ENMAX values, governing element,
+factor, and final ENCUT; they never contain POTCAR payloads.
+Stage1 compares its newly resolved plan with cutoff evidence in a newly generated
+relaxation manifest and fails before MD writes if it has drifted. Historical
+manifests without that evidence remain usable with an explicit warning and a
+newly resolved plan.
+
 If any target stage exists, including an empty directory, DPmoire-lite stops before modifying any file. It never moves, backs up, overwrites, or rebuilds a stage in place. Explicitly delete the complete conflicting stage, then rerun the build.
 
 ## 3. Init MLFF Paths
