@@ -22,6 +22,34 @@ from test_build import write_build_config
 
 
 MLAB_FIXTURES = Path(__file__).parent / "data" / "mlab"
+CONFIGURATION_2_MARKER = "     Configuration num.      2"
+CONFIGURATION_3_MARKER = "     Configuration num.      3"
+CONFIGURATION_4_MARKER = "     Configuration num.      4"
+CONFIGURATION_COUNT_2 = (
+    "     The number of configurations\n"
+    "--------------------------------------------------\n"
+    "         2"
+)
+CONFIGURATION_COUNT_4 = CONFIGURATION_COUNT_2[:-1] + "4"
+INITIAL_LATTICE_ROW = (
+    "   4.000000000000000E+000  0.000000000000000E+000"
+    "  0.000000000000000E+000"
+)
+STRAINED_LATTICE_ROW = (
+    "   4.040000000000000E+000  0.000000000000000E+000"
+    "  0.000000000000000E+000"
+)
+
+
+def _replace_once(text, old, new):
+    assert text.count(old) == 1
+    return text.replace(old, new, 1)
+
+
+def _split_second_configuration(text):
+    prefix, separator, second_configuration = text.partition(CONFIGURATION_2_MARKER)
+    assert separator
+    return prefix, second_configuration
 
 
 class SyntheticCalculationAdapter:
@@ -104,6 +132,62 @@ def _write_valid_step1(directory):
     return 0
 
 
+def _write_variable_cell_step1(directory):
+    text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+    prefix, second_configuration = _split_second_configuration(text)
+    second_configuration = _replace_once(
+        second_configuration,
+        INITIAL_LATTICE_ROW,
+        STRAINED_LATTICE_ROW,
+    )
+    (directory / "ML_ABN").write_text(
+        prefix + CONFIGURATION_2_MARKER + second_configuration,
+        encoding="utf-8",
+    )
+    (directory / "ML_FFN").write_bytes(b"synthetic-variable-cell-force-field\n")
+    return 0
+
+
+def _write_variable_cell_step2(directory):
+    step1_seed = (directory / "ML_AB").read_text(encoding="utf-8")
+    assert (directory / "ML_FF").read_bytes() == (
+        b"synthetic-variable-cell-force-field\n"
+    )
+    output = _replace_once(
+        step1_seed,
+        CONFIGURATION_COUNT_2,
+        CONFIGURATION_COUNT_4,
+    )
+
+    source = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+    _prefix, top_configuration = _split_second_configuration(source)
+    top_anchor = CONFIGURATION_3_MARKER + top_configuration
+
+    top_variable = _replace_once(
+        top_configuration,
+        INITIAL_LATTICE_ROW,
+        STRAINED_LATTICE_ROW,
+    )
+    top_variable = _replace_once(
+        top_variable,
+        "   0.000000000000000E+000  0.000000000000000E+000"
+        "  1.100000000000000E+000",
+        "   0.000000000000000E+000  0.000000000000000E+000"
+        "  1.200000000000000E+000",
+    )
+    top_variable = _replace_once(
+        top_variable,
+        "   2.100000000000000E+000  2.000000000000000E+000"
+        "  2.000000000000000E+000",
+        "   2.200000000000000E+000  2.000000000000000E+000"
+        "  2.000000000000000E+000",
+    )
+    output += top_anchor + CONFIGURATION_4_MARKER + top_variable
+    (directory / "ML_ABN").write_text(output, encoding="utf-8")
+    (directory / "ML_FFN").write_bytes(b"synthetic-variable-cell-final-ff\n")
+    return 0
+
+
 def _write_valid_step2(directory):
     assert (directory / "ML_AB").read_bytes() == (
         MLAB_FIXTURES / "complete_vasp_651.mlab"
@@ -180,6 +264,133 @@ def test_workflow_runs_both_phases_through_one_adapter_and_publishes_final_seed(
         "ml_ff_sha256": hashlib.sha256((root / "ML_FFN").read_bytes()).hexdigest(),
     }
     _assert_no_seed_candidates(root)
+
+
+def test_workflow_accepts_anchored_variable_cell_trajectories_and_publishes_seed(
+    tmp_path,
+):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_variable_cell_step1, "step2": _write_variable_cell_step2},
+    )
+
+    result = InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1", "step2"]
+    workflow = result.init_workflow
+    root = work_dir / "init_mlff"
+    assert workflow["state"] == "complete"
+    assert workflow["phases"]["bottom"]["state"] == "complete"
+    assert workflow["phases"]["top"]["state"] == "complete"
+    assert (root / "top" / "ML_AB").read_bytes() == (
+        root / "bottom" / "ML_ABN"
+    ).read_bytes()
+    assert (root / "ML_ABN").read_bytes() == (root / "top" / "ML_ABN").read_bytes()
+    assert (root / "ML_FFN").read_bytes() == (root / "top" / "ML_FFN").read_bytes()
+    assert init_mlff_module.parse_mlab(root / "ML_ABN").complete_count == 4
+
+
+def test_phase_anchor_requires_lattice_and_positions_in_same_configuration(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def write_split_anchor_step1(directory):
+        _write_variable_cell_step1(directory)
+        text = (directory / "ML_ABN").read_text(encoding="utf-8")
+        first_configuration, second_configuration = _split_second_configuration(text)
+        first_anchor_position = (
+            "   0.000000000000000E+000  0.000000000000000E+000"
+            "  1.000000000000000E+000"
+        )
+        displaced_first_position = (
+            "   0.000000000000000E+000  0.000000000000000E+000"
+            "  1.500000000000000E+000"
+        )
+        first_configuration = _replace_once(
+            first_configuration,
+            first_anchor_position,
+            displaced_first_position,
+        )
+        top_positions = (
+            (
+                "   0.000000000000000E+000  0.000000000000000E+000"
+                "  1.100000000000000E+000",
+                first_anchor_position,
+            ),
+            (
+                "   2.100000000000000E+000  2.000000000000000E+000"
+                "  2.000000000000000E+000",
+                "   2.000000000000000E+000  2.000000000000000E+000"
+                "  2.000000000000000E+000",
+            ),
+        )
+        for displaced, anchored in top_positions:
+            second_configuration = _replace_once(
+                second_configuration,
+                displaced,
+                anchored,
+            )
+        (directory / "ML_ABN").write_text(
+            first_configuration + CONFIGURATION_2_MARKER + second_configuration,
+            encoding="utf-8",
+        )
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": write_split_anchor_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="joint periodic POSCAR anchor"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    workflow = _manifest(work_dir).init_workflow
+    assert workflow["state"] == "step-1-failed"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    assert not (work_dir / "init_mlff" / "ML_ABN").exists()
+
+
+def test_phase_rejects_singular_non_anchor_lattice(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def write_singular_step1(directory):
+        _write_variable_cell_step1(directory)
+        text = (directory / "ML_ABN").read_text(encoding="utf-8")
+        prefix, second_configuration = _split_second_configuration(text)
+        regular_lattice_row = (
+            "   0.000000000000000E+000  4.000000000000000E+000"
+            "  0.000000000000000E+000"
+        )
+        singular_lattice_row = (
+            "   0.000000000000000E+000  0.000000000000000E+000"
+            "  0.000000000000000E+000"
+        )
+        second_configuration = _replace_once(
+            second_configuration,
+            regular_lattice_row,
+            singular_lattice_row,
+        )
+        (directory / "ML_ABN").write_text(
+            prefix + CONFIGURATION_2_MARKER + second_configuration,
+            encoding="utf-8",
+        )
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": write_singular_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="phase structure"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    workflow = _manifest(work_dir).init_workflow
+    assert workflow["state"] == "step-1-failed"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    assert not (work_dir / "init_mlff" / "ML_ABN").exists()
 
 
 def test_nonzero_step1_fails_closed_and_cannot_be_retried_implicitly(tmp_path):

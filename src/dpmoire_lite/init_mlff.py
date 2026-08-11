@@ -583,7 +583,7 @@ def _validate_phase_output(
         configurations = parsed.configurations[prior_parsed.complete_count :]
 
     if not configurations or any(
-        not _configuration_matches_phase_shape(configuration, expected_atoms)
+        not _configuration_has_valid_phase_structure(configuration, expected_atoms)
         for configuration in configurations
     ):
         raise InitMlffWorkflowError(
@@ -598,15 +598,16 @@ def _validate_phase_output(
             f"init MLFF {request.phase} output invariant failed: "
             "ML_ABN species order does not match POSCAR evidence"
         )
-    # A training run may add displaced MD frames, but each phase must retain at
-    # least one periodic-image-equivalent configuration that anchors it to POSCAR.
+    # A training run may add displaced, variable-cell MD frames, but each phase
+    # must retain one configuration that jointly anchors lattice and positions
+    # to POSCAR.
     if not any(
-        _configuration_matches_periodic_positions(configuration, expected_atoms)
+        _configuration_matches_phase_anchor(configuration, expected_atoms)
         for configuration in configurations
     ):
         raise InitMlffWorkflowError(
             f"init MLFF {request.phase} output invariant failed: "
-            "ML_ABN positions do not match periodic POSCAR evidence"
+            "ML_ABN lattice and positions do not contain a joint periodic POSCAR anchor"
         )
     try:
         if (
@@ -648,9 +649,26 @@ def _parse_complete_mlab(path: Path, phase: str) -> MlabParseResult:
     return parsed
 
 
-def _configuration_matches_phase_shape(configuration, atoms) -> bool:
+def _configuration_has_valid_phase_structure(configuration, atoms) -> bool:
     if configuration.n_atoms != len(atoms):
         return False
+    lattice = np.asarray(configuration.lattice, dtype=float)
+    if lattice.shape != (3, 3) or not np.all(np.isfinite(lattice)):
+        return False
+    try:
+        np.linalg.solve(lattice, np.eye(3))
+    except (np.linalg.LinAlgError, ValueError):
+        return False
+    return True
+
+
+def _configuration_matches_phase_anchor(configuration, atoms) -> bool:
+    if not _configuration_matches_poscar_lattice(configuration, atoms):
+        return False
+    return _configuration_matches_periodic_positions(configuration, atoms)
+
+
+def _configuration_matches_poscar_lattice(configuration, atoms) -> bool:
     return bool(
         np.allclose(
             np.asarray(configuration.lattice, dtype=float),
