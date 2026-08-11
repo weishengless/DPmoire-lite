@@ -48,7 +48,8 @@ run VASP.
 
 Stage0 can generate three independent groups, controlled by config tags:
 
-- `init_mlff/` when `init_mlff: true`.
+- `init_mlff/` when `init_mlff: true`; `init_mlff_mode` selects the legacy
+  single-folder or two-phase static layout.
 - `rlx/<i>_<j>/` stacking relaxation folders when `do_relaxation: true`.
 - `validation/<angle>/` twist validation folders when `twist_val: true`.
 
@@ -87,6 +88,34 @@ Manual path:
 2. Run `DPmoireLite build config.yaml`.
 3. Submit or run `init_mlff/` manually on the desired cluster.
 4. Ensure `init_mlff/ML_ABN` and `init_mlff/ML_FFN` exist before stage1.
+
+Auditable two-phase preparation:
+
+```yaml
+stage: 0
+submit: false
+init_mlff: true
+init_mlff_mode: single-job
+init_bottom_incar: init_bottom_INCAR
+init_top_incar: init_top_INCAR
+```
+
+This explicit mode preflights both layer structures, both scientific INCAR
+templates, the submit-script source, every selected POTCAR/ENMAX, the shared
+workflow cutoff, and all target paths before formal publication. It then creates
+independent `init_mlff/bottom/` and `init_mlff/top/` directories. Each contains a
+complete static VASP input set built from its own layer and cell; no POSCAR,
+POTCAR, or species-dependent INCAR fields are copied from one layer over the
+other. The complete candidate tree and its manifest are published together.
+
+`init_mlff/manifest.yaml` uses `dpmoire-lite.init-workflow.v1`, records bottom as
+`step-1-ready` and top as `planned`, and stores sizes/SHA-256 identities for the
+static files plus prepared template/submit sources. This evidence can detect a
+later conflict without exposing POTCAR contents or other private payloads.
+
+In the current unit, `single-job` is workspace preparation only and therefore
+requires `submit: false`. Output validation and seed promotion, wrapper
+rendering, and one-command Slurm submission are deliberately not active yet.
 
 Non-wait submit path:
 
@@ -136,6 +165,9 @@ symmetry-equivalent stackings and writes `sym_reduced_stackings.txt`.
 ## 5. Submitting Stage0
 
 Set `submit: true` to submit generated folders with Slurm.
+
+This applies to the default `init_mlff_mode: manual`. The preparatory
+`single-job` mode currently rejects `submit: true` before writing any target.
 
 Without `--wait`, DPmoire-lite submits every folder requested by the current
 stage and exits:

@@ -717,6 +717,8 @@ def test_build_help_marks_wait_temporarily_disabled_for_submitted_workflows(caps
     assert "temporarily disabled" in help_text
     assert "submit: true" in help_text
     assert "stage: all is unavailable" in help_text
+    assert "init_mlff_mode defaults to manual" in help_text
+    assert "single-job prepares separate bottom/top static inputs" in help_text
 
 
 def test_build_error_recommends_manual_submission(tmp_path):
@@ -828,6 +830,9 @@ def test_workflow_guides_document_bundled_example_defaults():
     assert bundled_config["auto_resub"] is False
     assert bundled_config["potcar_policy"] == "recommend"
     assert bundled_config["preserve_grid_shift_md"] is False
+    assert bundled_config["init_mlff_mode"] == "manual"
+    assert bundled_config["init_bottom_incar"] == "init_bottom_INCAR"
+    assert bundled_config["init_top_incar"] == "init_top_INCAR"
     assert tuple(bundled_config["outcar_patterns"]) == DEFAULT_OUTCAR_PATTERNS
 
     guide_anchors = {
@@ -836,12 +841,16 @@ def test_workflow_guides_document_bundled_example_defaults():
             ("submitted", "--wait", "disabled", "auto_resub", "not production-ready"),
             ("stage1", "clears md constraints", "default"),
             ("seed-aware", "default"),
+            ("init_mlff_mode: single-job", "init_mlff/bottom", "init_mlff/top"),
+            ("workspace preparation only", "submit: false"),
         ),
         "workflow_CH.md": (
             ("stage: all", "暂时不可用"),
             ("submitted", "--wait", "暂时关闭", "auto_resub", "不具备生产可用性"),
             ("stage1", "默认清除 md 约束"),
             ("seed-aware", "默认"),
+            ("init_mlff_mode: single-job", "init_mlff/bottom", "init_mlff/top"),
+            ("只负责准备工作区", "submit: false"),
         ),
     }
     for guide_name, semantic_anchors in guide_anchors.items():
@@ -871,6 +880,8 @@ def test_init_example_copies_complete_bundled_tree(tmp_path):
         "input/POSCAR",
         "input/bot_layer.poscar",
         "input/init_INCAR",
+        "input/init_bottom_INCAR",
+        "input/init_top_INCAR",
         "input/rlx_INCAR",
         "input/top_layer.poscar",
         "input/val_INCAR",
@@ -948,6 +959,8 @@ def test_wheel_example_tree_matches_source(_fg2_wheel_path):
         "input/POSCAR",
         "input/bot_layer.poscar",
         "input/init_INCAR",
+        "input/init_bottom_INCAR",
+        "input/init_top_INCAR",
         "input/rlx_INCAR",
         "input/top_layer.poscar",
         "input/val_INCAR",

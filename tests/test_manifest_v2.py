@@ -15,6 +15,43 @@ def _write_yaml(work_dir, stage, data):
     return path
 
 
+def _valid_init_workflow():
+    static_inputs = {
+        name: {"size": index + 1, "sha256": f"{index + 1:x}" * 64}
+        for index, name in enumerate(("POSCAR", "POTCAR", "INCAR", "KPOINTS", "sub"))
+    }
+    return {
+        "schema": "dpmoire-lite.init-workflow.v1",
+        "mode": "single-job",
+        "state": "step-1-ready",
+        "submit_source": {"name": "sub", "size": 7, "sha256": "a" * 64},
+        "phases": {
+            "bottom": {
+                "role": "step-1",
+                "state": "step-1-ready",
+                "directory": "init_mlff/bottom",
+                "incar_template": {
+                    "name": "init_bottom_INCAR",
+                    "size": 8,
+                    "sha256": "b" * 64,
+                },
+                "static_inputs": static_inputs,
+            },
+            "top": {
+                "role": "step-2",
+                "state": "planned",
+                "directory": "init_mlff/top",
+                "incar_template": {
+                    "name": "init_top_INCAR",
+                    "size": 9,
+                    "sha256": "c" * 64,
+                },
+                "static_inputs": static_inputs,
+            },
+        },
+    }
+
+
 def test_read_manifest_reports_missing_separately(tmp_path):
     work_dir = tmp_path / "work"
 
@@ -83,6 +120,62 @@ def test_manifest_v2_round_trip_preserves_extension_sections(tmp_path):
     assert result.kind == "current"
     assert result.manifest is not None
     assert asdict(result.manifest) == asdict(manifest)
+
+
+def test_init_workflow_v1_round_trip_preserves_bounded_evidence(tmp_path):
+    work_dir = tmp_path / "work"
+    manifest = Manifest(
+        stage="init_mlff",
+        generated_at="2026-08-11T12:00:00",
+        directories=["init_mlff/bottom", "init_mlff/top"],
+        init_workflow=_valid_init_workflow(),
+    )
+
+    write_manifest(work_dir, manifest)
+    result = read_manifest(work_dir, "init_mlff")
+
+    assert result.kind == "current"
+    assert result.manifest is not None
+    assert result.manifest.init_workflow == manifest.init_workflow
+
+
+@pytest.mark.parametrize(
+    ("field_path", "value", "match"),
+    [
+        (("schema",), "dpmoire-lite.init-workflow.v2", "schema"),
+        (("state",), "running", "state"),
+        (("phases", "bottom", "role"), "step-2", "role"),
+        (("phases", "bottom", "directory"), "../outside", "safe relative path"),
+        (
+            ("phases", "bottom", "static_inputs", "POSCAR", "sha256"),
+            "not-a-digest",
+            "SHA-256",
+        ),
+    ],
+)
+def test_read_manifest_rejects_invalid_init_workflow_v1(
+    tmp_path,
+    field_path,
+    value,
+    match,
+):
+    work_dir = tmp_path / "work"
+    data = asdict(
+        Manifest(
+            stage="init_mlff",
+            generated_at="2026-08-11T12:00:00",
+            directories=["init_mlff/bottom", "init_mlff/top"],
+            init_workflow=_valid_init_workflow(),
+        )
+    )
+    target = data["init_workflow"]
+    for key in field_path[:-1]:
+        target = target[key]
+    target[field_path[-1]] = value
+    _write_yaml(work_dir, "init_mlff", data)
+
+    with pytest.raises(ValueError, match=match):
+        read_manifest(work_dir, "init_mlff")
 
 
 def test_read_manifest_never_creates_a_file(tmp_path):

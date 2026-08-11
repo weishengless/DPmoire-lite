@@ -40,7 +40,8 @@ DPmoireLite build config.yaml
 
 stage0 可以根据配置生成三组相互独立的目录：
 
-- `init_mlff: true` 时生成 `init_mlff/`。
+- `init_mlff: true` 时生成 `init_mlff/`；`init_mlff_mode` 决定使用历史单目录
+  布局还是两阶段静态布局。
 - `do_relaxation: true` 时生成 `rlx/<i>_<j>/` 堆垛弛豫目录。
 - `twist_val: true` 时生成 `validation/<angle>/` twist validation 目录。
 
@@ -75,6 +76,31 @@ Stage1 会把新解析的计划与新版 relaxation manifest 中的 cutoff 证�
 2. 运行 `DPmoireLite build config.yaml`。
 3. 在目标集群上手动提交或运行 `init_mlff/`。
 4. 在 stage1 前确认 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN` 已经存在。
+
+可审计的两阶段准备路径：
+
+```yaml
+stage: 0
+submit: false
+init_mlff: true
+init_mlff_mode: single-job
+init_bottom_incar: init_bottom_INCAR
+init_top_incar: init_top_INCAR
+```
+
+该显式模式会在正式发布前一次性预检两层结构、两份科学 INCAR 模板、提交脚本
+来源、所有选中的 POTCAR/ENMAX、共享工作流 cutoff 以及全部目标路径。随后分别生成
+`init_mlff/bottom/` 和 `init_mlff/top/`。每个目录都从自身层结构和晶胞生成完整的
+静态 VASP 输入；不会再用一层的 POSCAR、POTCAR 或依赖元素的 INCAR 字段覆盖另一层。
+完整候选目录树和 manifest 会一起发布。
+
+`init_mlff/manifest.yaml` 使用 `dpmoire-lite.init-workflow.v1`，把 bottom 记录为
+`step-1-ready`、top 记录为 `planned`，并保存静态文件以及已预检模板/提交脚本的
+size/SHA-256 identity。这些证据可以识别后续 conflict，但不会暴露 POTCAR 内容或
+其他私有 payload。
+
+当前单元中的 `single-job` 只负责准备工作区，因此要求 `submit: false`。输出校验与
+seed promotion、wrapper 渲染和一键 Slurm 提交尚未启用。
 
 非等待提交路径：
 
@@ -115,6 +141,9 @@ DPmoire-lite 的网格平移锚点；其 `F F T` 掩码表示固定 x/y、允许
 ## 5. 提交 Stage0
 
 设置 `submit: true` 后，生成目录会被 Slurm 提交。
+
+该行为适用于默认的 `init_mlff_mode: manual`。当前的 `single-job` 准备模式会在
+写入任何目标前拒绝 `submit: true`。
 
 不加 `--wait` 时，DPmoire-lite 会提交当前 stage 请求的所有目录，然后退出：
 

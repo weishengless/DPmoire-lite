@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import tempfile
 import warnings
 from collections.abc import Callable
 from datetime import datetime
@@ -11,8 +13,13 @@ from ase import Atoms
 from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
-from .atomic_io import sha256_file
+from .atomic_io import (
+    atomic_directory_publish_no_replace,
+    atomic_text_publish,
+    sha256_file,
+)
 from .build_preflight import (
+    PreparedInitMlffWorkflow,
     PreparedValidationStructure,
     PreparedWorkflowCutoff,
     preflight_stage0,
@@ -30,7 +37,7 @@ from .inputs import (
     write_prepared_potcar,
     write_supercell_poscar,
 )
-from .manifest import Manifest, write_manifest
+from .manifest import INIT_WORKFLOW_SCHEMA, Manifest, serialize_manifest, write_manifest
 from .mlab import seed_prefix_identity
 from .paths import backup_existing_directory, relative_to_workdir
 from . import provenance as provenance_module
@@ -101,11 +108,24 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     stackings = preflight.stackings
     templates = {template.name: template for template in preflight.templates}
     output_dirs = iter(preflight.output_dirs)
-    init_dir = (
-        _take_prepared_output_dirs(output_dirs, 1, "init_mlff")[0]
-        if config.init_mlff
-        else None
+    init_dir_count = (
+        len(preflight.init_mlff_workflow.phases)
+        if preflight.init_mlff_workflow is not None
+        else int(config.init_mlff)
     )
+    init_dirs = _take_prepared_output_dirs(
+        output_dirs,
+        init_dir_count,
+        "init_mlff",
+    )
+    if preflight.init_mlff_workflow is not None:
+        prepared_init_dirs = tuple(
+            phase.target_dir for phase in preflight.init_mlff_workflow.phases
+        )
+        if init_dirs != prepared_init_dirs:
+            raise RuntimeError(
+                "Stage0 preflight returned inconsistent init MLFF output directories"
+            )
     relaxation_dirs = _take_prepared_output_dirs(
         output_dirs,
         len(stackings) if config.do_relaxation else 0,
@@ -123,11 +143,20 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
         structures.write_sym_reduced_stackings(list(stackings))
     runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
 
-    if config.init_mlff:
+    if preflight.init_mlff_workflow is not None:
+        _build_two_phase_init_mlff(
+            config,
+            preflight.init_mlff_workflow,
+            workflow_cutoff,
+            preflight.submit_script,
+            rcut,
+            generated_at,
+        )
+    elif config.init_mlff:
         _build_init_mlff(
             config,
             structures,
-            init_dir,
+            init_dirs[0],
             _prepared_template(templates, "init_INCAR"),
             workflow_cutoff,
             preflight.submit_script,
@@ -470,6 +499,116 @@ def _build_init_mlff(
     )
 
 
+def _build_two_phase_init_mlff(
+    config: DPmoireLiteConfig,
+    workflow: PreparedInitMlffWorkflow,
+    workflow_cutoff: PreparedWorkflowCutoff,
+    submit_script: PreparedSource,
+    rcut: float,
+    generated_at: str,
+) -> None:
+    if config.submit:
+        raise RuntimeError("single-job init workspace generation requires submit: false")
+    if len(workflow.phases) != 2:
+        raise RuntimeError("Preflight did not return both init MLFF phase directories")
+
+    init_root = workflow.root_dir
+    candidate = Path(
+        tempfile.mkdtemp(
+            prefix=".init_mlff-candidate-",
+            dir=config.work_dir,
+        )
+    )
+    try:
+        phase_records = {}
+        for phase in workflow.phases:
+            atoms = phase.atoms.copy()
+            candidate_phase = candidate / phase.name
+            candidate_phase.mkdir(parents=True)
+            write_vasp(candidate_phase / "POSCAR", atoms=atoms)
+            _write_vasp_inputs(
+                config,
+                candidate_phase,
+                atoms,
+                phase.template,
+                rcut,
+                workflow_cutoff,
+                submit_script,
+            )
+            static_names = [
+                "POSCAR",
+                "POTCAR",
+                "INCAR",
+                "KPOINTS",
+                submit_script.path.name,
+            ]
+            if phase.template.vdw_source is not None:
+                static_names.append(phase.template.vdw_source.path.name)
+            phase_records[phase.name] = {
+                "role": phase.role,
+                "state": phase.initial_state,
+                "directory": relative_to_workdir(
+                    config.work_dir,
+                    phase.target_dir,
+                ),
+                "incar_template": _prepared_source_evidence(
+                    phase.template.source
+                ),
+                "static_inputs": {
+                    name: _file_evidence(candidate_phase / name)
+                    for name in static_names
+                },
+            }
+
+        manifest = Manifest(
+            stage="init_mlff",
+            generated_at=generated_at,
+            config_summary=_config_summary(config, workflow_cutoff),
+            directories=[
+                relative_to_workdir(config.work_dir, phase.target_dir)
+                for phase in workflow.phases
+            ],
+            init_workflow={
+                "schema": INIT_WORKFLOW_SCHEMA,
+                "mode": workflow.mode,
+                "state": workflow.initial_state,
+                "submit_source": _prepared_source_evidence(submit_script),
+                "phases": phase_records,
+            },
+        )
+        atomic_text_publish(
+            candidate / "manifest.yaml",
+            serialize_manifest(config.work_dir, manifest),
+            encoding="utf-8",
+        )
+        try:
+            atomic_directory_publish_no_replace(candidate, init_root)
+        except FileExistsError as exc:
+            raise RuntimeError(
+                "init_mlff appeared after preflight; refusing to replace an existing target"
+            ) from exc
+    except BaseException:
+        if candidate.exists():
+            shutil.rmtree(candidate)
+        raise
+
+
+def _prepared_source_evidence(source: PreparedSource) -> dict[str, object]:
+    return {
+        "name": source.path.name,
+        "size": source.size,
+        "sha256": source.sha256,
+    }
+
+
+def _file_evidence(path: Path) -> dict[str, object]:
+    path = Path(path)
+    return {
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+    }
+
+
 def _build_relaxations(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
@@ -781,6 +920,7 @@ def _config_summary(
         "d_mode": config.d_mode,
         "d_reference": d_reference,
         "potcar_policy": config.potcar_policy,
+        "init_mlff_mode": config.init_mlff_mode,
         "k_mesh": config.k_mesh,
         "encut_factor": config.encut_factor,
         "workflow_cutoff": workflow_cutoff.audit_record(),

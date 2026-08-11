@@ -74,7 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="DPmoireLite", description="DPmoireLite VASP dataset builder")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    build = subparsers.add_parser("build", help="Generate and optionally submit calculation folders")
+    build = subparsers.add_parser(
+        "build",
+        help="Generate and optionally submit calculation folders",
+        description=(
+            "Generate calculation folders. Config init_mlff_mode defaults to manual; "
+            "single-job prepares separate bottom/top static inputs and currently "
+            "requires submit: false."
+        ),
+    )
     build.add_argument("config", help="Path to config.yaml")
     build.add_argument(
         "--wait",

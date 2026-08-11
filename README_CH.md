@@ -44,7 +44,10 @@ python -m pip install .
 
 - `top_layer.poscar`：上层单层结构，可以是 primitive cell，也可以是已经匹配好的单层晶胞。
 - `bot_layer.poscar`：下层单层结构，可以是 primitive cell，也可以是已经匹配好的单层晶胞。
-- `init_INCAR`：初始单层 MLFF 计算使用的 INCAR 模板。
+- `init_INCAR`：向后兼容的手动 init MLFF 路径使用的 INCAR 模板。
+- `init_bottom_INCAR` 和 `init_top_INCAR`：`init_mlff_mode: single-job`
+  使用的两份独立科学模板。`MAGMOM`、DFT+U 等依赖元素的设置必须由用户在
+  对应模板中明确给出；DPmoire-lite 不会猜测或用脚本修补这些标签。
 - `rlx_INCAR`：堆垛弛豫计算使用的 INCAR 模板。
 - `MD_INCAR`：双层 MD 计算使用的 INCAR 模板。
 - `MD_monolayer_INCAR`：可选单层 MD 计算使用的 INCAR 模板。
@@ -62,7 +65,8 @@ python -m pip install .
 
 `stage: 0` 生成第一批计算目录：
 
-- 如果 `init_mlff: true`，生成 `init_mlff/`。
+- 如果 `init_mlff: true`，按 `init_mlff_mode` 选择的布局生成
+  `init_mlff/`。
 - 如果 `do_relaxation: true`，生成 `rlx/<i>_<j>/` 弛豫目录。
 - 如果 `twist_val: true`，生成 `validation/<angle>/` 验证集目录。
 
@@ -86,8 +90,19 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 
 初始 MLFF 流程是显式设计的：
 
-- 手动模式：stage0 会创建第一步 `init_mlff` 作业；如果 `submit: true` 但不加 `--wait`，只会提交这第一步 init 作业。stage0 仍会继续生成并可选提交已经启用的弛豫或 validation 目录。用户完成 `ML_ABN` 和 `ML_FFN` 准备后，stage1 再使用这些文件。
-- 当前必须在检查前一阶段输出后，手动完成第二步 init MLFF 和 Stage0 到 Stage1 的切换。
+- `manual` 是默认模式。stage0 会创建历史兼容的单目录 `init_mlff`
+  作业；如果 `submit: true` 但不加 `--wait`，只提交这第一步 init 作业。
+  stage0 仍会继续生成并可选提交已经启用的弛豫或 validation 目录。用户完成
+  `ML_ABN` 和 `ML_FFN` 准备后，stage1 再使用这些文件。
+- `single-job` 是显式 opt-in，当前要求 `submit: false`。stage0 会事务性发布
+  `init_mlff/bottom/` 与 `init_mlff/top/` 两套完整静态输入，分别使用
+  `init_bottom_incar` 和 `init_top_incar`。每个 phase 都有自己的 POSCAR、
+  局部元素 POTCAR、按自身晶胞生成的 KPOINTS、渲染后的 INCAR 和提交脚本副本；
+  两份 INCAR 共用全工作流 cutoff。`init_mlff/manifest.yaml` 只记录带版本的
+  `step-1-ready`/`planned` 状态以及有界 size/SHA-256 证据，不记录 POTCAR 内容。
+- 当前版本只负责生成和审计两阶段工作区。seed 输出校验/提升、派生的单作业
+  wrapper 与自动 `sbatch` 属于后续工作流单元；不要再把一个 phase 手工覆盖到
+  另一个 phase 上。
 
 ## 数据收集语义
 
@@ -144,6 +159,9 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 | `outcar_collect_freq` | 正整数 | 弛豫和非 ML MD 的 OUTCAR 采样间隔。validation 始终使用 1。VASP-ML MD 收集读取 `ML_ABN`，不受此项影响。 |
 | `do_relaxation` | 布尔值 | stage0 是否生成 `rlx/` 下的弛豫目录。 |
 | `init_mlff` | 布尔值 | stage0 是否生成初始 `init_mlff/` 目录。 |
+| `init_mlff_mode` | `manual` 或 `single-job` | init 布局，默认 `manual`。`single-job` 会分别生成 `init_mlff/bottom` 和 `init_mlff/top` 静态工作区，当前要求 `submit: false`。 |
+| `init_bottom_incar` | 相对路径 | `input_dir` 下的 bottom phase INCAR 模板；`single-job` 必填。 |
+| `init_top_incar` | 相对路径 | `input_dir` 下的 top phase INCAR 模板；`single-job` 必填。 |
 | `sc_rlx` | 布尔值 | `true` 表示弛豫超胞堆垛结构；`false` 表示只弛豫 primitive glide structure，并在 stage1 根据 CONTCAR 扩胞。 |
 | `preserve_grid_shift_md` | 布尔值 | Stage1 默认清除全部约束。设为 `true` 时只保留 DPmoire-lite 的网格平移锚点；`F F T` 表示固定 x/y、允许 z 移动。 |
 | `n_sectors` | 整数或 `[nx, ny]` | 堆垛平移采样网格。`9` 等价于 `[9, 9]`，`[9, 8]` 表示矩形网格。 |

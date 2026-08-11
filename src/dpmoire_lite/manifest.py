@@ -14,6 +14,10 @@ from dpmoire_lite.paths import manifest_path
 
 
 MANIFEST_SCHEMA_VERSION = 2
+INIT_WORKFLOW_SCHEMA = "dpmoire-lite.init-workflow.v1"
+
+_INIT_WORKFLOW_STATES = {"planned", "step-1-ready", "conflict"}
+_INIT_PHASE_ROLES = {"bottom": "step-1", "top": "step-2"}
 
 _COLLECT_OUTPUTS = {
     "rlx": "rlx_data.extxyz",
@@ -37,6 +41,7 @@ _MANIFEST_FIELDS = {
     "structure_provenance",
     "grid_shift_anchors",
     "mlff_seed",
+    "init_workflow",
     "partial",
 }
 
@@ -58,6 +63,7 @@ class Manifest:
     structure_provenance: dict[str, Any] = field(default_factory=dict)
     grid_shift_anchors: dict[str, Any] = field(default_factory=dict)
     mlff_seed: dict[str, Any] = field(default_factory=dict)
+    init_workflow: dict[str, Any] = field(default_factory=dict)
     partial: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -198,6 +204,9 @@ def _validate_v2_data(
     _require_mapping_field(data, path, "structure_provenance")
     _require_mapping_field(data, path, "grid_shift_anchors")
     _require_mapping_field(data, path, "mlff_seed")
+    if "init_workflow" in data:
+        _require_mapping_field(data, path, "init_workflow")
+        _validate_init_workflow(data["init_workflow"], path, stage=data["stage"])
     _require_record_list(data, path, "jobs")
     _require_record_list(data, path, "skipped")
     _require_record_list(data, path, "failed")
@@ -250,6 +259,8 @@ def _normalize_manifest_paths(
         for value in data["backups"]
     ]
 
+    _normalize_init_workflow_paths(data, path, work_dir)
+
     collect = data["collect"]
     output = collect.get("output")
     if output is not None:
@@ -269,6 +280,187 @@ def _normalize_manifest_paths(
         collect["backup"] = _normalize_relative_path(backup, work_dir, path, "collect.backup")
     elif backup is not None:
         raise ValueError(f"Invalid manifest {path}: collect.backup must be a relative path")
+
+
+def _validate_init_workflow(
+    workflow: Mapping[str, Any],
+    path: Path,
+    *,
+    stage: str,
+) -> None:
+    if not workflow:
+        return
+    if stage != "init_mlff":
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow is valid only for stage 'init_mlff'"
+        )
+    _require_exact_mapping_fields(
+        workflow,
+        path,
+        "init_workflow",
+        {"schema", "mode", "state", "submit_source", "phases"},
+    )
+    if workflow["schema"] != INIT_WORKFLOW_SCHEMA:
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow.schema must be "
+            f"{INIT_WORKFLOW_SCHEMA!r}"
+        )
+    if workflow["mode"] != "single-job":
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow.mode must be 'single-job'"
+        )
+    _require_init_state(workflow["state"], path, "init_workflow.state")
+    submit_source = workflow["submit_source"]
+    _expect_mapping(submit_source, path, "init_workflow.submit_source")
+    _validate_file_identity(
+        submit_source,
+        path,
+        "init_workflow.submit_source",
+        include_name=True,
+    )
+
+    phases = workflow["phases"]
+    _expect_mapping(phases, path, "init_workflow.phases")
+    if set(phases) != set(_INIT_PHASE_ROLES):
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow.phases must contain exactly "
+            "bottom and top"
+        )
+    for phase_name, expected_role in _INIT_PHASE_ROLES.items():
+        record = phases[phase_name]
+        field_name = f"init_workflow.phases.{phase_name}"
+        _expect_mapping(record, path, field_name)
+        _require_exact_mapping_fields(
+            record,
+            path,
+            field_name,
+            {"role", "state", "directory", "incar_template", "static_inputs"},
+        )
+        if record["role"] != expected_role:
+            raise ValueError(
+                f"Invalid manifest {path}: {field_name}.role must be {expected_role!r}"
+            )
+        _require_init_state(record["state"], path, f"{field_name}.state")
+        if not isinstance(record["directory"], str):
+            raise ValueError(
+                f"Invalid manifest {path}: {field_name}.directory must be a string"
+            )
+        incar_template = record["incar_template"]
+        _expect_mapping(incar_template, path, f"{field_name}.incar_template")
+        _validate_file_identity(
+            incar_template,
+            path,
+            f"{field_name}.incar_template",
+            include_name=True,
+        )
+        static_inputs = record["static_inputs"]
+        _expect_mapping(static_inputs, path, f"{field_name}.static_inputs")
+        required_static = {"POSCAR", "POTCAR", "INCAR", "KPOINTS", submit_source["name"]}
+        if not required_static.issubset(static_inputs):
+            missing = sorted(required_static - set(static_inputs))
+            raise ValueError(
+                f"Invalid manifest {path}: {field_name}.static_inputs is missing {missing}"
+            )
+        for name, identity in static_inputs.items():
+            _require_safe_basename(name, path, f"{field_name}.static_inputs key")
+            _expect_mapping(identity, path, f"{field_name}.static_inputs.{name}")
+            _validate_file_identity(
+                identity,
+                path,
+                f"{field_name}.static_inputs.{name}",
+                include_name=False,
+            )
+
+
+def _normalize_init_workflow_paths(
+    data: Mapping[str, Any],
+    path: Path,
+    work_dir: Path,
+) -> None:
+    workflow = data.get("init_workflow")
+    if not workflow:
+        return
+    expected_directories = []
+    for phase_name in _INIT_PHASE_ROLES:
+        record = workflow["phases"][phase_name]
+        field_name = f"init_workflow.phases.{phase_name}.directory"
+        normalized = _normalize_relative_path(
+            record["directory"],
+            work_dir,
+            path,
+            field_name,
+        )
+        expected = f"init_mlff/{phase_name}"
+        if normalized != expected:
+            raise ValueError(
+                f"Invalid manifest {path}: {field_name} must be {expected!r}"
+            )
+        record["directory"] = normalized
+        expected_directories.append(expected)
+    if data["directories"] != expected_directories:
+        raise ValueError(
+            f"Invalid manifest {path}: directories must match init_workflow phase order"
+        )
+
+
+def _require_exact_mapping_fields(
+    data: Mapping[str, Any],
+    path: Path,
+    field_name: str,
+    expected: set[str],
+) -> None:
+    missing = sorted(expected - set(data))
+    unknown = sorted(set(data) - expected, key=repr)
+    if missing or unknown:
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name} fields mismatch; "
+            f"missing={missing}, unknown={unknown}"
+        )
+
+
+def _require_init_state(value: Any, path: Path, field_name: str) -> None:
+    if not isinstance(value, str) or value not in _INIT_WORKFLOW_STATES:
+        allowed = ", ".join(sorted(_INIT_WORKFLOW_STATES))
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name} must be one of: {allowed}"
+        )
+
+
+def _validate_file_identity(
+    identity: Mapping[str, Any],
+    path: Path,
+    field_name: str,
+    *,
+    include_name: bool,
+) -> None:
+    expected = {"size", "sha256"}
+    if include_name:
+        expected.add("name")
+    _require_exact_mapping_fields(identity, path, field_name, expected)
+    if include_name:
+        _require_safe_basename(identity["name"], path, f"{field_name}.name")
+    size = identity["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name}.size must be a non-negative integer"
+        )
+    digest = identity["sha256"]
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name}.sha256 must be a lowercase SHA-256"
+        )
+
+
+def _require_safe_basename(value: Any, path: Path, field_name: str) -> None:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a safe basename")
+    normalized = value.replace("\\", "/")
+    if "/" in normalized:
+        raise ValueError(f"Invalid manifest {path}: {field_name} must be a safe basename")
 
 
 def _normalize_relative_path(value: str, work_dir: Path, manifest: Path, field_name: str) -> str:

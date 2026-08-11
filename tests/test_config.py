@@ -186,6 +186,91 @@ def test_d_mode_defaults_to_surface_gap(tmp_path):
     assert config.d_mode == "surface_gap"
     assert config.d_reference is None
     assert config.potcar_policy == "recommend"
+    assert config.init_mlff_mode == "manual"
+    assert config.init_bottom_incar is None
+    assert config.init_top_incar is None
+
+
+def test_single_job_init_mode_requires_and_resolves_explicit_templates(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        init_mlff_mode="single-job",
+        init_bottom_incar="bottom/init_INCAR",
+        init_top_incar="top/init_INCAR",
+    )
+
+    config = load_config(config_file)
+
+    assert config.init_mlff_mode == "single-job"
+    assert config.init_bottom_incar == tmp_path / "input" / "bottom" / "init_INCAR"
+    assert config.init_top_incar == tmp_path / "input" / "top" / "init_INCAR"
+
+
+@pytest.mark.parametrize("missing", ["init_bottom_incar", "init_top_incar"])
+def test_single_job_init_mode_rejects_missing_scientific_template(tmp_path, missing):
+    config_file = tmp_path / "config.yaml"
+    templates = {
+        "init_bottom_incar": "init_bottom_INCAR",
+        "init_top_incar": "init_top_INCAR",
+    }
+    del templates[missing]
+    write_config(config_file, init_mlff_mode="single-job", **templates)
+
+    with pytest.raises(ConfigError, match=missing):
+        load_config(config_file)
+
+
+def test_single_job_init_mode_rejects_disabled_init_mlff(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        init_mlff=False,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+    )
+
+    with pytest.raises(ConfigError, match="requires init_mlff: true"):
+        load_config(config_file)
+
+
+def test_single_job_init_submission_remains_fail_closed(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        submit=True,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+    )
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError, match="single-job currently requires submit: false"):
+        config.validate_build_mode(wait=False)
+
+
+@pytest.mark.parametrize("mode", ["automatic", "single_job", ""])
+def test_load_config_rejects_invalid_init_mlff_mode(tmp_path, mode):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, init_mlff_mode=mode)
+
+    with pytest.raises(ConfigError, match="init_mlff_mode"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("template", ["../outside_INCAR", "C:/outside/INCAR"])
+def test_single_job_init_templates_must_remain_inside_input_dir(tmp_path, template):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        init_mlff_mode="single-job",
+        init_bottom_incar=template,
+        init_top_incar="init_top_INCAR",
+    )
+
+    with pytest.raises(ConfigError, match="init_bottom_incar"):
+        load_config(config_file)
 
 
 @pytest.mark.parametrize("policy", ["recommend", "minimal"])
@@ -308,6 +393,9 @@ def test_source_and_bundled_examples_show_false_default():
     for relative_path in ("example/config.yaml", "src/dpmoire_lite/example/config.yaml"):
         data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
         assert data["preserve_grid_shift_md"] is False
+        assert data["init_mlff_mode"] == "manual"
+        assert data["init_bottom_incar"] == "init_bottom_INCAR"
+        assert data["init_top_incar"] == "init_top_INCAR"
 
 
 def test_outcar_patterns_defaults_to_historical_families_then_active(tmp_path):

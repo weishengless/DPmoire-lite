@@ -132,6 +132,295 @@ def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
     assert not (work / "backups").exists()
 
 
+def test_stage0_treats_dangling_init_target_as_preflight_conflict(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+        symm_reduce=True,
+    )
+    input_dir = tmp_path / "input"
+    for name in ("init_bottom_INCAR", "init_top_INCAR"):
+        (input_dir / name).write_text(
+            "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+            encoding="utf-8",
+        )
+    work = tmp_path / "work"
+    init_target = work / "init_mlff"
+    real_exists = Path.exists
+    real_is_symlink = Path.is_symlink
+
+    def dangling_target_exists(path):
+        if path == init_target:
+            return False
+        return real_exists(path)
+
+    def dangling_target_is_symlink(path):
+        if path == init_target:
+            return True
+        return real_is_symlink(path)
+
+    monkeypatch.setattr(Path, "exists", dangling_target_exists)
+    monkeypatch.setattr(Path, "is_symlink", dangling_target_is_symlink)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        run_build(config, wait=False)
+
+    assert not (work / "sym_reduced_stackings.txt").exists()
+    assert list(work.glob(".init_mlff-candidate-*")) == []
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["POTCAR", "potcar", "vdw_kernel.bindat", "VDW_KERNEL.BINDAT"],
+)
+def test_single_job_init_preflight_rejects_static_filename_collisions(
+    tmp_path,
+    script_name,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        dft_script=script_name,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    input_dir = tmp_path / "input"
+    for name in ("init_bottom_INCAR", "init_top_INCAR"):
+        (input_dir / name).write_text(
+            "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\nLUSE_VDW=.TRUE.\n",
+            encoding="utf-8",
+        )
+    (input_dir / "vdw_kernel.bindat").write_bytes(b"synthetic support data\n")
+    (tmp_path / "scripts" / script_name).write_text(
+        "#!/usr/bin/env bash\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="filename collision"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "nested/submit.sh",
+        "C:submit.sh",
+        "name:stream",
+        "POTCAR.",
+        "submit.sh ",
+        "CON",
+        "input?.sh",
+    ],
+)
+def test_single_job_init_preflight_requires_safe_submit_basename(
+    tmp_path,
+    script_name,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        dft_script=script_name,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    input_dir = tmp_path / "input"
+    for name in ("init_bottom_INCAR", "init_top_INCAR"):
+        (input_dir / name).write_text(
+            "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+            encoding="utf-8",
+        )
+    if script_name == "nested/submit.sh":
+        nested_script = tmp_path / "scripts" / script_name
+        nested_script.parent.mkdir()
+        nested_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="safe basename"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work").exists()
+
+
+def test_single_job_init_preflight_reports_both_missing_phase_templates(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff_mode="single-job",
+        init_bottom_incar="missing_bottom_INCAR",
+        init_top_incar="missing_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config, wait=False)
+
+    message = str(exc_info.value)
+    assert "missing required template init_bottom_INCAR" in message
+    assert "missing required template init_top_INCAR" in message
+    assert not (tmp_path / "work" / "init_mlff").exists()
+
+
+def test_single_job_init_preflight_returns_frozen_phase_plan(tmp_path):
+    config_path = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+        sc=[2, 1],
+        input_kwargs={"top_a": 3.0, "bot_a": 4.0},
+    )
+    input_dir = tmp_path / "input"
+    for name in ("init_bottom_INCAR", "init_top_INCAR"):
+        (input_dir / name).write_text(
+            "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+            encoding="utf-8",
+        )
+
+    result = preflight_module.preflight_stage0(load_config(config_path))
+
+    workflow = result.init_mlff_workflow
+    assert workflow is not None
+    assert workflow.mode == "single-job"
+    assert workflow.initial_state == "step-1-ready"
+    assert workflow.root_dir == tmp_path / "work" / "init_mlff"
+    assert [
+        (
+            phase.name,
+            phase.role,
+            phase.initial_state,
+            phase.target_dir,
+            phase.template.name,
+        )
+        for phase in workflow.phases
+    ] == [
+        (
+            "bottom",
+            "step-1",
+            "step-1-ready",
+            tmp_path / "work" / "init_mlff" / "bottom",
+            "init_bottom_INCAR",
+        ),
+        (
+            "top",
+            "step-2",
+            "planned",
+            tmp_path / "work" / "init_mlff" / "top",
+            "init_top_INCAR",
+        ),
+    ]
+    assert workflow.phases[0].atoms.cell.lengths()[:2] == pytest.approx([8.0, 4.0])
+    assert workflow.phases[1].atoms.cell.lengths()[:2] == pytest.approx([6.0, 3.0])
+
+
+def test_single_job_init_generation_failure_leaves_no_formal_workspace(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    input_dir = tmp_path / "input"
+    bottom_template = input_dir / "init_bottom_INCAR"
+    top_template = input_dir / "init_top_INCAR"
+    bottom_template.write_text(
+        "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+        encoding="utf-8",
+    )
+    top_template.write_text(
+        "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+        encoding="utf-8",
+    )
+    real_preflight = build_module.preflight_stage0
+
+    def mutate_top_template_after_preflight(config_value):
+        result = real_preflight(config_value)
+        top_template.write_text("changed after preflight\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        build_module,
+        "preflight_stage0",
+        mutate_top_template_after_preflight,
+    )
+
+    with pytest.raises(RuntimeError, match="changed since preflight|identity"):
+        run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    assert not (work / "init_mlff").exists()
+    assert list(work.glob(".init_mlff-candidate-*")) == []
+
+
+def test_single_job_init_late_target_conflict_is_not_replaced(monkeypatch, tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    input_dir = tmp_path / "input"
+    for name in ("init_bottom_INCAR", "init_top_INCAR"):
+        (input_dir / name).write_text(
+            "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+            encoding="utf-8",
+        )
+    real_publish = build_module.atomic_directory_publish_no_replace
+
+    def create_conflict_before_publish(candidate, destination):
+        destination.mkdir()
+        return real_publish(candidate, destination)
+
+    monkeypatch.setattr(
+        build_module,
+        "atomic_directory_publish_no_replace",
+        create_conflict_before_publish,
+    )
+
+    with pytest.raises(RuntimeError, match="appeared after preflight"):
+        run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    conflict = work / "init_mlff"
+    assert conflict.is_dir()
+    assert list(conflict.iterdir()) == []
+    assert list(work.glob(".init_mlff-candidate-*")) == []
+
+
 def test_stage0_existing_rlx_blocks_init_and_validation_generation(tmp_path):
     config = write_build_config(
         tmp_path,

@@ -12,6 +12,12 @@
   seed-aware default validates immutable seed provenance, while explicit
   full-dedup is MLFF-MD-only, reads every accepted final `ML_ABN`, retains the
   first exact copy (including one shared seed), and uses more I/O.
+- Added explicit `init_mlff_mode: single-job` workspace preparation while
+  retaining `manual` as the default. The opt-in mode preflights separate bottom
+  and top scientific INCAR templates, transactionally publishes independent
+  static VASP input directories, and records versioned state plus bounded file
+  identities in the init manifest. Submission and seed promotion remain
+  fail-closed for later workflow units.
 
 ### Fixed
 

@@ -100,3 +100,49 @@ def test_atomic_publish_does_not_swallow_replace_failure(tmp_path, monkeypatch):
         atomic_io.atomic_text_publish(destination, "new\n")
 
     assert destination.read_bytes() == b"previous\n"
+
+
+def test_atomic_directory_publish_installs_complete_candidate(tmp_path):
+    candidate = tmp_path / ".workspace-candidate"
+    destination = tmp_path / "init_mlff"
+    (candidate / "bottom").mkdir(parents=True)
+    (candidate / "bottom" / "POSCAR").write_text("prepared\n", encoding="utf-8")
+
+    atomic_io.atomic_directory_publish_no_replace(candidate, destination)
+
+    assert not candidate.exists()
+    assert (destination / "bottom" / "POSCAR").read_text(encoding="utf-8") == (
+        "prepared\n"
+    )
+
+
+def test_atomic_directory_publish_refuses_existing_empty_directory(tmp_path):
+    candidate = tmp_path / ".workspace-candidate"
+    destination = tmp_path / "init_mlff"
+    candidate.mkdir()
+    (candidate / "manifest.yaml").write_text("candidate\n", encoding="utf-8")
+    destination.mkdir()
+
+    with pytest.raises(FileExistsError):
+        atomic_io.atomic_directory_publish_no_replace(candidate, destination)
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+    assert (candidate / "manifest.yaml").read_text(encoding="utf-8") == "candidate\n"
+
+
+def test_atomic_directory_publish_refuses_dangling_symlink(tmp_path):
+    candidate = tmp_path / ".workspace-candidate"
+    destination = tmp_path / "init_mlff"
+    candidate.mkdir()
+    (candidate / "manifest.yaml").write_text("candidate\n", encoding="utf-8")
+    try:
+        destination.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(FileExistsError):
+        atomic_io.atomic_directory_publish_no_replace(candidate, destination)
+
+    assert destination.is_symlink()
+    assert (candidate / "manifest.yaml").read_text(encoding="utf-8") == "candidate\n"

@@ -6,6 +6,7 @@ import warnings as pywarnings
 
 import numpy as np
 from ase import Atoms
+from ase.build import make_supercell, sort
 from ase.io.vasp import read_vasp
 
 from .config import DPmoireLiteConfig
@@ -23,7 +24,12 @@ from .mlab import MlabParseResult, parse_mlab
 from .manifest import ManifestReadResult, read_manifest
 from .paths import relative_to_workdir, stage_dir
 from . import provenance as provenance_module
-from .structures import StructureHandler, generate_stackings, validate_cartesian_z_slab_cell
+from .structures import (
+    StructureHandler,
+    generate_stackings,
+    supercell_matrix,
+    validate_cartesian_z_slab_cell,
+)
 
 
 VASP_RELAXATION_CONVERGED_PHRASE = (
@@ -96,6 +102,24 @@ class PreparedWorkflowCutoff:
 
 
 @dataclass(frozen=True)
+class PreparedInitMlffPhase:
+    name: str
+    role: str
+    initial_state: str
+    target_dir: Path
+    atoms: Atoms
+    template: PreparedIncarTemplate
+
+
+@dataclass(frozen=True)
+class PreparedInitMlffWorkflow:
+    mode: str
+    initial_state: str
+    root_dir: Path
+    phases: tuple[PreparedInitMlffPhase, ...]
+
+
+@dataclass(frozen=True)
 class BuildPreflightResult:
     stage: int | str
     structures: StructureHandler | None
@@ -109,6 +133,7 @@ class BuildPreflightResult:
     initial_seed: MlabParseResult | None = None
     relaxations: tuple[PreparedRelaxation, ...] = ()
     validation_structures: tuple[PreparedValidationStructure, ...] = ()
+    init_mlff_workflow: PreparedInitMlffWorkflow | None = None
     warnings: tuple[PreflightDiagnostic, ...] = ()
     provenance: provenance_module.Stage1ProvenanceResult | None = None
 
@@ -142,7 +167,11 @@ def _check_target_stages_absent(
     config: DPmoireLiteConfig,
     targets: tuple[tuple[str, Path], ...],
 ) -> None:
-    conflicts = [(stage, path) for stage, path in targets if path.exists()]
+    conflicts = [
+        (stage, path)
+        for stage, path in targets
+        if path.exists() or path.is_symlink()
+    ]
     if not conflicts:
         return
     details = "\n".join(
@@ -165,7 +194,11 @@ def _stage0_output_dirs(
 ) -> tuple[Path, ...]:
     output_dirs = []
     if config.init_mlff:
-        output_dirs.append(stage_dir(config.work_dir, "init_mlff"))
+        init_root = stage_dir(config.work_dir, "init_mlff")
+        if config.init_mlff_mode == "single-job":
+            output_dirs.extend((init_root / "bottom", init_root / "top"))
+        else:
+            output_dirs.append(init_root)
     if config.do_relaxation:
         relaxation_dir = stage_dir(config.work_dir, "rlx")
         output_dirs.extend(relaxation_dir / f"{i}_{j}" for i, j in stackings)
@@ -271,6 +304,14 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
                     )
                 )
     output_dirs = _stage0_output_dirs(config, stackings, validation_structures)
+    init_mlff_workflow = _prepare_init_mlff_workflow(
+        config,
+        structures,
+        templates,
+        submit_script,
+        output_dirs,
+        diagnostics,
+    )
     _validate_output_dirs(
         config,
         tuple(path for _stage, path in stage_targets) + output_dirs,
@@ -288,9 +329,171 @@ def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
         submit_script=submit_script,
         stage_targets=stage_targets,
         output_dirs=output_dirs,
+        init_mlff_workflow=init_mlff_workflow,
         warnings=tuple(warning_diagnostics),
         validation_structures=validation_structures,
     )
+
+
+def _prepare_init_mlff_workflow(
+    config: DPmoireLiteConfig,
+    structures: StructureHandler | None,
+    templates: tuple[PreparedIncarTemplate, ...],
+    submit_script: PreparedSource | None,
+    output_dirs: tuple[Path, ...],
+    diagnostics: list[PreflightDiagnostic],
+) -> PreparedInitMlffWorkflow | None:
+    if config.init_mlff_mode != "single-job" or not config.init_mlff:
+        return None
+    if structures is None or structures.bot_atoms is None or structures.top_atoms is None:
+        return None
+
+    templates_by_name = {template.name: template for template in templates}
+    bottom_template = templates_by_name.get("init_bottom_INCAR")
+    top_template = templates_by_name.get("init_top_INCAR")
+    if (
+        bottom_template is None
+        or top_template is None
+        or submit_script is None
+        or len(output_dirs) < 2
+    ):
+        return None
+
+    if not _is_safe_basename(config.dft_script):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="script",
+                path=submit_script.path,
+                reason=(
+                    "single-job init submit script must use a safe basename, "
+                    "not a nested or absolute path"
+                ),
+            )
+        )
+        return None
+
+    phase_templates = (
+        ("bottom", bottom_template),
+        ("top", top_template),
+    )
+    if _record_init_phase_filename_collisions(
+        phase_templates,
+        submit_script,
+        diagnostics,
+    ):
+        return None
+
+    root_dir = stage_dir(config.work_dir, "init_mlff")
+    bottom_dir, top_dir = output_dirs[:2]
+    if (bottom_dir, top_dir) != (root_dir / "bottom", root_dir / "top"):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="path",
+                path=root_dir,
+                reason="single-job init phase targets do not match the required layout",
+            )
+        )
+        return None
+    try:
+        bottom_atoms = sort(
+            make_supercell(
+                prim=structures.bot_atoms.copy(),
+                P=supercell_matrix(config.sc),
+            )
+        )
+        top_atoms = sort(
+            make_supercell(
+                prim=structures.top_atoms.copy(),
+                P=supercell_matrix(config.sc),
+            )
+        )
+    except Exception as exc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="structure",
+                path=root_dir,
+                reason=f"single-job init phase preparation failed: {exc}",
+            )
+        )
+        return None
+    return PreparedInitMlffWorkflow(
+        mode="single-job",
+        initial_state="step-1-ready",
+        root_dir=root_dir,
+        phases=(
+            PreparedInitMlffPhase(
+                name="bottom",
+                role="step-1",
+                initial_state="step-1-ready",
+                target_dir=bottom_dir,
+                atoms=bottom_atoms,
+                template=bottom_template,
+            ),
+            PreparedInitMlffPhase(
+                name="top",
+                role="step-2",
+                initial_state="planned",
+                target_dir=top_dir,
+                atoms=top_atoms,
+                template=top_template,
+            ),
+        ),
+    )
+
+
+def _is_safe_basename(value: str) -> bool:
+    if not value or value in {".", ".."} or value != value.strip():
+        return False
+    invalid_characters = '<>:"/\\|?*'
+    if any(character in invalid_characters or ord(character) < 32 for character in value):
+        return False
+    if value.endswith("."):
+        return False
+    reserved_stems = {"con", "prn", "aux", "nul"}
+    reserved_stems.update(f"com{index}" for index in range(1, 10))
+    reserved_stems.update(f"lpt{index}" for index in range(1, 10))
+    return value.split(".", 1)[0].casefold() not in reserved_stems
+
+
+def _portable_filename_key(value: str) -> str:
+    return value.rstrip(" .").casefold()
+
+
+def _record_init_phase_filename_collisions(
+    phase_templates: tuple[tuple[str, PreparedIncarTemplate], ...],
+    submit_script: PreparedSource,
+    diagnostics: list[PreflightDiagnostic],
+) -> bool:
+    collision_found = False
+    fixed_inputs = ("POSCAR", "POTCAR", "INCAR", "KPOINTS")
+    for phase_name, template in phase_templates:
+        owners = {
+            _portable_filename_key(name): (name, "generated VASP input")
+            for name in fixed_inputs
+        }
+        sources = [(submit_script.path.name, "submit script")]
+        if template.vdw_source is not None:
+            sources.append((template.vdw_source.path.name, "supporting input"))
+        for name, owner in sources:
+            key = _portable_filename_key(name)
+            previous = owners.get(key)
+            if previous is not None:
+                previous_name, previous_owner = previous
+                diagnostics.append(
+                    PreflightDiagnostic(
+                        domain="path",
+                        path=submit_script.path,
+                        reason=(
+                            f"single-job init {phase_name} filename collision: "
+                            f"{name!r} conflicts with {previous_name!r}; used by "
+                            f"both {previous_owner} and {owner}"
+                        ),
+                    )
+                )
+                collision_found = True
+            else:
+                owners[key] = (name, owner)
+    return collision_found
 
 
 def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
@@ -495,7 +698,19 @@ def _validate_workflow_cutoff_provenance(
 def _stage0_templates(config: DPmoireLiteConfig) -> list[tuple[str, Path]]:
     templates = []
     if config.init_mlff:
-        templates.append(("init_INCAR", config.input_dir / "init_INCAR"))
+        if config.init_mlff_mode == "single-job":
+            if config.init_bottom_incar is None or config.init_top_incar is None:
+                raise RuntimeError(
+                    "single-job init preflight requires prepared bottom and top INCAR paths"
+                )
+            templates.extend(
+                (
+                    ("init_bottom_INCAR", config.init_bottom_incar),
+                    ("init_top_INCAR", config.init_top_incar),
+                )
+            )
+        else:
+            templates.append(("init_INCAR", config.input_dir / "init_INCAR"))
     if config.do_relaxation:
         templates.append(("rlx_INCAR", config.input_dir / "rlx_INCAR"))
     if config.twist_val:
@@ -610,6 +825,20 @@ def _validate_submit_script(
     config: DPmoireLiteConfig,
     diagnostics: list[PreflightDiagnostic],
 ) -> PreparedSource | None:
+    if config.init_mlff_mode == "single-job" and not _is_safe_basename(
+        config.dft_script
+    ):
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="script",
+                path=config.script_dir,
+                reason=(
+                    "single-job init submit script must use a safe basename, "
+                    "not a nested, drive-relative, reserved, or non-portable name"
+                ),
+            )
+        )
+        return None
     path = config.script_dir / config.dft_script
     if not path.is_file():
         diagnostics.append(

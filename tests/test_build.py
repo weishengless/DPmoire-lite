@@ -1,3 +1,4 @@
+import hashlib
 import math
 import shutil
 from pathlib import Path
@@ -290,6 +291,127 @@ def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_
             (work / stage / "manifest.yaml").read_text(encoding="utf-8")
         )
         assert manifest["config_summary"]["workflow_cutoff"] == expected_evidence
+
+
+def test_single_job_init_mode_generates_auditable_two_phase_workspace(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+    input_dir = tmp_path / "input"
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=[3.0, 3.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=[4.0, 4.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    (input_dir / "init_bottom_INCAR").write_text(
+        "SYSTEM = bottom-vte2\nENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\n",
+        encoding="utf-8",
+    )
+    (input_dir / "init_top_INCAR").write_text(
+        "SYSTEM = top-nbte2\nENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\n",
+        encoding="utf-8",
+    )
+
+    run_build(config, wait=False)
+
+    root = tmp_path / "work" / "init_mlff"
+    phase_dirs = {"bottom": root / "bottom", "top": root / "top"}
+    expected_files = {"POSCAR", "POTCAR", "INCAR", "KPOINTS", "DFT_script.sh"}
+    for phase_dir in phase_dirs.values():
+        assert expected_files <= {path.name for path in phase_dir.iterdir()}
+    assert not (root / "POSCAR").exists()
+    assert "SYSTEM = bottom-vte2" in (phase_dirs["bottom"] / "INCAR").read_text(
+        encoding="utf-8"
+    )
+    assert "SYSTEM = top-nbte2" in (phase_dirs["top"] / "INCAR").read_text(
+        encoding="utf-8"
+    )
+    for phase_dir in phase_dirs.values():
+        analysis = parse_incar(
+            (phase_dir / "INCAR").read_text(encoding="utf-8"),
+            source_name=str(phase_dir / "INCAR"),
+        ).analyze()
+        assert float(analysis.effective_value("ENCUT")) == 450.0
+    assert (
+        (phase_dirs["bottom"] / "KPOINTS")
+        .read_text(encoding="utf-8")
+        .splitlines()[3]
+        == "5 5 1"
+    )
+    assert (
+        (phase_dirs["top"] / "KPOINTS")
+        .read_text(encoding="utf-8")
+        .splitlines()[3]
+        == "7 7 1"
+    )
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Nb": potcar_payloads["Nb_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    for phase_dir in phase_dirs.values():
+        elements = _ordered_elements(read_vasp(phase_dir / "POSCAR"))
+        assert (phase_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+            payload_by_element[element] for element in elements
+        )
+
+    manifest = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["directories"] == ["init_mlff/bottom", "init_mlff/top"]
+    workflow = manifest["init_workflow"]
+    assert workflow["schema"] == "dpmoire-lite.init-workflow.v1"
+    assert workflow["mode"] == "single-job"
+    assert workflow["state"] == "step-1-ready"
+    assert workflow["phases"]["bottom"]["role"] == "step-1"
+    assert workflow["phases"]["top"]["role"] == "step-2"
+    assert workflow["phases"]["bottom"]["state"] == "step-1-ready"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    submit_payload = (tmp_path / "scripts" / "DFT_script.sh").read_bytes()
+    assert workflow["submit_source"] == {
+        "name": "DFT_script.sh",
+        "size": len(submit_payload),
+        "sha256": hashlib.sha256(submit_payload).hexdigest(),
+    }
+    for phase, phase_dir in phase_dirs.items():
+        evidence = workflow["phases"][phase]
+        assert evidence["directory"] == f"init_mlff/{phase}"
+        template_path = input_dir / f"init_{phase}_INCAR"
+        template_payload = template_path.read_bytes()
+        assert evidence["incar_template"] == {
+            "name": template_path.name,
+            "size": len(template_payload),
+            "sha256": hashlib.sha256(template_payload).hexdigest(),
+        }
+        assert set(evidence["static_inputs"]) == expected_files
+        for name, identity in evidence["static_inputs"].items():
+            payload = (phase_dir / name).read_bytes()
+            assert identity == {
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
 
 
 def test_stage0_validation_uses_workflow_wide_encut_and_local_potcar_order(tmp_path):

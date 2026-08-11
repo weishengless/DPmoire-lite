@@ -50,7 +50,12 @@ copy rather than an editable development install.
 
 - `top_layer.poscar`: top monolayer primitive or pre-matched cell.
 - `bot_layer.poscar`: bottom monolayer primitive or pre-matched cell.
-- `init_INCAR`: INCAR template for the initial single-layer MLFF calculation.
+- `init_INCAR`: INCAR template for the backward-compatible manual init MLFF
+  path.
+- `init_bottom_INCAR` and `init_top_INCAR`: independent scientific templates
+  for `init_mlff_mode: single-job`. Keep species-dependent tags such as
+  `MAGMOM` and DFT+U settings explicit in the appropriate file; DPmoire-lite
+  does not infer or patch them.
 - `rlx_INCAR`: INCAR template for stacking relaxation calculations.
 - `MD_INCAR`: INCAR template for bilayer MD calculations.
 - `MD_monolayer_INCAR`: INCAR template for optional monolayer MD calculations.
@@ -75,7 +80,8 @@ with the smallest `ZVAL` in `potcar_dir`.
 
 `stage: 0` creates the first calculation set:
 
-- `init_mlff/` if `init_mlff: true`
+- `init_mlff/` if `init_mlff: true`; its layout is selected by
+  `init_mlff_mode`
 - `rlx/<i>_<j>/` folders if `do_relaxation: true`
 - `validation/<angle>/` folders if `twist_val: true`
 
@@ -115,13 +121,23 @@ production-ready feature while submitted wait remains disabled.
 
 The initial MLFF workflow is intentionally explicit:
 
-- Manual mode: stage0 creates the first `init_mlff` job, and if `submit: true`
+- `manual` is the default. Stage0 creates the historical single-folder
+  `init_mlff` job, and if `submit: true`
   without `--wait`, submits that first init job only. Stage0 still continues to
   generate and optionally submit any enabled relaxation or validation folders.
   After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use those
   files.
-- The second init MLFF step and the Stage0-to-Stage1 transition must currently be
-  completed manually after inspecting the preceding outputs.
+- `single-job` is an explicit opt-in that currently requires `submit: false`.
+  Stage0 transactionally publishes complete static inputs in
+  `init_mlff/bottom/` and `init_mlff/top/`, using `init_bottom_incar` and
+  `init_top_incar`. Each phase receives its own POSCAR, local POTCAR, own-cell
+  KPOINTS, rendered INCAR, and submit-script copy, while both INCAR files use the
+  workflow-wide cutoff. `init_mlff/manifest.yaml` records the versioned
+  `step-1-ready`/`planned` state and bounded size/SHA-256 evidence without POTCAR
+  payloads.
+- This release prepares and audits the two-phase workspace only. Seed-output
+  validation/promotion, the derived single-job wrapper, and automatic `sbatch`
+  are later workflow units; do not manually rename one phase over the other.
 
 ## Collection Semantics
 
@@ -207,6 +223,9 @@ rejected.
 | `outcar_collect_freq` | positive int | OUTCAR sampling stride for relaxation and non-ML MD collection. Validation always uses stride 1. VASP-ML MD collection reads `ML_ABN`, so this tag does not affect that path. |
 | `do_relaxation` | bool | In stage0, generate relaxation folders under `rlx/`. |
 | `init_mlff` | bool | In stage0, generate the initial `init_mlff/` folder. |
+| `init_mlff_mode` | `manual` or `single-job` | Init layout. Defaults to `manual`. `single-job` creates separate `init_mlff/bottom` and `init_mlff/top` static workspaces and currently requires `submit: false`. |
+| `init_bottom_incar` | relative path | Bottom-phase INCAR template under `input_dir`; required by `single-job`. |
+| `init_top_incar` | relative path | Top-phase INCAR template under `input_dir`; required by `single-job`. |
 | `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |
 | `preserve_grid_shift_md` | bool | Stage1 defaults to clearing all constraints. If `true`, preserve only DPmoire-lite grid-shift anchors; `F F T` means fixed x/y and movable z. |
 | `n_sectors` | int or `[nx, ny]` | Stacking-shift grid. `9` means `[9, 9]`; `[9, 8]` creates a rectangular grid. |

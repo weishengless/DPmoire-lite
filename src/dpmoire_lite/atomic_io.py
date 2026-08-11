@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
+import platform
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,6 +83,82 @@ def atomic_bytes_publish(
         if not replace_started:
             candidate.unlink(missing_ok=True)
         raise
+
+
+def atomic_directory_publish_no_replace(candidate: Path, destination: Path) -> None:
+    """Atomically publish a sibling directory without replacing any target entry."""
+    candidate = Path(candidate)
+    destination = Path(destination)
+    if candidate.parent.resolve() != destination.parent.resolve():
+        raise ValueError("Atomic directory publication requires sibling paths")
+    if not candidate.is_dir():
+        raise ValueError(f"Directory publication candidate is not a directory: {candidate}")
+
+    if os.name == "nt":
+        os.rename(candidate, destination)
+    elif platform.system() == "Linux":
+        _linux_rename_directory_no_replace(candidate, destination)
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "Atomic no-replace directory publication is unsupported on this platform",
+            str(destination),
+        )
+    _fsync_directory(destination.parent)
+
+
+def _linux_rename_directory_no_replace(candidate: Path, destination: Path) -> None:
+    at_fdcwd = -100
+    rename_noreplace = 1
+    source_bytes = os.fsencode(candidate)
+    destination_bytes = os.fsencode(destination)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            at_fdcwd,
+            source_bytes,
+            at_fdcwd,
+            destination_bytes,
+            rename_noreplace,
+        )
+    else:
+        syscall_numbers = {
+            "aarch64": 276,
+            "amd64": 316,
+            "x86_64": 316,
+        }
+        syscall_number = syscall_numbers.get(platform.machine().casefold())
+        if syscall_number is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "renameat2 is unavailable for atomic no-replace publication",
+                str(destination),
+            )
+        libc.syscall.restype = ctypes.c_long
+        result = libc.syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(at_fdcwd),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(at_fdcwd),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(rename_noreplace),
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
 
 
 def _new_candidate(destination: Path) -> Path:
