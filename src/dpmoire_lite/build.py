@@ -19,6 +19,7 @@ from .atomic_io import (
     sha256_file,
 )
 from .build_preflight import (
+    PreparedInitialSeed,
     PreparedInitMlffWorkflow,
     PreparedValidationStructure,
     PreparedWorkflowCutoff,
@@ -220,8 +221,8 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
         "md monolayers",
     )
     _assert_no_prepared_output_dirs_remain(output_dirs)
-    mlff_sources = _stage1_mlff_sources(config, preflight)
-    mlff_seed = _stage1_mlff_seed_identity(config, preflight, mlff_sources)
+    initial_seed = _stage1_prepared_seed(config, preflight)
+    mlff_seed = _stage1_mlff_seed_identity(config, initial_seed)
     generated_at = datetime.now().isoformat(timespec="seconds")
     config.work_dir.mkdir(parents=True, exist_ok=True)
     backups = []
@@ -270,8 +271,8 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             preflight.submit_script,
         )
         if config.vasp_ml:
-            _stage_prepared_mlff_files(mlff_sources, target)
-            _verify_staged_mlff_files(mlff_sources, target, mlff_seed)
+            _stage_prepared_mlff_files(initial_seed, target)
+            _verify_staged_mlff_files(initial_seed, target, mlff_seed)
         directories.append(target)
 
     monolayer_constraint_warning_emitted = False
@@ -309,8 +310,8 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
                 preflight.submit_script,
             )
             if config.vasp_ml:
-                _stage_prepared_mlff_files(mlff_sources, target)
-                _verify_staged_mlff_files(mlff_sources, target, mlff_seed)
+                _stage_prepared_mlff_files(initial_seed, target)
+                _verify_staged_mlff_files(initial_seed, target, mlff_seed)
             directories.append(target)
 
     if not config.submit:
@@ -339,96 +340,103 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
 
 def _stage1_mlff_seed_identity(
     config: DPmoireLiteConfig,
-    preflight,
-    sources: tuple[PreparedSource, ...],
+    prepared: PreparedInitialSeed | None,
 ) -> dict[str, object]:
     if not config.vasp_ml:
         return {}
-    if preflight.initial_seed is None:
+    if prepared is None:
         raise RuntimeError("Stage1 MLFF seed preflight did not return a complete seed")
 
-    ml_ab, ml_ff = sources
-    seed_identity = seed_prefix_identity(preflight.initial_seed)
+    seed_identity = seed_prefix_identity(prepared.parsed)
     return {
         "source": "init_mlff/ML_ABN",
-        "configurations": preflight.initial_seed.complete_count,
+        "configurations": prepared.parsed.complete_count,
         "digest_schema": seed_identity.schema,
         "seed_prefix_sha256": seed_identity.sha256,
-        "ml_ab_sha256": ml_ab.sha256,
-        "ml_ff_sha256": ml_ff.sha256,
+        "ml_ab_sha256": prepared.ml_ab.sha256,
+        "ml_ff_sha256": prepared.ml_ff.sha256,
     }
 
 
-def _stage1_mlff_sources(
+def _stage1_prepared_seed(
     config: DPmoireLiteConfig,
     preflight,
-) -> tuple[PreparedSource, ...]:
+) -> PreparedInitialSeed | None:
     if not config.vasp_ml:
-        return ()
-    sources = tuple(preflight.initial_seed_sources)
-    expected_paths = (
-        (config.work_dir / "init_mlff" / "ML_ABN").resolve(strict=False),
-        (config.work_dir / "init_mlff" / "ML_FFN").resolve(strict=False),
+        return None
+    prepared = preflight.initial_seed
+    if prepared is None:
+        raise RuntimeError("Stage1 MLFF seed preflight did not return a complete seed")
+    expected_ml_ab = (config.work_dir / "init_mlff" / "ML_ABN").resolve(
+        strict=False
+    )
+    expected_ml_ff = (config.work_dir / "init_mlff" / "ML_FFN").resolve(
+        strict=False
     )
     if (
-        len(sources) != 2
-        or tuple(source.path.resolve(strict=False) for source in sources)
-        != expected_paths
+        prepared.ml_ab.path.resolve(strict=False) != expected_ml_ab
+        or prepared.ml_ff.path.resolve(strict=False) != expected_ml_ff
     ):
         raise RuntimeError("Stage1 MLFF seed preflight did not return bounded sources")
-    for source in sources:
-        verify_prepared_source(source)
-    return sources
+    verify_prepared_source(prepared.ml_ab)
+    verify_prepared_source(prepared.ml_ff)
+    return prepared
 
 
 def _stage_prepared_mlff_files(
-    sources: tuple[PreparedSource, ...],
+    prepared: PreparedInitialSeed | None,
     output_dir: Path,
 ) -> None:
-    if len(sources) != 2:
-        raise RuntimeError("Stage1 MLFF staging requires two prepared seed sources")
-    for source in sources:
-        verify_prepared_source(source)
-    for source, destination_name in zip(
-        sources,
-        ("ML_AB", "ML_FF"),
-        strict=True,
-    ):
-        copy_prepared_source(source, Path(output_dir) / destination_name)
+    if prepared is None:
+        raise RuntimeError("Stage1 MLFF staging requires a prepared seed")
+    verify_prepared_source(prepared.ml_ab)
+    verify_prepared_source(prepared.ml_ff)
+    copy_prepared_source(prepared.ml_ab, Path(output_dir) / "ML_AB")
+    copy_prepared_source(prepared.ml_ff, Path(output_dir) / "ML_FF")
 
 
 def _verify_staged_mlff_files(
-    sources: tuple[PreparedSource, ...],
+    prepared: PreparedInitialSeed | None,
     output_dir: Path,
     seed_identity: dict[str, object],
 ) -> None:
-    if len(sources) != 2:
-        raise RuntimeError("Stage1 MLFF verification requires two prepared seed sources")
-    for source, destination_name, digest_key in zip(
-        sources,
-        ("ML_AB", "ML_FF"),
-        ("ml_ab_sha256", "ml_ff_sha256"),
-        strict=True,
-    ):
-        destination = Path(output_dir) / destination_name
-        if not destination.is_file():
-            raise RuntimeError(
-                f"Stage1 MLFF copy verification failed for {destination}: missing file"
-            )
-        destination_size = destination.stat().st_size
-        if source.size != destination_size:
-            raise RuntimeError(
-                f"Stage1 MLFF copy verification failed for {destination}: "
-                f"size {destination_size} != {source.size}"
-            )
-        destination_hash = sha256_file(destination)
-        if source.sha256 != seed_identity[digest_key]:
-            raise RuntimeError("Stage1 MLFF seed identity disagrees with preflight")
-        if destination_hash != source.sha256:
-            raise RuntimeError(
-                f"Stage1 MLFF copy verification failed for {destination}: "
-                f"hash {destination_hash} != {source.sha256}"
-            )
+    if prepared is None:
+        raise RuntimeError("Stage1 MLFF verification requires a prepared seed")
+    _verify_staged_mlff_file(
+        prepared.ml_ab,
+        Path(output_dir) / "ML_AB",
+        seed_identity["ml_ab_sha256"],
+    )
+    _verify_staged_mlff_file(
+        prepared.ml_ff,
+        Path(output_dir) / "ML_FF",
+        seed_identity["ml_ff_sha256"],
+    )
+
+
+def _verify_staged_mlff_file(
+    source: PreparedSource,
+    destination: Path,
+    recorded_sha256: object,
+) -> None:
+    if not destination.is_file():
+        raise RuntimeError(
+            f"Stage1 MLFF copy verification failed for {destination}: missing file"
+        )
+    destination_size = destination.stat().st_size
+    if source.size != destination_size:
+        raise RuntimeError(
+            f"Stage1 MLFF copy verification failed for {destination}: "
+            f"size {destination_size} != {source.size}"
+        )
+    destination_hash = sha256_file(destination)
+    if source.sha256 != recorded_sha256:
+        raise RuntimeError("Stage1 MLFF seed identity disagrees with preflight")
+    if destination_hash != source.sha256:
+        raise RuntimeError(
+            f"Stage1 MLFF copy verification failed for {destination}: "
+            f"hash {destination_hash} != {source.sha256}"
+        )
 
 
 def build_stage_all(
