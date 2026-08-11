@@ -20,6 +20,10 @@ from .inputs import (
     read_enmax,
     resolve_potcar_dir,
 )
+from .init_mlff import (
+    InitMlffWorkflowError,
+    validate_published_init_mlff_seed,
+)
 from .mlab import MlabParseResult, parse_mlab
 from .manifest import ManifestReadResult, read_manifest
 from .paths import relative_to_workdir, stage_dir
@@ -1056,6 +1060,20 @@ def _validate_initial_seed(
     diagnostics: list[PreflightDiagnostic],
 ) -> MlabParseResult | None:
     init_dir = config.work_dir / "init_mlff"
+    try:
+        published_seed = validate_published_init_mlff_seed(config.work_dir)
+    except InitMlffWorkflowError as exc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="mlff",
+                path=Path("init_mlff") / "manifest.yaml",
+                reason=str(exc),
+            )
+        )
+        return None
+    if published_seed is not None:
+        return published_seed
+
     seed_path = init_dir / "ML_ABN"
     force_field_path = init_dir / "ML_FFN"
     seed_display_path = Path("init_mlff") / "ML_ABN"

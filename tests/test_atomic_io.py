@@ -146,3 +146,27 @@ def test_atomic_directory_publish_refuses_dangling_symlink(tmp_path):
 
     assert destination.is_symlink()
     assert (candidate / "manifest.yaml").read_text(encoding="utf-8") == "candidate\n"
+
+
+def test_atomic_file_publish_installs_candidate_without_replacement(tmp_path):
+    candidate = tmp_path / ".ML_AB.candidate"
+    destination = tmp_path / "ML_AB"
+    candidate.write_bytes(b"verified-seed\n")
+
+    atomic_io.atomic_file_publish_no_replace(candidate, destination)
+
+    assert not candidate.exists()
+    assert destination.read_bytes() == b"verified-seed\n"
+
+
+def test_atomic_file_publish_refuses_existing_destination(tmp_path):
+    candidate = tmp_path / ".ML_AB.candidate"
+    destination = tmp_path / "ML_AB"
+    candidate.write_bytes(b"candidate\n")
+    destination.write_bytes(b"existing\n")
+
+    with pytest.raises(FileExistsError):
+        atomic_io.atomic_file_publish_no_replace(candidate, destination)
+
+    assert candidate.read_bytes() == b"candidate\n"
+    assert destination.read_bytes() == b"existing\n"

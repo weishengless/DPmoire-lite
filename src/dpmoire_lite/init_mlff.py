@@ -1,0 +1,677 @@
+from __future__ import annotations
+
+from collections import Counter
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+import shutil
+from typing import Protocol
+
+import numpy as np
+from ase.io.vasp import read_vasp
+
+from .atomic_io import (
+    atomic_file_publish_no_replace,
+    create_candidate,
+    fsync_directory,
+    fsync_path,
+    sha256_file,
+)
+from .manifest import Manifest, read_manifest, write_manifest
+from .mlab import MlabParseResult, seed_prefix_identity, parse_mlab
+from .mlff_seed import SeedPrefixVerifier
+
+
+class InitMlffWorkflowError(RuntimeError):
+    """A bounded init-MLFF lifecycle or evidence failure."""
+
+
+@dataclass(frozen=True)
+class InitMlffCalculation:
+    phase: str
+    role: str
+    name: str
+    directory: Path
+
+
+class InitMlffCalculationAdapter(Protocol):
+    def run(self, request: InitMlffCalculation) -> int:
+        """Run one phase synchronously and return its process exit code."""
+
+
+@dataclass(frozen=True)
+class _PublishedCopy:
+    destination: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _ValidatedPhaseOutput:
+    parsed: MlabParseResult
+    ml_ab_sha256: str
+    ml_ff_sha256: str
+
+
+class InitMlffWorkflow:
+    """Execute one fresh two-phase init-MLFF transaction."""
+
+    def __init__(self, work_dir: Path) -> None:
+        self.work_dir = Path(work_dir).resolve(strict=False)
+        self.root_dir = self.work_dir / "init_mlff"
+
+    def run(self, adapter: InitMlffCalculationAdapter) -> Manifest:
+        manifest = self._load_fresh_manifest()
+        bottom_dir = self.root_dir / "bottom"
+        top_dir = self.root_dir / "top"
+        self._preflight(manifest, bottom_dir, top_dir)
+
+        manifest = self._transition(
+            manifest,
+            "step-1-running",
+            "step-1-running",
+            "planned",
+        )
+        step1_request = InitMlffCalculation(
+            phase="step1",
+            role="step-1",
+            name="bottom",
+            directory=bottom_dir,
+        )
+        self._invoke_adapter(
+            adapter,
+            step1_request,
+            manifest,
+            failure_states=("step-1-failed", "step-1-failed", "planned"),
+        )
+        try:
+            self._verify_phase_static(manifest, "bottom", bottom_dir)
+            self._verify_phase_static(manifest, "top", top_dir)
+            step1_output = _validate_phase_output(
+                step1_request,
+                prior_seed=None,
+            )
+        except InitMlffWorkflowError as exc:
+            self._fail(
+                manifest,
+                ("step-1-failed", "step-1-failed", "planned"),
+                exc,
+            )
+
+        manifest = self._transition(
+            manifest,
+            "step-1-complete",
+            "step-1-complete",
+            "planned",
+        )
+        handoff: tuple[_PublishedCopy, ...] = ()
+        try:
+            handoff = _publish_copy_pair(
+                (
+                    (
+                        bottom_dir / "ML_ABN",
+                        top_dir / "ML_AB",
+                        step1_output.ml_ab_sha256,
+                    ),
+                    (
+                        bottom_dir / "ML_FFN",
+                        top_dir / "ML_FF",
+                        step1_output.ml_ff_sha256,
+                    ),
+                )
+            )
+            manifest = self._transition(
+                manifest,
+                "step-2-ready",
+                "step-1-complete",
+                "step-2-ready",
+            )
+        except Exception as exc:
+            if handoff:
+                _rollback_published_copies(handoff)
+            error = InitMlffWorkflowError(
+                "init MLFF step1 handoff invariant failed; step2 is not ready"
+            )
+            self._fail(
+                manifest,
+                ("step-1-failed", "step-1-failed", "planned"),
+                error,
+                cause=exc,
+            )
+
+        manifest = self._transition(
+            manifest,
+            "step-2-running",
+            "step-1-complete",
+            "step-2-running",
+        )
+        step2_request = InitMlffCalculation(
+            phase="step2",
+            role="step-2",
+            name="top",
+            directory=top_dir,
+        )
+        self._invoke_adapter(
+            adapter,
+            step2_request,
+            manifest,
+            failure_states=("step-2-failed", "step-1-complete", "step-2-failed"),
+        )
+        try:
+            self._verify_phase_static(manifest, "top", top_dir)
+            step2_output = _validate_phase_output(
+                step2_request,
+                prior_seed=step1_output,
+            )
+        except InitMlffWorkflowError as exc:
+            self._fail(
+                manifest,
+                ("step-2-failed", "step-1-complete", "step-2-failed"),
+                exc,
+            )
+
+        published: tuple[_PublishedCopy, ...] = ()
+        try:
+            published = _publish_copy_pair(
+                (
+                    (
+                        top_dir / "ML_ABN",
+                        self.root_dir / "ML_ABN",
+                        step2_output.ml_ab_sha256,
+                    ),
+                    (
+                        top_dir / "ML_FFN",
+                        self.root_dir / "ML_FFN",
+                        step2_output.ml_ff_sha256,
+                    ),
+                )
+            )
+            seed_evidence = _published_seed_evidence(
+                self.root_dir,
+                step2_output.parsed,
+            )
+            manifest = self._transition(
+                manifest,
+                "complete",
+                "complete",
+                "complete",
+                mlff_seed=seed_evidence,
+            )
+        except Exception as exc:
+            if published:
+                _rollback_published_copies(published)
+            error = InitMlffWorkflowError(
+                "init MLFF step2 publication invariant failed; final seed is unpublished"
+            )
+            self._fail(
+                manifest,
+                ("step-2-failed", "step-1-complete", "step-2-failed"),
+                error,
+                cause=exc,
+            )
+        return manifest
+
+    def _load_fresh_manifest(self) -> Manifest:
+        try:
+            result = read_manifest(self.work_dir, "init_mlff")
+        except Exception as exc:
+            raise InitMlffWorkflowError(
+                "init MLFF preflight invariant failed: workflow manifest is invalid"
+            ) from exc
+        if result.kind != "current" or result.manifest is None:
+            raise InitMlffWorkflowError(
+                "init MLFF preflight invariant failed: current workflow manifest is required"
+            )
+        manifest = result.manifest
+        workflow = manifest.init_workflow
+        if not workflow:
+            raise InitMlffWorkflowError(
+                "init MLFF preflight invariant failed: automated workflow evidence is missing"
+            )
+        state = workflow["state"]
+        if state != "step-1-ready":
+            raise InitMlffWorkflowError(
+                "init MLFF state invariant failed: a fresh step-1-ready workflow is required; "
+                f"found {state!r}. No implicit resume, retry, or overwrite is allowed"
+            )
+        return manifest
+
+    def _preflight(
+        self,
+        manifest: Manifest,
+        bottom_dir: Path,
+        top_dir: Path,
+    ) -> None:
+        if self.root_dir.is_symlink() or not self.root_dir.is_dir():
+            raise InitMlffWorkflowError(
+                "init MLFF preflight invariant failed: workflow root must be a real directory"
+            )
+        for destination in (
+            self.root_dir / "ML_ABN",
+            self.root_dir / "ML_FFN",
+            top_dir / "ML_AB",
+            top_dir / "ML_FF",
+            bottom_dir / "ML_ABN",
+            bottom_dir / "ML_FFN",
+            top_dir / "ML_ABN",
+            top_dir / "ML_FFN",
+        ):
+            if destination.exists() or destination.is_symlink():
+                raise InitMlffWorkflowError(
+                    "init MLFF preflight invariant failed: preexisting workflow output "
+                    f"{destination.name!r} conflicts with a fresh transaction"
+                )
+        if any(self.root_dir.rglob("*.candidate")):
+            raise InitMlffWorkflowError(
+                "init MLFF preflight invariant failed: stale publication candidate exists"
+            )
+
+        for name, expected_dir in (("bottom", bottom_dir), ("top", top_dir)):
+            self._verify_phase_static(manifest, name, expected_dir)
+
+    def _verify_phase_static(
+        self,
+        manifest: Manifest,
+        name: str,
+        expected_dir: Path,
+    ) -> None:
+        phase = "step1" if name == "bottom" else "step2"
+        record = manifest.init_workflow["phases"][name]
+        phase_dir = self.work_dir / record["directory"]
+        if phase_dir != expected_dir or phase_dir.is_symlink() or not phase_dir.is_dir():
+            raise InitMlffWorkflowError(
+                f"init MLFF {phase} static-input invariant failed: "
+                f"{name} phase directory is invalid"
+            )
+        for filename, identity in record["static_inputs"].items():
+            path = phase_dir / filename
+            if not _matches_file_identity(path, identity):
+                raise InitMlffWorkflowError(
+                    f"init MLFF {phase} static-input invariant failed: "
+                    f"{name} static input {filename!r} changed after planning"
+                )
+
+    def _invoke_adapter(
+        self,
+        adapter: InitMlffCalculationAdapter,
+        request: InitMlffCalculation,
+        manifest: Manifest,
+        *,
+        failure_states: tuple[str, str, str],
+    ) -> None:
+        try:
+            exit_code = adapter.run(request)
+        except Exception as exc:
+            error = InitMlffWorkflowError(
+                f"init MLFF {request.phase} adapter invariant failed: synchronous adapter raised "
+                f"{type(exc).__name__}"
+            )
+            self._fail(
+                manifest,
+                failure_states,
+                error,
+                cause=exc,
+                suppress_context=True,
+            )
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            error = InitMlffWorkflowError(
+                f"init MLFF {request.phase} adapter invariant failed: exit code must be an integer"
+            )
+            self._fail(manifest, failure_states, error)
+        if exit_code != 0:
+            error = InitMlffWorkflowError(
+                f"init MLFF {request.phase} calculation failed with exit code {exit_code}"
+            )
+            self._fail(manifest, failure_states, error)
+
+    def _transition(
+        self,
+        manifest: Manifest,
+        workflow_state: str,
+        bottom_state: str,
+        top_state: str,
+        *,
+        mlff_seed: dict[str, object] | None = None,
+    ) -> Manifest:
+        candidate = deepcopy(manifest)
+        candidate.init_workflow["state"] = workflow_state
+        candidate.init_workflow["phases"]["bottom"]["state"] = bottom_state
+        candidate.init_workflow["phases"]["top"]["state"] = top_state
+        if mlff_seed is not None:
+            candidate.mlff_seed = dict(mlff_seed)
+        try:
+            write_manifest(self.work_dir, candidate)
+        except Exception as exc:
+            raise InitMlffWorkflowError(
+                "init MLFF state publication invariant failed for "
+                f"{workflow_state!r}"
+            ) from exc
+        return candidate
+
+    def _fail(
+        self,
+        manifest: Manifest,
+        states: tuple[str, str, str],
+        error: InitMlffWorkflowError,
+        *,
+        cause: Exception | None = None,
+        suppress_context: bool = False,
+    ) -> None:
+        try:
+            self._transition(manifest, *states)
+        except Exception as state_exc:
+            raise InitMlffWorkflowError(
+                "init MLFF failure-state publication invariant failed"
+            ) from state_exc
+        if suppress_context:
+            raise error from None
+        if cause is not None:
+            raise error from cause
+        raise error
+
+
+def validate_published_init_mlff_seed(work_dir: Path) -> MlabParseResult | None:
+    """Return a trusted automated seed, or None for a legacy/manual workspace."""
+    work_dir = Path(work_dir).resolve(strict=False)
+    root = work_dir / "init_mlff"
+    phase_layout_exists = (root / "bottom").exists() or (root / "top").exists()
+    try:
+        result = read_manifest(work_dir, "init_mlff")
+    except Exception as exc:
+        raise InitMlffWorkflowError(
+            "automated init workflow manifest invariant failed: manifest is invalid"
+        ) from exc
+    if result.kind != "current" or result.manifest is None:
+        if phase_layout_exists:
+            raise InitMlffWorkflowError(
+                "automated init workflow manifest invariant failed: current manifest is missing"
+            )
+        return None
+    manifest = result.manifest
+    if not manifest.init_workflow:
+        if phase_layout_exists:
+            raise InitMlffWorkflowError(
+                "automated init workflow manifest invariant failed: lifecycle evidence is missing"
+            )
+        return None
+
+    state = manifest.init_workflow["state"]
+    if state != "complete":
+        raise InitMlffWorkflowError(
+            f"automated init workflow state {state!r} is not complete; "
+            "Stage1 refuses an unpublished seed"
+        )
+    seed_path = root / "ML_ABN"
+    force_field_path = root / "ML_FFN"
+    _require_nonempty_regular_file(seed_path, "published", "ML_ABN")
+    _require_nonempty_regular_file(force_field_path, "published", "ML_FFN")
+    parsed = _parse_complete_mlab(seed_path, "published")
+
+    evidence = manifest.mlff_seed
+    required = {
+        "source",
+        "configurations",
+        "digest_schema",
+        "seed_prefix_sha256",
+        "ml_ab_sha256",
+        "ml_ff_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: bounded identity is missing"
+        )
+    if evidence["source"] != "init_mlff/ML_ABN":
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: source is invalid"
+        )
+    if evidence["digest_schema"] != "mlab-seed-v1":
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: digest schema is invalid"
+        )
+    configurations = evidence["configurations"]
+    if (
+        isinstance(configurations, bool)
+        or not isinstance(configurations, int)
+        or configurations <= 0
+        or configurations != parsed.complete_count
+    ):
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: configuration count changed"
+        )
+    for field in ("seed_prefix_sha256", "ml_ab_sha256", "ml_ff_sha256"):
+        if not _is_sha256(evidence[field]):
+            raise InitMlffWorkflowError(
+                "published init MLFF seed evidence invariant failed: "
+                f"{field} is invalid"
+            )
+    if evidence["seed_prefix_sha256"] != seed_prefix_identity(parsed).sha256:
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: canonical seed hash changed"
+        )
+    if evidence["ml_ab_sha256"] != sha256_file(seed_path):
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: ML_ABN hash changed"
+        )
+    if evidence["ml_ff_sha256"] != sha256_file(force_field_path):
+        raise InitMlffWorkflowError(
+            "published init MLFF seed evidence invariant failed: ML_FFN hash changed"
+        )
+    return parsed
+
+
+def _validate_phase_output(
+    request: InitMlffCalculation,
+    *,
+    prior_seed: _ValidatedPhaseOutput | None,
+) -> _ValidatedPhaseOutput:
+    seed_path = request.directory / "ML_ABN"
+    force_field_path = request.directory / "ML_FFN"
+    _require_nonempty_regular_file(seed_path, request.phase, "ML_ABN")
+    _require_nonempty_regular_file(force_field_path, request.phase, "ML_FFN")
+    try:
+        seed_hash = sha256_file(seed_path)
+        force_field_hash = sha256_file(force_field_path)
+    except OSError as exc:
+        raise InitMlffWorkflowError(
+            f"init MLFF {request.phase} output invariant failed: output is unreadable"
+        ) from exc
+    parsed = _parse_complete_mlab(seed_path, request.phase)
+    try:
+        expected_atoms = read_vasp(request.directory / "POSCAR")
+    except Exception as exc:
+        raise InitMlffWorkflowError(
+            f"init MLFF {request.phase} output invariant failed: POSCAR evidence is unreadable"
+        ) from exc
+
+    if prior_seed is None:
+        configurations = parsed.configurations
+    else:
+        prior_parsed = prior_seed.parsed
+        if parsed.complete_count <= prior_parsed.complete_count:
+            raise InitMlffWorkflowError(
+                f"init MLFF {request.phase} output invariant failed: "
+                "ML_ABN contains no new top configuration"
+            )
+        verification = SeedPrefixVerifier(prior_parsed.configurations).verify(
+            parsed.configurations
+        )
+        if verification.outcome == "mismatch":
+            raise InitMlffWorkflowError(
+                f"init MLFF {request.phase} output invariant failed: "
+                "ML_ABN seed prefix does not match trusted step1 output"
+            )
+        configurations = parsed.configurations[prior_parsed.complete_count :]
+
+    if not configurations or any(
+        not _configuration_matches_atoms(configuration, expected_atoms)
+        for configuration in configurations
+    ):
+        raise InitMlffWorkflowError(
+            f"init MLFF {request.phase} output invariant failed: "
+            "ML_ABN phase structure does not match POSCAR evidence"
+        )
+    try:
+        if (
+            sha256_file(seed_path) != seed_hash
+            or sha256_file(force_field_path) != force_field_hash
+        ):
+            raise InitMlffWorkflowError(
+                f"init MLFF {request.phase} output invariant failed: "
+                "output changed during validation"
+            )
+    except OSError as exc:
+        raise InitMlffWorkflowError(
+            f"init MLFF {request.phase} output invariant failed: output changed during validation"
+        ) from exc
+    return _ValidatedPhaseOutput(
+        parsed=parsed,
+        ml_ab_sha256=seed_hash,
+        ml_ff_sha256=force_field_hash,
+    )
+
+
+def _parse_complete_mlab(path: Path, phase: str) -> MlabParseResult:
+    try:
+        parsed = parse_mlab(path)
+    except Exception:
+        raise InitMlffWorkflowError(
+            f"init MLFF {phase} output invariant failed: ML_ABN is malformed"
+        ) from None
+    if parsed.status != "complete" or parsed.declared_count != parsed.complete_count:
+        raise InitMlffWorkflowError(
+            f"init MLFF {phase} output invariant failed: ML_ABN must be complete "
+            f"(status={parsed.status!r}, declared={parsed.declared_count}, "
+            f"complete={parsed.complete_count})"
+        )
+    if parsed.complete_count <= 0:
+        raise InitMlffWorkflowError(
+            f"init MLFF {phase} output invariant failed: ML_ABN has no configurations"
+        )
+    return parsed
+
+
+def _configuration_matches_atoms(configuration, atoms) -> bool:
+    expected_counts = Counter(atoms.get_chemical_symbols())
+    actual_counts = Counter()
+    for element, count in zip(configuration.elements, configuration.counts, strict=True):
+        actual_counts[element] += count
+    if configuration.n_atoms != len(atoms) or actual_counts != expected_counts:
+        return False
+    return bool(
+        np.allclose(
+            np.asarray(configuration.lattice, dtype=float),
+            np.asarray(atoms.cell.array, dtype=float),
+            rtol=1.0e-10,
+            atol=1.0e-8,
+        )
+    )
+
+
+def _require_nonempty_regular_file(path: Path, phase: str, name: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise InitMlffWorkflowError(
+            f"init MLFF {phase} output invariant failed: {name} is missing"
+        )
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise InitMlffWorkflowError(
+            f"init MLFF {phase} output invariant failed: {name} is unreadable"
+        ) from exc
+    if size == 0:
+        raise InitMlffWorkflowError(
+            f"init MLFF {phase} output invariant failed: {name} is empty"
+        )
+
+
+def _matches_file_identity(path: Path, identity: dict[str, object]) -> bool:
+    try:
+        return (
+            not path.is_symlink()
+            and path.is_file()
+            and path.stat().st_size == identity["size"]
+            and sha256_file(path) == identity["sha256"]
+        )
+    except OSError:
+        return False
+
+
+def _is_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _publish_copy_pair(
+    pairs: tuple[tuple[Path, Path, str], tuple[Path, Path, str]],
+) -> tuple[_PublishedCopy, ...]:
+    prepared: list[tuple[Path, Path, str]] = []
+    published: list[_PublishedCopy] = []
+    try:
+        for source, destination, expected_hash in pairs:
+            if source.is_symlink() or not source.is_file():
+                raise OSError(f"source is not a regular file: {source.name}")
+            if destination.exists() or destination.is_symlink():
+                raise FileExistsError(destination)
+            if sha256_file(source) != expected_hash:
+                raise OSError(f"validated source changed: {source.name}")
+            expected_size = source.stat().st_size
+            candidate = create_candidate(destination)
+            shutil.copyfile(source, candidate)
+            fsync_path(candidate)
+            if (
+                candidate.stat().st_size != expected_size
+                or sha256_file(candidate) != expected_hash
+            ):
+                raise OSError(f"candidate copy verification failed: {destination.name}")
+            prepared.append((candidate, destination, expected_hash))
+
+        for candidate, destination, expected_hash in prepared:
+            atomic_file_publish_no_replace(candidate, destination)
+            published.append(
+                _PublishedCopy(destination=destination, sha256=expected_hash)
+            )
+            if sha256_file(destination) != expected_hash:
+                raise OSError(f"published copy verification failed: {destination.name}")
+        return tuple(published)
+    except BaseException:
+        if published:
+            _rollback_published_copies(tuple(published))
+        raise
+    finally:
+        for candidate, _destination, _expected_hash in prepared:
+            candidate.unlink(missing_ok=True)
+
+
+def _rollback_published_copies(published: tuple[_PublishedCopy, ...]) -> None:
+    parents = set()
+    for record in reversed(published):
+        destination = record.destination
+        if destination.is_symlink() or not destination.is_file():
+            raise InitMlffWorkflowError(
+                "init MLFF rollback invariant failed: published copy identity changed"
+            )
+        if sha256_file(destination) != record.sha256:
+            raise InitMlffWorkflowError(
+                "init MLFF rollback invariant failed: published copy hash changed"
+            )
+        destination.unlink()
+        parents.add(destination.parent)
+    for parent in parents:
+        fsync_directory(parent)
+
+
+def _published_seed_evidence(
+    root: Path,
+    parsed: MlabParseResult,
+) -> dict[str, object]:
+    identity = seed_prefix_identity(parsed)
+    return {
+        "source": "init_mlff/ML_ABN",
+        "configurations": parsed.complete_count,
+        "digest_schema": identity.schema,
+        "seed_prefix_sha256": identity.sha256,
+        "ml_ab_sha256": sha256_file(root / "ML_ABN"),
+        "ml_ff_sha256": sha256_file(root / "ML_FFN"),
+    }

@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from copy import deepcopy
 
 import pytest
 import yaml
@@ -49,6 +50,17 @@ def _valid_init_workflow():
                 "static_inputs": static_inputs,
             },
         },
+    }
+
+
+def _valid_published_init_seed():
+    return {
+        "source": "init_mlff/ML_ABN",
+        "configurations": 2,
+        "digest_schema": "mlab-seed-v1",
+        "seed_prefix_sha256": "d" * 64,
+        "ml_ab_sha256": "e" * 64,
+        "ml_ff_sha256": "f" * 64,
     }
 
 
@@ -137,6 +149,81 @@ def test_init_workflow_v1_round_trip_preserves_bounded_evidence(tmp_path):
     assert result.kind == "current"
     assert result.manifest is not None
     assert result.manifest.init_workflow == manifest.init_workflow
+
+
+@pytest.mark.parametrize(
+    ("workflow_state", "bottom_state", "top_state"),
+    [
+        ("step-1-running", "step-1-running", "planned"),
+        ("step-1-failed", "step-1-failed", "planned"),
+        ("step-1-complete", "step-1-complete", "planned"),
+        ("step-2-ready", "step-1-complete", "step-2-ready"),
+        ("step-2-running", "step-1-complete", "step-2-running"),
+        ("step-2-failed", "step-1-complete", "step-2-failed"),
+        ("complete", "complete", "complete"),
+    ],
+)
+def test_init_workflow_v1_round_trip_accepts_transactional_lifecycle_states(
+    tmp_path,
+    workflow_state,
+    bottom_state,
+    top_state,
+):
+    work_dir = tmp_path / "work"
+    workflow = deepcopy(_valid_init_workflow())
+    workflow["state"] = workflow_state
+    workflow["phases"]["bottom"]["state"] = bottom_state
+    workflow["phases"]["top"]["state"] = top_state
+    manifest = Manifest(
+        stage="init_mlff",
+        generated_at="2026-08-11T12:00:00",
+        directories=["init_mlff/bottom", "init_mlff/top"],
+        mlff_seed=(
+            _valid_published_init_seed() if workflow_state == "complete" else {}
+        ),
+        init_workflow=workflow,
+    )
+
+    write_manifest(work_dir, manifest)
+
+    result = read_manifest(work_dir, "init_mlff")
+    assert result.kind == "current"
+    assert result.manifest is not None
+    assert result.manifest.init_workflow == workflow
+
+
+def test_init_workflow_v1_rejects_inconsistent_transactional_phase_states(tmp_path):
+    work_dir = tmp_path / "work"
+    workflow = deepcopy(_valid_init_workflow())
+    workflow["state"] = "step-2-ready"
+    workflow["phases"]["bottom"]["state"] = "step-1-running"
+    workflow["phases"]["top"]["state"] = "step-2-ready"
+    manifest = Manifest(
+        stage="init_mlff",
+        generated_at="2026-08-11T12:00:00",
+        directories=["init_mlff/bottom", "init_mlff/top"],
+        init_workflow=workflow,
+    )
+
+    with pytest.raises(ValueError, match="requires bottom/top states"):
+        write_manifest(work_dir, manifest)
+
+
+def test_complete_init_workflow_requires_bounded_published_seed_evidence(tmp_path):
+    work_dir = tmp_path / "work"
+    workflow = deepcopy(_valid_init_workflow())
+    workflow["state"] = "complete"
+    workflow["phases"]["bottom"]["state"] = "complete"
+    workflow["phases"]["top"]["state"] = "complete"
+    manifest = Manifest(
+        stage="init_mlff",
+        generated_at="2026-08-11T12:00:00",
+        directories=["init_mlff/bottom", "init_mlff/top"],
+        init_workflow=workflow,
+    )
+
+    with pytest.raises(ValueError, match="mlff_seed.*fields mismatch"):
+        write_manifest(work_dir, manifest)
 
 
 @pytest.mark.parametrize(

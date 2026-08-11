@@ -97,7 +97,7 @@ def atomic_directory_publish_no_replace(candidate: Path, destination: Path) -> N
     if os.name == "nt":
         os.rename(candidate, destination)
     elif platform.system() == "Linux":
-        _linux_rename_directory_no_replace(candidate, destination)
+        _linux_rename_no_replace(candidate, destination)
     else:
         raise OSError(
             errno.ENOTSUP,
@@ -107,7 +107,29 @@ def atomic_directory_publish_no_replace(candidate: Path, destination: Path) -> N
     _fsync_directory(destination.parent)
 
 
-def _linux_rename_directory_no_replace(candidate: Path, destination: Path) -> None:
+def atomic_file_publish_no_replace(candidate: Path, destination: Path) -> None:
+    """Atomically publish a sibling file without replacing any target entry."""
+    candidate = Path(candidate)
+    destination = Path(destination)
+    if candidate.parent.resolve() != destination.parent.resolve():
+        raise ValueError("Atomic file publication requires sibling paths")
+    if not candidate.is_file() or candidate.is_symlink():
+        raise ValueError(f"File publication candidate is not a regular file: {candidate}")
+
+    if os.name == "nt":
+        os.rename(candidate, destination)
+    elif platform.system() == "Linux":
+        _linux_rename_no_replace(candidate, destination)
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "Atomic no-replace file publication is unsupported on this platform",
+            str(destination),
+        )
+    _fsync_directory(destination.parent)
+
+
+def _linux_rename_no_replace(candidate: Path, destination: Path) -> None:
     at_fdcwd = -100
     rename_noreplace = 1
     source_bytes = os.fsencode(candidate)

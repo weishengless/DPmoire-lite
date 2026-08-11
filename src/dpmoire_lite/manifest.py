@@ -16,7 +16,19 @@ from dpmoire_lite.paths import manifest_path
 MANIFEST_SCHEMA_VERSION = 2
 INIT_WORKFLOW_SCHEMA = "dpmoire-lite.init-workflow.v1"
 
-_INIT_WORKFLOW_STATES = {"planned", "step-1-ready", "conflict"}
+_INIT_WORKFLOW_STATE_PHASES = {
+    "planned": ("planned", "planned"),
+    "step-1-ready": ("step-1-ready", "planned"),
+    "step-1-running": ("step-1-running", "planned"),
+    "step-1-failed": ("step-1-failed", "planned"),
+    "step-1-complete": ("step-1-complete", "planned"),
+    "step-2-ready": ("step-1-complete", "step-2-ready"),
+    "step-2-running": ("step-1-complete", "step-2-running"),
+    "step-2-failed": ("step-1-complete", "step-2-failed"),
+    "complete": ("complete", "complete"),
+    "conflict": ("conflict", "conflict"),
+}
+_INIT_WORKFLOW_STATES = set(_INIT_WORKFLOW_STATE_PHASES)
 _INIT_PHASE_ROLES = {"bottom": "step-1", "top": "step-2"}
 
 _COLLECT_OUTPUTS = {
@@ -206,7 +218,12 @@ def _validate_v2_data(
     _require_mapping_field(data, path, "mlff_seed")
     if "init_workflow" in data:
         _require_mapping_field(data, path, "init_workflow")
-        _validate_init_workflow(data["init_workflow"], path, stage=data["stage"])
+        _validate_init_workflow(
+            data["init_workflow"],
+            path,
+            stage=data["stage"],
+            mlff_seed=data["mlff_seed"],
+        )
     _require_record_list(data, path, "jobs")
     _require_record_list(data, path, "skipped")
     _require_record_list(data, path, "failed")
@@ -287,6 +304,7 @@ def _validate_init_workflow(
     path: Path,
     *,
     stage: str,
+    mlff_seed: Mapping[str, Any],
 ) -> None:
     if not workflow:
         return
@@ -369,6 +387,79 @@ def _validate_init_workflow(
                 path,
                 f"{field_name}.static_inputs.{name}",
                 include_name=False,
+            )
+
+    actual_phase_states = tuple(
+        phases[phase_name]["state"] for phase_name in _INIT_PHASE_ROLES
+    )
+    expected_phase_states = _INIT_WORKFLOW_STATE_PHASES[workflow["state"]]
+    if actual_phase_states != expected_phase_states:
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow.state {workflow['state']!r} "
+            f"requires bottom/top states {expected_phase_states!r}, got "
+            f"{actual_phase_states!r}"
+        )
+    if workflow["state"] == "complete":
+        _validate_published_init_seed(mlff_seed, path)
+    elif mlff_seed:
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow state {workflow['state']!r} "
+            "must not publish mlff_seed evidence"
+        )
+
+
+def _validate_published_init_seed(
+    evidence: Mapping[str, Any],
+    path: Path,
+) -> None:
+    field_name = "mlff_seed"
+    _require_exact_mapping_fields(
+        evidence,
+        path,
+        field_name,
+        {
+            "source",
+            "configurations",
+            "digest_schema",
+            "seed_prefix_sha256",
+            "ml_ab_sha256",
+            "ml_ff_sha256",
+        },
+    )
+    if evidence["source"] != "init_mlff/ML_ABN":
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name}.source must be "
+            "'init_mlff/ML_ABN'"
+        )
+    configurations = evidence["configurations"]
+    if (
+        isinstance(configurations, bool)
+        or not isinstance(configurations, int)
+        or configurations <= 0
+    ):
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name}.configurations must be a "
+            "positive integer"
+        )
+    if evidence["digest_schema"] != "mlab-seed-v1":
+        raise ValueError(
+            f"Invalid manifest {path}: {field_name}.digest_schema must be "
+            "'mlab-seed-v1'"
+        )
+    for digest_field in (
+        "seed_prefix_sha256",
+        "ml_ab_sha256",
+        "ml_ff_sha256",
+    ):
+        digest = evidence[digest_field]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                f"Invalid manifest {path}: {field_name}.{digest_field} must be a "
+                "lowercase SHA-256"
             )
 
 
