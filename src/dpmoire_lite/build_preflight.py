@@ -421,6 +421,30 @@ def _prepare_init_mlff_workflow(
             )
         )
         return None
+    if config.submit and submit_adapter.sbatch_wait_requested:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="script",
+                path=submit_script.path,
+                reason=(
+                    "single-job sbatch wait directives are incompatible with "
+                    "fire-and-forget automatic submission"
+                ),
+            )
+        )
+        return None
+    if config.submit and submit_adapter.translated_scheduler_prefixes:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="script",
+                path=submit_script.path,
+                reason=(
+                    "single-job translated scheduler directives (#PBS/#BSUB) "
+                    "are incompatible with automatic submission"
+                ),
+            )
+        )
+        return None
     try:
         bottom_atoms = sort(
             make_supercell(
@@ -470,7 +494,12 @@ def _prepare_init_mlff_workflow(
 
 
 def _is_safe_basename(value: str) -> bool:
-    if not value or value in {".", ".."} or value != value.strip():
+    if (
+        not value
+        or value in {".", ".."}
+        or value != value.strip()
+        or value.startswith("-")
+    ):
         return False
     invalid_characters = '<>:"/\\|?*'
     if any(character in invalid_characters or ord(character) < 32 for character in value):

@@ -1,6 +1,8 @@
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
+import dpmoire_lite.slurm as slurm_module
 from dpmoire_lite.build import _submit_dirs
 from dpmoire_lite.slurm import SlurmJob, SlurmRunner
 
@@ -27,6 +29,36 @@ class QueueRunner(SlurmRunner):
             state = sequence.pop(0)
             states[job_id] = state
         return states
+
+
+def test_submit_removes_inherited_sbatch_wait_environment(monkeypatch, tmp_path):
+    observed = {}
+
+    def synthetic_run(command, *, cwd, check, text, capture_output, env):
+        observed.update(
+            command=command,
+            cwd=cwd,
+            check=check,
+            text=text,
+            capture_output=capture_output,
+            env=env,
+        )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="Submitted batch job 12345\n",
+        )
+
+    monkeypatch.setenv("SBATCH_WAIT", "1")
+    monkeypatch.setattr(slurm_module.subprocess, "run", synthetic_run)
+
+    job = SlurmRunner("submit.sh", n_nodes=1, auto_resub=False).submit(
+        tmp_path,
+        "init_mlff",
+    )
+
+    assert job.job_id == "12345"
+    assert "SBATCH_WAIT" not in observed["env"]
 
 
 def test_submit_many_wait_throttles_to_one_active_job():

@@ -84,6 +84,15 @@ DPmoire-lite replaces only that marked line in a derived copy and never searches
 for or rewrites `srun`, `mpirun`, containers, pipelines, or redirections in the
 function body.
 
+For automatic `single-job` submission, the template must not request Slurm's
+wait mode through `#SBATCH --wait`, `-W`, or a clustered short option containing
+`W`; the deprecated `#SLURM -W` spelling and every `hetjob`/`packjob` component
+are checked as well. Preflight rejects those directives before writing the work
+tree. Because `sbatch` may translate foreign scheduler syntax, automatic mode
+also rejects any `#PBS` or `#BSUB` prefix anywhere in the template; use native
+`#SBATCH` directives or `submit: false`. These restrictions do not apply to
+`submit: false`, where the user owns the later manual `sbatch` call.
+
 `potcar_dir` should point to a VASP POTCAR root. With the default
 `potcar_policy: recommend`, DPmoire-lite tries VASP's recommended mapped folder
 first, for example `Li_sv` for `Li`, then falls back to the plain element
@@ -141,24 +150,40 @@ The initial MLFF workflow is intentionally explicit:
   generate and optionally submit any enabled relaxation or validation folders.
   After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use those
   files.
-- `single-job` is an explicit opt-in that requires `submit: false`. Stage0
-  transactionally publishes complete static inputs in
+- `single-job` is an explicit opt-in. Stage0 transactionally publishes complete
+  static inputs in
   `init_mlff/bottom/` and `init_mlff/top/`, using `init_bottom_incar` and
   `init_top_incar`. Each phase receives its own POSCAR, local POTCAR, own-cell
   KPOINTS, rendered INCAR, and submit-script copy, while both INCAR files use the
   workflow-wide cutoff. It also renders `init_mlff/<dft_script>` from the marked
   source template without changing that source. The manifest records both
   script hashes and bounded workflow evidence without POTCAR payloads.
-- After build, inspect the derived script, change into `<work_dir>/init_mlff`,
-  and submit it once with `sbatch <dft_script>`. The generated adapter resolves
+- With `submit: false`, build stops after generation. Inspect the derived script,
+  change into `<work_dir>/init_mlff`, and submit it once with
+  `sbatch <dft_script>`. With `submit: true` and no `--wait`, DPmoire-lite makes
+  exactly one `sbatch` request for that root script, records the returned job ID
+  and generated-script hash in `init_mlff/manifest.yaml`, and returns without
+  claiming the workflow completed. The generated adapter resolves
   the workflow from Slurm's submit directory, so submitting from that directory
   keeps a relocated workspace portable. In one allocation it runs bottom,
   validates and copies the continuation seed, runs top, validates again, and
   atomically publishes final `init_mlff/ML_ABN` and `ML_FFN`. `DPMOIRE_PHASE` is
   `step1` or `step2` for phase-specific logging. The allocation resources must
   suit both calculations and its walltime must cover their combined runtime.
-  Automatic `sbatch`, scheduler polling, retries, and cross-job dependencies are
-  not enabled in this unit.
+  Scheduler polling, retries, resume, and cross-job dependencies are not enabled.
+  DPmoire-lite removes an inherited `SBATCH_WAIT` from every programmatic
+  `sbatch` environment so the documented fire-and-forget path cannot silently
+  become a waiting submission.
+
+The build CLI prints `build status=generated` whenever it made no `sbatch`
+request, including generation-only work or a stage with no enabled targets. It
+prints `build status=submission_requested` only after successful fire-and-forget
+`sbatch`; that means only that Slurm accepted the request. A failed request
+returns a nonzero exit and leaves bounded `SUBMIT_FAILED` evidence in the init
+manifest.
+The generated job later prints `init_mlff status=complete` only after both phases
+and final seed publication succeed, or `init_mlff status=failed` on a workflow
+failure. No scheduler polling is used to bridge these states.
 
 ## Collection Semantics
 
@@ -244,7 +269,7 @@ rejected.
 | `outcar_collect_freq` | positive int | OUTCAR sampling stride for relaxation and non-ML MD collection. Validation always uses stride 1. VASP-ML MD collection reads `ML_ABN`, so this tag does not affect that path. |
 | `do_relaxation` | bool | In stage0, generate relaxation folders under `rlx/`. |
 | `init_mlff` | bool | In stage0, generate the initial `init_mlff/` folder. |
-| `init_mlff_mode` | `manual` or `single-job` | Init layout. Defaults to `manual`. `single-job` creates separate bottom/top workspaces and one ready-to-submit derived script; it still requires `submit: false`, so the user invokes `sbatch` once after inspection. |
+| `init_mlff_mode` | `manual` or `single-job` | Init layout. Defaults to `manual`. `single-job` creates separate bottom/top workspaces and one derived root script. With `submit: false`, inspect and submit that script once manually; with fire-and-forget `submit: true`, DPmoire-lite requests that one root submission and records its job ID without waiting for completion. |
 | `init_bottom_incar` | relative path | Bottom-phase INCAR template under `input_dir`; required by `single-job`. |
 | `init_top_incar` | relative path | Top-phase INCAR template under `input_dir`; required by `single-job`. |
 | `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |

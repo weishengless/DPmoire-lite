@@ -173,6 +173,81 @@ def test_init_workflow_v2_round_trip_preserves_bounded_evidence(tmp_path):
     assert result.manifest.init_workflow == manifest.init_workflow
 
 
+@pytest.mark.parametrize(
+    "jobs",
+    [
+        [
+            {
+                "job_id": "123",
+                "path": "init_mlff",
+                "status": "COMPLETED",
+                "script": {"name": "sub", "size": 10, "sha256": "d" * 64},
+            }
+        ],
+        [
+            {
+                "path": "init_mlff",
+                "status": "SUBMITTED",
+                "script": {"name": "sub", "size": 10, "sha256": "d" * 64},
+            }
+        ],
+        [
+            {
+                "job_id": "123",
+                "path": "init_mlff",
+                "status": "SUBMITTED",
+                "script": {"name": "sub", "size": 10, "sha256": "e" * 64},
+            }
+        ],
+        [
+            {
+                "path": "init_mlff",
+                "status": "SUBMIT_FAILED",
+                "script": {"name": "sub", "size": 10, "sha256": "d" * 64},
+                "failure": {
+                    "kind": "sbatch-invocation",
+                    "exception": "CalledProcessError",
+                    "returncode": 1,
+                    "stderr": "must-not-be-persisted",
+                },
+            }
+        ],
+        [
+            {
+                "job_id": "123",
+                "path": "init_mlff",
+                "status": "SUBMITTED",
+                "script": {"name": "sub", "size": 10, "sha256": "d" * 64},
+            },
+            {
+                "job_id": "124",
+                "path": "init_mlff",
+                "status": "SUBMITTED",
+                "script": {"name": "sub", "size": 10, "sha256": "d" * 64},
+            },
+        ],
+    ],
+    ids=(
+        "terminal-state",
+        "missing-job-id",
+        "script-identity-mismatch",
+        "unbounded-failure-evidence",
+        "multiple-jobs",
+    ),
+)
+def test_init_workflow_v2_rejects_invalid_submission_evidence(tmp_path, jobs):
+    manifest = Manifest(
+        stage="init_mlff",
+        generated_at="2026-08-11T12:00:00",
+        directories=["init_mlff/bottom", "init_mlff/top"],
+        jobs=jobs,
+        init_workflow=_valid_init_workflow(),
+    )
+
+    with pytest.raises(ValueError, match="jobs"):
+        write_manifest(tmp_path / "work", manifest)
+
+
 def test_read_manifest_accepts_completed_init_workflow_v1_for_stage1_compatibility(
     tmp_path,
 ):

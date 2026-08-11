@@ -51,6 +51,8 @@ class PreparedInitMlffSubmitAdapter:
     generated_name: str
     rendered_bytes: bytes
     sha256: str
+    sbatch_wait_requested: bool
+    translated_scheduler_prefixes: tuple[str, ...]
 
     @property
     def size(self) -> int:
@@ -103,6 +105,8 @@ def prepare_init_mlff_submit_adapter(
             "single-job submit template must begin with a Bash shebang"
         )
     _validate_slurm_directive_positions(bodies)
+    sbatch_wait_requested = _slurm_directive_requests_wait(bodies)
+    translated_scheduler_prefixes = _translated_scheduler_directive_prefixes(bodies)
 
     marker_occurrences = payload.count(INIT_MLFF_RUN_MARKER.encode("ascii"))
     if marker_occurrences != 1:
@@ -187,6 +191,8 @@ def prepare_init_mlff_submit_adapter(
         generated_name=generated_name,
         rendered_bytes=rendered,
         sha256=hashlib.sha256(rendered).hexdigest(),
+        sbatch_wait_requested=sbatch_wait_requested,
+        translated_scheduler_prefixes=translated_scheduler_prefixes,
     )
 
 
@@ -263,13 +269,25 @@ def _first_line_ending(lines: list[bytes]) -> bytes:
     return b""
 
 
+_SLURM_DIRECTIVE_PREFIXES = ("#SBATCH", "#SLURM")
+_SLURM_HETERO_COMPONENT_SEPARATORS = frozenset({"hetjob", "packjob"})
+_TRANSLATED_SCHEDULER_DIRECTIVE_PREFIXES = ("#PBS", "#BSUB")
+
+
+def _slurm_directive_body(line: str) -> str | None:
+    for prefix in _SLURM_DIRECTIVE_PREFIXES:
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return None
+
+
 def _validate_slurm_directive_positions(lines: list[str]) -> None:
     executable_seen = False
     for line in lines[1:]:
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith("#SBATCH"):
+        if _slurm_directive_body(stripped) is not None:
             if executable_seen:
                 raise InitMlffSubmitTemplateError(
                     "single-job Slurm directives must precede executable template content"
@@ -278,6 +296,100 @@ def _validate_slurm_directive_positions(lines: list[str]) -> None:
         if stripped.startswith("#"):
             continue
         executable_seen = True
+
+
+def _translated_scheduler_directive_prefixes(lines: list[str]) -> tuple[str, ...]:
+    found: list[str] = []
+    for line in lines[1:]:
+        stripped = line.strip()
+        for prefix in _TRANSLATED_SCHEDULER_DIRECTIVE_PREFIXES:
+            if stripped.startswith(prefix) and prefix not in found:
+                found.append(prefix)
+    return tuple(found)
+
+
+def _slurm_directive_requests_wait(lines: list[str]) -> bool:
+    components: list[list[str]] = [[]]
+    for line in lines[1:]:
+        stripped = line.strip()
+        directive = _slurm_directive_body(stripped)
+        if directive is None:
+            continue
+        try:
+            options = shlex.split(directive, comments=True, posix=True)
+        except ValueError:
+            options = directive.split()
+        if options and options[0].lower() in _SLURM_HETERO_COMPONENT_SEPARATORS:
+            components.append(options[1:])
+        else:
+            components[-1].extend(options)
+    return any(_slurm_options_request_wait(options) for options in components)
+
+
+# Required short options consume the following token only when their own cluster
+# has no attached value. Short ``-k`` has an optional argument, so it consumes
+# attached text but never the following token.
+_SBATCH_SHORT_OPTIONS_WITH_REQUIRED_ARGUMENT = frozenset(
+    "AabDMCScdmexBGiJLFwNnopqt"
+)
+_SBATCH_SHORT_OPTIONS_WITH_OPTIONAL_ARGUMENT = frozenset("k")
+
+# Current sbatch required-argument long options. Unknown options remain
+# non-consuming here, which deliberately keeps a later ``-W`` fail-closed.
+_SBATCH_LONG_OPTIONS_WITH_REQUIRED_ARGUMENT = frozenset(
+    """
+    account acctg-freq array batch bbf autocomplete begin bb
+    cluster-constraint chdir clusters cluster comment constraint container
+    container-id runtime context core-spec cores-per-socket cpu-freq
+    cpus-per-gpu cpus-per-task deadline delay-boot dependency distribution
+    error exclude export export-file extra extra-node-info gid gpu-bind
+    tres-bind gpu-freq gpus gpus-per-node gpus-per-socket gpus-per-task
+    tres-per-task gres gres-flags hint input job-name kill-on-invalid-dep
+    licenses mail-type mail-user mcs-label mem mem-bind mem-per-cpu mem-per-gpu
+    mem-update mincpus network nodefile nodelist nodes ntasks ntasks-per-core
+    ntasks-per-node ntasks-per-socket ntasks-per-tres ntasks-per-gpu open-mode
+    output partition prefer priority profile qos reservation resources segment
+    signal sockets-per-node switches tasks-per-node thread-spec threads-per-core
+    time time-min tmp uid wait-all-nodes wckey wrap
+    """.split()
+)
+
+
+def _slurm_options_request_wait(options: list[str]) -> bool:
+    consume_next = False
+    for option in options:
+        if consume_next:
+            consume_next = False
+            continue
+        if option == "--":
+            return False
+        if option.startswith("--"):
+            name, separator, _value = option[2:].partition("=")
+            if name == "wait":
+                return True
+            consume_next = (
+                not separator
+                and name in _SBATCH_LONG_OPTIONS_WITH_REQUIRED_ARGUMENT
+            )
+            continue
+        if not option.startswith("-") or option == "-":
+            return False
+        wait_requested, consume_next = _short_slurm_option_requests_wait(option)
+        if wait_requested:
+            return True
+    return False
+
+
+def _short_slurm_option_requests_wait(option: str) -> tuple[bool, bool]:
+    cluster = option[1:]
+    for index, short_option in enumerate(cluster):
+        if short_option == "W":
+            return True, False
+        if short_option in _SBATCH_SHORT_OPTIONS_WITH_REQUIRED_ARGUMENT:
+            return False, index == len(cluster) - 1
+        if short_option in _SBATCH_SHORT_OPTIONS_WITH_OPTIONAL_ARGUMENT:
+            return False, False
+    return False, False
 
 
 def _is_bash_shebang(line: str) -> bool:

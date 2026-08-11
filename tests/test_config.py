@@ -235,7 +235,7 @@ def test_single_job_init_mode_rejects_disabled_init_mlff(tmp_path):
         load_config(config_file)
 
 
-def test_single_job_init_submission_remains_fail_closed(tmp_path):
+def test_single_job_init_fire_and_forget_submission_is_allowed(tmp_path):
     config_file = tmp_path / "config.yaml"
     write_config(
         config_file,
@@ -246,8 +246,7 @@ def test_single_job_init_submission_remains_fail_closed(tmp_path):
     )
     config = load_config(config_file)
 
-    with pytest.raises(ConfigError, match="single-job currently requires submit: false"):
-        config.validate_build_mode(wait=False)
+    config.validate_build_mode(wait=False)
 
 
 @pytest.mark.parametrize("mode", ["automatic", "single_job", ""])

@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from .inputs import (
     write_prepared_potcar,
     write_supercell_poscar,
 )
+from .init_mlff import init_mlff_manifest_lock
 from .manifest import INIT_WORKFLOW_SCHEMA, Manifest, serialize_manifest, write_manifest
 from .mlab import seed_prefix_identity
 from .paths import backup_existing_directory, relative_to_workdir
@@ -50,15 +52,30 @@ from .structures import StructureHandler, supercell_matrix
 VASP_RELAXATION_CONVERGED_PHRASE = "reached required accuracy - stopping structural energy minimisation"
 
 
-def run_build(config_path: Path, wait: bool = False) -> None:
+class InitMlffSubmissionError(RuntimeError):
+    """The single-job init workspace exists, but its sbatch request failed."""
+
+
+@dataclass(frozen=True)
+class BuildOutcome:
+    stage: int | str
+    status: str
+
+
+def run_build(config_path: Path, wait: bool = False) -> BuildOutcome:
     config = load_config(config_path)
     config.validate_build_mode(wait)
+    submitted = False
     if config.stage == 0:
-        build_stage0(config, wait=wait)
+        submitted = build_stage0(config, wait=wait)
     elif config.stage == 1:
-        build_stage1(config, wait=wait)
+        submitted = build_stage1(config, wait=wait)
     elif config.stage == "all":
         build_stage_all(config, wait=wait)
+    return BuildOutcome(
+        stage=config.stage,
+        status="submission_requested" if submitted else "generated",
+    )
 
 
 def _prepared_template(
@@ -95,7 +112,7 @@ def _assert_no_prepared_output_dirs_remain(output_dirs) -> None:
     raise RuntimeError(f"Preflight returned an unexpected output directory: {extra}")
 
 
-def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
+def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> bool:
     config.validate_build_mode(wait)
     preflight = preflight_stage0(config)
     if preflight.structures is None or preflight.rcut is None:
@@ -144,18 +161,21 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
     if config.symm_reduce:
         structures.write_sym_reduced_stackings(list(stackings))
     runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
+    submitted = False
 
     if preflight.init_mlff_workflow is not None:
-        _build_two_phase_init_mlff(
+        submitted = _build_two_phase_init_mlff(
             config,
             preflight.init_mlff_workflow,
             workflow_cutoff,
             preflight.submit_script,
             rcut,
             generated_at,
-        )
+            runner,
+            wait,
+        ) or submitted
     elif config.init_mlff:
-        _build_init_mlff(
+        submitted = _build_init_mlff(
             config,
             structures,
             init_dirs[0],
@@ -166,9 +186,9 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
             generated_at,
             runner,
             wait,
-        )
+        ) or submitted
     if config.do_relaxation:
-        _build_relaxations(
+        submitted = _build_relaxations(
             config,
             structures,
             stackings,
@@ -180,9 +200,9 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
             generated_at,
             runner,
             wait,
-        )
+        ) or submitted
     if config.twist_val:
-        _build_validation(
+        submitted = _build_validation(
             config,
             preflight.validation_structures,
             validation_dirs,
@@ -193,10 +213,15 @@ def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> None:
             generated_at,
             runner,
             wait,
-        )
+        ) or submitted
+    return submitted
 
 
-def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRunner | None = None) -> None:
+def build_stage1(
+    config: DPmoireLiteConfig,
+    wait: bool = False,
+    runner: SlurmRunner | None = None,
+) -> bool:
     config.validate_build_mode(wait)
     preflight = preflight_stage1(config)
     if preflight.structures is None or preflight.rcut is None:
@@ -337,6 +362,7 @@ def build_stage1(config: DPmoireLiteConfig, wait: bool = False, runner: SlurmRun
             mlff_seed=mlff_seed,
         ),
     )
+    return bool(jobs)
 
 
 def _stage1_mlff_seed_identity(
@@ -513,7 +539,7 @@ def _build_init_mlff(
     generated_at: str,
     runner: SlurmRunner | None,
     wait: bool,
-) -> None:
+) -> bool:
     backups = []
     init_dir.mkdir(parents=True, exist_ok=True)
     if structures.bot_atoms is None:
@@ -549,6 +575,7 @@ def _build_init_mlff(
             jobs=[job.as_dict() for job in jobs],
         ),
     )
+    return bool(jobs)
 
 
 def _build_two_phase_init_mlff(
@@ -558,9 +585,11 @@ def _build_two_phase_init_mlff(
     submit_script: PreparedSource,
     rcut: float,
     generated_at: str,
-) -> None:
-    if config.submit:
-        raise RuntimeError("single-job init workspace generation requires submit: false")
+    runner: SlurmRunner | None,
+    wait: bool,
+) -> bool:
+    if runner is not None and wait:
+        raise RuntimeError("single-job init submission cannot wait")
     if len(workflow.phases) != 2:
         raise RuntimeError("Preflight did not return both init MLFF phase directories")
     if workflow.submit_adapter.source != submit_script:
@@ -650,16 +679,69 @@ def _build_two_phase_init_mlff(
             serialize_manifest(config.work_dir, manifest),
             encoding="utf-8",
         )
-        try:
-            atomic_directory_publish_no_replace(candidate, init_root)
-        except FileExistsError as exc:
-            raise RuntimeError(
-                "init_mlff appeared after preflight; refusing to replace an existing target"
-            ) from exc
+        if runner is None:
+            _publish_init_mlff_candidate(candidate, init_root)
+        else:
+            script_record = {
+                "name": workflow.submit_adapter.generated_name,
+                "size": workflow.submit_adapter.size,
+                "sha256": workflow.submit_adapter.sha256,
+            }
+            with init_mlff_manifest_lock(config.work_dir):
+                _publish_init_mlff_candidate(candidate, init_root)
+                manifest.jobs = [
+                    {
+                        "path": "init_mlff",
+                        "status": "SUBMITTING",
+                        "script": script_record,
+                    }
+                ]
+                write_manifest(config.work_dir, manifest)
+                try:
+                    job = runner.submit(init_root, "init_mlff")
+                except Exception as exc:
+                    failure = {
+                        "kind": "sbatch-invocation",
+                        "exception": type(exc).__name__,
+                    }
+                    returncode = getattr(exc, "returncode", None)
+                    if isinstance(returncode, int) and not isinstance(returncode, bool):
+                        failure["returncode"] = returncode
+                    manifest.jobs = [
+                        {
+                            "path": "init_mlff",
+                            "status": "SUBMIT_FAILED",
+                            "script": script_record,
+                            "failure": failure,
+                        }
+                    ]
+                    write_manifest(config.work_dir, manifest)
+                    raise InitMlffSubmissionError(
+                        "single-job init sbatch request failed; inspect init_mlff/manifest.yaml"
+                    ) from exc
+                manifest.jobs = [
+                    {
+                        "job_id": job.job_id,
+                        "path": "init_mlff",
+                        "status": "SUBMITTED",
+                        "script": script_record,
+                    }
+                ]
+                write_manifest(config.work_dir, manifest)
     except BaseException:
         if candidate.exists():
             shutil.rmtree(candidate)
         raise
+    return runner is not None
+
+
+def _publish_init_mlff_candidate(candidate: Path, init_root: Path) -> None:
+    try:
+        atomic_directory_publish_no_replace(candidate, init_root)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "init_mlff appeared after preflight; refusing to replace an existing target"
+        ) from exc
 
 
 def _prepared_source_evidence(source: PreparedSource) -> dict[str, object]:
@@ -690,7 +772,7 @@ def _build_relaxations(
     generated_at: str,
     runner: SlurmRunner | None,
     wait: bool,
-) -> None:
+) -> bool:
     backups = []
     directories = []
     rlx_poscars = {}
@@ -741,6 +823,7 @@ def _build_relaxations(
             grid_shift_anchors=grid_shift_anchors,
         ),
     )
+    return bool(jobs)
 
 
 def _build_validation(
@@ -754,7 +837,7 @@ def _build_validation(
     generated_at: str,
     runner: SlurmRunner | None,
     wait: bool,
-) -> None:
+) -> bool:
     directories = list(target_dirs)
     backups = []
     for record, target in zip(validation_structures, target_dirs, strict=True):
@@ -783,6 +866,7 @@ def _build_validation(
             angles=[record.angle for record in validation_structures],
         ),
     )
+    return bool(jobs)
 
 
 def _check_mlff_files(init_mlff_dir: Path) -> None:

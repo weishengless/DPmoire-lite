@@ -250,17 +250,6 @@ class DPmoireLiteConfig:
                 "Slurm terminal-state validation and failure propagation are not yet reliable. "
                 "Generate stages with submit: false and submit them manually."
             )
-        if (
-            self.stage == 0
-            and self.init_mlff
-            and self.init_mlff_mode == "single-job"
-            and self.submit
-        ):
-            raise ConfigError(
-                "init_mlff_mode: single-job currently requires submit: false. "
-                "Inspect and submit the generated init_mlff derived script once; "
-                "automatic single-job submission is enabled by a later workflow unit."
-            )
 
 
 def _require(data: dict[str, Any], field_name: str) -> Any:

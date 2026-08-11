@@ -22,9 +22,21 @@ _COLLECT_EXIT_CODES = {
 
 
 def build_command(config_path: str, wait: bool) -> int:
-    from .build import run_build
+    from .build import InitMlffSubmissionError, run_build
 
-    run_build(Path(config_path), wait=wait)
+    try:
+        outcome = run_build(Path(config_path), wait=wait)
+    except InitMlffSubmissionError:
+        print(
+            "build status=submission_failed stage=0 workflow=init_mlff "
+            "manifest=init_mlff/manifest.yaml",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"build status={outcome.status} stage={outcome.stage}",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -77,12 +89,22 @@ def run_init_mlff_command(work_dir: str) -> int:
     try:
         run_init_mlff_submit_workflow(Path(work_dir))
     except InitMlffWorkflowError as exc:
-        print(f"DPmoireLite: {exc}", file=sys.stderr)
         exit_code = exc.calculation_exit_code
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             if 1 <= exit_code <= 255:
-                return exit_code
-        return 1
+                normalized_exit_code = exit_code
+            else:
+                normalized_exit_code = 1
+        else:
+            normalized_exit_code = 1
+        diagnostic = " ".join(str(exc).split())
+        print(
+            f"init_mlff status=failed exit_code={normalized_exit_code} "
+            f"diagnostic={diagnostic}",
+            file=sys.stderr,
+        )
+        return normalized_exit_code
+    print("init_mlff status=complete", file=sys.stderr)
     return 0
 
 
@@ -96,7 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Generate calculation folders. Config init_mlff_mode defaults to manual; "
             "single-job prepares separate bottom/top inputs plus one derived submit "
-            "script and currently requires submit: false."
+            "script. With submit: false it only generates; with submit: true it "
+            "requests one root submission and returns without waiting. Automatic "
+            "single-job templates must not request sbatch wait."
         ),
     )
     build.add_argument("config", help="Path to config.yaml")

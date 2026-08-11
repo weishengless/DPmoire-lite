@@ -248,6 +248,12 @@ def _validate_v2_data(
             mlff_seed=data["mlff_seed"],
         )
     _require_record_list(data, path, "jobs")
+    if data.get("init_workflow"):
+        _validate_init_submission_jobs(
+            data["jobs"],
+            data["init_workflow"],
+            path,
+        )
     _require_record_list(data, path, "skipped")
     _require_record_list(data, path, "failed")
     _require_record_list(data, path, "partial")
@@ -544,6 +550,89 @@ def _validate_published_init_seed(
                 f"Invalid manifest {path}: {field_name}.{digest_field} must be a "
                 "lowercase SHA-256"
             )
+
+
+def _validate_init_submission_jobs(
+    jobs: list[Mapping[str, Any]],
+    workflow: Mapping[str, Any],
+    path: Path,
+) -> None:
+    if workflow.get("schema") != INIT_WORKFLOW_SCHEMA:
+        return
+    if len(jobs) > 1:
+        raise ValueError(
+            f"Invalid manifest {path}: jobs must contain at most one init submission record"
+        )
+    if not jobs:
+        return
+
+    record = jobs[0]
+    status = record.get("status")
+    expected_fields = {
+        "SUBMITTING": {"path", "status", "script"},
+        "SUBMIT_FAILED": {"path", "status", "script", "failure"},
+        "SUBMITTED": {"job_id", "path", "status", "script"},
+    }
+    if not isinstance(status, str) or status not in expected_fields:
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].status must describe only the "
+            "submission request, not scheduler completion"
+        )
+    _require_exact_mapping_fields(
+        record,
+        path,
+        "jobs[0]",
+        expected_fields[status],
+    )
+    if record["path"] != "init_mlff":
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].path must be 'init_mlff'"
+        )
+
+    script = record["script"]
+    _expect_mapping(script, path, "jobs[0].script")
+    _validate_file_identity(script, path, "jobs[0].script", include_name=True)
+    generated_script = workflow["submit_adapter"]["generated_script"]
+    if dict(script) != dict(generated_script):
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].script must match the generated submit adapter"
+        )
+
+    if status == "SUBMITTED":
+        job_id = record["job_id"]
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError(
+                f"Invalid manifest {path}: jobs[0].job_id must be a non-empty string"
+            )
+        return
+    if status != "SUBMIT_FAILED":
+        return
+
+    failure = record["failure"]
+    _expect_mapping(failure, path, "jobs[0].failure")
+    fields = set(failure)
+    if fields not in (
+        {"kind", "exception"},
+        {"kind", "exception", "returncode"},
+    ):
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].failure fields must be bounded"
+        )
+    if failure["kind"] != "sbatch-invocation":
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].failure.kind must be 'sbatch-invocation'"
+        )
+    if not isinstance(failure["exception"], str) or not failure["exception"]:
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].failure.exception must be a non-empty string"
+        )
+    if "returncode" in failure and (
+        isinstance(failure["returncode"], bool)
+        or not isinstance(failure["returncode"], int)
+    ):
+        raise ValueError(
+            f"Invalid manifest {path}: jobs[0].failure.returncode must be an integer"
+        )
 
 
 def _normalize_init_workflow_paths(

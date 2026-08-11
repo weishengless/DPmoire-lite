@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import errno
+import os
+import stat
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Iterator, Protocol
 
 import numpy as np
 from ase.io.vasp import read_vasp
@@ -25,6 +29,12 @@ from .mlab import MlabParseResult, seed_prefix_identity, parse_mlab
 from .mlff_seed import SeedPrefixVerifier
 
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+
 class InitMlffWorkflowError(RuntimeError):
     """A bounded init-MLFF lifecycle or evidence failure."""
 
@@ -36,6 +46,112 @@ class InitMlffWorkflowError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.calculation_exit_code = calculation_exit_code
+
+
+def _lock_file_is_safe(file_stat: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_nlink == 1
+        and getattr(file_stat, "st_reparse_tag", 0) == 0
+    )
+
+
+def _same_file_identity(
+    first: os.stat_result,
+    second: os.stat_result,
+) -> bool:
+    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+
+def _verify_open_lock_file(descriptor: int, lock_path: Path) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    current = lock_path.lstat()
+    if not _lock_file_is_safe(opened) or not _lock_file_is_safe(current):
+        raise OSError(
+            errno.EPERM,
+            "lock path is not a single-link regular file",
+            os.fspath(lock_path),
+        )
+    if not _same_file_identity(opened, current):
+        raise OSError(
+            errno.EPERM,
+            "lock path changed while it was being opened",
+            os.fspath(lock_path),
+        )
+    return current
+
+
+def _open_verified_lock_file(lock_path: Path) -> int:
+    try:
+        before = lock_path.lstat()
+    except FileNotFoundError:
+        before = None
+    else:
+        if not _lock_file_is_safe(before):
+            raise OSError(
+                errno.EPERM,
+                "lock path is not a single-link regular file",
+                os.fspath(lock_path),
+            )
+
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.fspath(lock_path), flags, 0o666)
+    try:
+        current = _verify_open_lock_file(descriptor, lock_path)
+        if before is not None and not _same_file_identity(before, current):
+            raise OSError(
+                errno.EPERM,
+                "lock path changed while it was being opened",
+                os.fspath(lock_path),
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+@contextmanager
+def init_mlff_manifest_lock(work_dir: Path) -> Iterator[None]:
+    """Serialize submission evidence with the workflow's first state transition."""
+    lock_path = Path(work_dir) / ".dpmoire-lite-init-mlff.lock"
+    descriptor = -1
+    handle = None
+    try:
+        descriptor = _open_verified_lock_file(lock_path)
+        handle = os.fdopen(descriptor, "r+b")
+        descriptor = -1
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        if os.name == "nt":
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        _verify_open_lock_file(handle.fileno(), lock_path)
+    except OSError as exc:
+        if handle is not None:
+            handle.close()
+        elif descriptor != -1:
+            os.close(descriptor)
+        raise InitMlffWorkflowError(
+            "init MLFF manifest lock invariant failed"
+        ) from exc
+
+    try:
+        yield
+    finally:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 @dataclass(frozen=True)
@@ -73,12 +189,12 @@ class InitMlffWorkflow:
         self.root_dir = self.work_dir / "init_mlff"
 
     def run(self, adapter: InitMlffCalculationAdapter) -> Manifest:
-        manifest = self._load_fresh_manifest()
         bottom_dir = self.root_dir / "bottom"
         top_dir = self.root_dir / "top"
-        self._preflight(manifest, bottom_dir, top_dir)
-
-        manifest = self._transition(manifest, "step-1-running")
+        with init_mlff_manifest_lock(self.work_dir):
+            manifest = self._load_fresh_manifest()
+            self._preflight(manifest, bottom_dir, top_dir)
+            manifest = self._transition(manifest, "step-1-running")
         step1_request = InitMlffCalculation(
             phase="step1",
             role="step-1",
@@ -218,6 +334,11 @@ class InitMlffWorkflow:
             raise InitMlffWorkflowError(
                 "init MLFF state invariant failed: a fresh step-1-ready workflow is required; "
                 f"found {state!r}. No implicit resume, retry, or overwrite is allowed"
+            )
+        if manifest.jobs and manifest.jobs[0].get("status") != "SUBMITTED":
+            raise InitMlffWorkflowError(
+                "init MLFF submission evidence is not complete; refusing to start "
+                "a workflow whose sbatch request was not recorded as submitted"
             )
         return manifest
 

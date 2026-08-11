@@ -81,7 +81,7 @@ Stage1 会把新解析的计划与新版 relaxation manifest 中的 cutoff 证�
 
 ```yaml
 stage: 0
-submit: false
+submit: true
 init_mlff: true
 init_mlff_mode: single-job
 init_bottom_incar: init_bottom_INCAR
@@ -113,12 +113,20 @@ marker 都必须恰好出现一次，且不能嵌套在其他 shell function 中
 status。DPmoire-lite 保证源模板字节不变，只替换派生 `init_mlff/<dft_script>` 副本中的
 精确标记调用，不解析或改写任意 launcher、container、pipeline 或重定向文本。
 
+当 `submit: true` 选择自动 single-job 路径时，模板不能包含 `#SBATCH --wait`、
+`#SBATCH -W` 或含 `W` 的合法短选项组合；弃用的 `#SLURM -W` 写法以及每个
+`hetjob`/`packjob` component 也会识别。preflight 会在创建目标工作目录之前拒绝
+这些等待指令。由于 `sbatch` 可能翻译其他调度器语法，自动模式还会拒绝所有
+模板任意位置以 `#PBS` 或 `#BSUB` 开头的内容；请改用原生 `#SBATCH`，或选择只生成
+的 `submit: false`，后者会原样保留这些内容，供用户之后自行控制 `sbatch` 调用。
+
 `init_mlff/manifest.yaml` 使用 `dpmoire-lite.init-workflow.v2`，把 bottom 记录为
 `step-1-ready`、top 记录为 `planned`，并保存静态文件、源模板与派生 adapter 的
 size/SHA-256 identity。这些证据可以识别后续 conflict，但不会暴露 POTCAR 内容或
 其他私有 payload。
 
-运行 `DPmoireLite build config.yaml` 后，检查并且只提交根目录下的派生脚本：
+使用 `submit: false` 时，`DPmoireLite build config.yaml` 输出
+`build status=generated`。检查并且只提交根目录下的派生脚本：
 
 ```bash
 cd <work_dir>/init_mlff
@@ -139,10 +147,24 @@ sbatch <dft_script>
 submit-adapter 证据。
 
 两次 VASP 启动共享同一个 Slurm allocation，因此资源必须同时适用于两步，walltime
-必须覆盖两步总时长。该模式仍要求 `submit: false`；自动 `sbatch` 属于后续单元。
-这里不会第二次提交，也不会使用 `sacct`、polling、retry、resume 或跨作业 dependency。
+必须覆盖两步总时长。
 
-非等待提交路径：
+使用 `submit: true` 且不加 `--wait` 时，build 只提交这个根派生脚本一次。`sbatch`
+成功后，它会把返回的 job ID 和脚本 identity 原子写入 `init_mlff/manifest.yaml`，输出
+`build status=submission_requested`，然后退出；这个状态不表示计算已完成。`sbatch`
+失败会返回非零退出码，并留下有界 `SUBMIT_FAILED` 证据，不会把 scheduler stderr
+写进 manifest。这里不会第二次提交，也不会使用 `sacct`；不轮询调度器，不执行
+retry、resume 或跨作业 dependency。
+DPmoire-lite 还会从每次程序化 `sbatch` 的环境中移除继承的 `SBATCH_WAIT`，避免
+父 shell 把该路径静默改成等待提交。
+
+CLI 只有在至少一次 `sbatch` 请求成功时才输出 `submission_requested`。如果当前 stage
+没有启用任何提交目标，即使配置为 `submit: true`，也会输出 `build status=generated`。
+
+在 allocation 内，`run-init-mlff` 只有在两个 phase 校验通过并发布最终 seed 后才输出
+`init_mlff status=complete`；workflow 失败时输出 `init_mlff status=failed` 并返回非零。
+
+默认 `manual` 模式保留历史非等待提交路径：
 
 ```bash
 DPmoireLite build config.yaml
@@ -182,9 +204,9 @@ DPmoire-lite 的网格平移锚点；其 `F F T` 掩码表示固定 x/y、允许
 
 设置 `submit: true` 后，生成目录会被 Slurm 提交。
 
-自动提交行为适用于默认的 `init_mlff_mode: manual`。`single-job` 会生成可提交的根
-adapter，但仍会在写入任何目标前拒绝 `submit: true`；请按上文检查后手动执行一次
-`sbatch`。
+自动 fire-and-forget 提交适用于两种 init 模式。默认 `manual` 模式提交历史单目录
+init 作业；`single-job` 只提交一个根 adapter，由它在同一个 allocation 内运行两个
+phase。希望先检查再手动提交 adapter 时，请使用 `submit: false`。
 
 不加 `--wait` 时，DPmoire-lite 会提交当前 stage 请求的所有目录，然后退出：
 

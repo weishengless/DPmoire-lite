@@ -20,11 +20,24 @@
   Source/generated script hashes and lifecycle evidence are recorded in the init
   manifest. Users inspect the adapter, submit it from the derived script
   directory, and run both phases in one allocation; the workflow preserves the
-  real launcher exit code. Automatic submission remains fail-closed for a later
-  workflow unit. Completed v1 workflow evidence remains readable for Stage1.
+  real launcher exit code. With fire-and-forget `submit: true`, DPmoire-lite now
+  submits exactly that one root adapter, persists the returned job ID and script
+  hash without claiming completion, and records bounded evidence on `sbatch`
+  failure. Generation, submission request, workflow completion, and workflow
+  failure have distinct CLI statuses. Scheduler polling, retry, resume, and
+  cross-job dependencies remain deferred. Completed v1 workflow evidence remains
+  readable for Stage1.
 
 ### Fixed
 
+- Prevented automatic single-job submission from entering Slurm wait mode via
+  template `#SBATCH`/`#SLURM -W` variants (including heterogeneous components)
+  or inherited `SBATCH_WAIT`, and rejected translated `#PBS`/`#BSUB` scheduler
+  directives on that automatic path. Also hardened the init workflow lock
+  against symlink, reparse-point, hard-link, and replacement races before any
+  lock-file write.
+- Build status now reports `submission_requested` only after at least one real
+  `sbatch` request succeeds; a stage with no enabled target reports `generated`.
 - All generated stages now share one workflow-wide ENCUT derived from the maximum ENMAX across the selected top- and bottom-layer POTCAR variants, while each generated POTCAR remains local to its POSCAR species and order. Stage1 rejects drift from new relaxation-manifest cutoff evidence, and preflight rejects ambiguous ENMAX or lowest-`ZVAL` selections.
 - Generated POTCAR files are now byte-concatenated from source potentials without inserting extra blank lines.
 - Mo and W now resolve to the VASP-recommended `Mo_sv` and `W_sv` potentials when those directories are available.
