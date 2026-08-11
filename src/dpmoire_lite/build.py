@@ -14,6 +14,7 @@ from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
 from .atomic_io import (
+    atomic_bytes_publish,
     atomic_directory_publish_no_replace,
     atomic_text_publish,
     sha256_file,
@@ -562,6 +563,10 @@ def _build_two_phase_init_mlff(
         raise RuntimeError("single-job init workspace generation requires submit: false")
     if len(workflow.phases) != 2:
         raise RuntimeError("Preflight did not return both init MLFF phase directories")
+    if workflow.submit_adapter.source != submit_script:
+        raise RuntimeError(
+            "Preflight returned inconsistent single-job submit source identities"
+        )
 
     init_root = workflow.root_dir
     candidate = Path(
@@ -611,6 +616,18 @@ def _build_two_phase_init_mlff(
                 },
             }
 
+        submit_adapter = workflow.submit_adapter
+        verify_prepared_source(submit_adapter.source)
+        derived_path = candidate / submit_adapter.generated_name
+        atomic_bytes_publish(derived_path, submit_adapter.rendered_bytes)
+        if _file_evidence(derived_path) != {
+            "size": submit_adapter.size,
+            "sha256": submit_adapter.sha256,
+        }:
+            raise RuntimeError(
+                "Generated single-job submit adapter identity does not match preflight"
+            )
+
         manifest = Manifest(
             stage="init_mlff",
             generated_at=generated_at,
@@ -624,6 +641,7 @@ def _build_two_phase_init_mlff(
                 "mode": workflow.mode,
                 "state": workflow.initial_state,
                 "submit_source": _prepared_source_evidence(submit_script),
+                "submit_adapter": submit_adapter.audit_record(),
                 "phases": phase_records,
             },
         )

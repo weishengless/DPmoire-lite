@@ -718,7 +718,7 @@ def test_build_help_marks_wait_temporarily_disabled_for_submitted_workflows(caps
     assert "submit: true" in help_text
     assert "stage: all is unavailable" in help_text
     assert "init_mlff_mode defaults to manual" in help_text
-    assert "single-job prepares separate bottom/top static inputs" in help_text
+    assert "single-job prepares separate bottom/top inputs plus one derived submit script" in help_text
 
 
 def test_build_error_recommends_manual_submission(tmp_path):
@@ -842,7 +842,8 @@ def test_workflow_guides_document_bundled_example_defaults():
             ("stage1", "clears md constraints", "default"),
             ("seed-aware", "default"),
             ("init_mlff_mode: single-job", "init_mlff/bottom", "init_mlff/top"),
-            ("workspace preparation only", "submit: false"),
+            ("dpmoire_run_vasp", "# dpmoire-lite:run", "submit: false"),
+            ("same slurm allocation", "combined runtime"),
         ),
         "workflow_CH.md": (
             ("stage: all", "暂时不可用"),
@@ -850,7 +851,8 @@ def test_workflow_guides_document_bundled_example_defaults():
             ("stage1", "默认清除 md 约束"),
             ("seed-aware", "默认"),
             ("init_mlff_mode: single-job", "init_mlff/bottom", "init_mlff/top"),
-            ("只负责准备工作区", "submit: false"),
+            ("dpmoire_run_vasp", "# dpmoire-lite:run", "submit: false"),
+            ("同一个 slurm allocation", "两步总时长"),
         ),
     }
     for guide_name, semantic_anchors in guide_anchors.items():

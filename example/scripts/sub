@@ -17,4 +17,12 @@ module load oneapi-2022/hdf5-1.14.3
 module load oneapi-2022/libxc-6.2.2
 module load oneapi-2022/dftd4-3.6.0
 
-mpirun vasp_std > sout
+dpmoire_run_vasp() {
+    if [ -n "${DPMOIRE_PHASE:-}" ]; then
+        mpirun vasp_std > "sout.${DPMOIRE_PHASE}"
+    else
+        mpirun vasp_std > sout
+    fi
+}
+
+dpmoire_run_vasp # DPMOIRE-LITE:RUN

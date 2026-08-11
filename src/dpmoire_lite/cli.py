@@ -70,6 +70,22 @@ def init_example_command(target_dir: str) -> int:
     return 0
 
 
+def run_init_mlff_command(work_dir: str) -> int:
+    from .init_mlff import InitMlffWorkflowError
+    from .init_mlff_submit import run_init_mlff_submit_workflow
+
+    try:
+        run_init_mlff_submit_workflow(Path(work_dir))
+    except InitMlffWorkflowError as exc:
+        print(f"DPmoireLite: {exc}", file=sys.stderr)
+        exit_code = exc.calculation_exit_code
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            if 1 <= exit_code <= 255:
+                return exit_code
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="DPmoireLite", description="DPmoireLite VASP dataset builder")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -79,8 +95,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate and optionally submit calculation folders",
         description=(
             "Generate calculation folders. Config init_mlff_mode defaults to manual; "
-            "single-job prepares separate bottom/top static inputs and currently "
-            "requires submit: false."
+            "single-job prepares separate bottom/top inputs plus one derived submit "
+            "script and currently requires submit: false."
         ),
     )
     build.add_argument("config", help="Path to config.yaml")
@@ -105,6 +121,20 @@ def build_parser() -> argparse.ArgumentParser:
     init_example = subparsers.add_parser("init-example", help="Copy the bundled example template")
     init_example.add_argument("target_dir", help="Directory to create from the example template")
 
+    run_init_mlff = subparsers.add_parser(
+        "run-init-mlff",
+        help="Run a prepared two-phase init workflow inside the current allocation",
+        description=(
+            "Execute a prepared single-job init MLFF workflow. This command is "
+            "normally invoked by the generated init-specific submit script."
+        ),
+    )
+    run_init_mlff.add_argument(
+        "--work-dir",
+        required=True,
+        help="Prepared DPmoire-lite work directory",
+    )
+
     return parser
 
 
@@ -121,6 +151,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.command == "init-example":
         return init_example_command(args.target_dir)
+    if args.command == "run-init-mlff":
+        return run_init_mlff_command(args.work_dir)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

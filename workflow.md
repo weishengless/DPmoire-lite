@@ -89,7 +89,7 @@ Manual path:
 3. Submit or run `init_mlff/` manually on the desired cluster.
 4. Ensure `init_mlff/ML_ABN` and `init_mlff/ML_FFN` exist before stage1.
 
-Auditable two-phase preparation:
+Auditable two-phase single-allocation workflow:
 
 ```yaml
 stage: 0
@@ -108,14 +108,62 @@ complete static VASP input set built from its own layer and cell; no POSCAR,
 POTCAR, or species-dependent INCAR fields are copied from one layer over the
 other. The complete candidate tree and its manifest are published together.
 
-`init_mlff/manifest.yaml` uses `dpmoire-lite.init-workflow.v1`, records bottom as
+Single-job mode requires a Bash submit template with valid `#SBATCH` directives
+before executable content and this exact interface:
+
+```bash
+dpmoire_run_vasp() {
+    # Run synchronously and return the real VASP launcher exit code.
+    srun vasp_std > "sout.${DPMOIRE_PHASE:-manual}"
+}
+
+dpmoire_run_vasp # DPMOIRE-LITE:RUN
+```
+
+The declaration, standalone closing brace, and marked call are deliberate
+contract syntax. There must be exactly one launch-function definition and one
+marker; neither may be nested in another shell function. The marker must be the
+first top-level executable line after the function and the final executable line
+in the file, although comments and blank lines may follow. The function must be
+self-contained apart from exported environment and installed commands; do not
+append `&` or hide the launcher status. DPmoire-lite leaves this source file
+byte-for-byte unchanged and replaces only the exact marked call in the derived
+`init_mlff/<dft_script>` copy. It never parses or transforms arbitrary launcher,
+container, pipeline, or redirection text.
+
+`init_mlff/manifest.yaml` uses `dpmoire-lite.init-workflow.v2`, records bottom as
 `step-1-ready` and top as `planned`, and stores sizes/SHA-256 identities for the
-static files plus prepared template/submit sources. This evidence can detect a
+static files, source template, and generated adapter. This evidence can detect a
 later conflict without exposing POTCAR contents or other private payloads.
 
-In the current unit, `single-job` is workspace preparation only and therefore
-requires `submit: false`. Output validation and seed promotion, wrapper
-rendering, and one-command Slurm submission are deliberately not active yet.
+After `DPmoireLite build config.yaml`, inspect and submit exactly the derived
+root script:
+
+```bash
+cd <work_dir>/init_mlff
+sbatch <dft_script>
+```
+
+The generated adapter exports `dpmoire_run_vasp` and invokes the trusted
+two-phase workflow using `SLURM_SUBMIT_DIR/..` as the work directory. Submit from
+the derived script directory as shown: Slurm may execute a spooled script copy,
+so the script file's runtime path is not a reliable workspace anchor. This fixed
+relative submit-directory contract also lets the complete workspace be moved.
+Each synchronous child launch runs in its own bottom/top
+working directory with `DPMOIRE_PHASE=step1|step2`, plus
+`DPMOIRE_PHASE_ROLE` and `DPMOIRE_PHASE_NAME`. A nonzero bottom exit or invalid
+bottom MLFF output records failure and prevents the top launch even if the
+template does not use `set -e`. Only validated top outputs publish root
+`ML_ABN`/`ML_FFN`.
+
+Completed `dpmoire-lite.init-workflow.v1` manifests remain readable so Stage1
+can consume a previously published, hash-verified seed. Only v2 manifests carry
+the submit-adapter evidence required to start this automated two-phase command.
+
+Both VASP launches use the same Slurm allocation. Select resources compatible
+with both phases and request walltime for their combined runtime. This mode still
+requires `submit: false`: automatic `sbatch` is a later unit. It performs no
+second submission, `sacct` query, polling, retry, resume, or cross-job dependency.
 
 Non-wait submit path:
 
@@ -166,8 +214,10 @@ symmetry-equivalent stackings and writes `sym_reduced_stackings.txt`.
 
 Set `submit: true` to submit generated folders with Slurm.
 
-This applies to the default `init_mlff_mode: manual`. The preparatory
-`single-job` mode currently rejects `submit: true` before writing any target.
+Automatic submission applies to the default `init_mlff_mode: manual`. The
+`single-job` mode generates a ready-to-submit root adapter but still rejects
+`submit: true` before writing any target; inspect it and run one `sbatch`
+manually as described above.
 
 Without `--wait`, DPmoire-lite submits every folder requested by the current
 stage and exits:

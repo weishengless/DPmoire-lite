@@ -10,11 +10,17 @@ from typing import Any
 import yaml
 
 from . import atomic_io
+from .init_mlff_contract import (
+    INIT_MLFF_LAUNCH_FUNCTION,
+    INIT_MLFF_RUN_MARKER_LINE,
+    INIT_MLFF_SUBMIT_ADAPTER_SCHEMA,
+)
 from dpmoire_lite.paths import manifest_path
 
 
 MANIFEST_SCHEMA_VERSION = 2
-INIT_WORKFLOW_SCHEMA = "dpmoire-lite.init-workflow.v1"
+INIT_WORKFLOW_SCHEMA = "dpmoire-lite.init-workflow.v2"
+LEGACY_INIT_WORKFLOW_SCHEMA = "dpmoire-lite.init-workflow.v1"
 
 _INIT_WORKFLOW_STATE_PHASES = {
     "planned": ("planned", "planned"),
@@ -329,17 +335,35 @@ def _validate_init_workflow(
         raise ValueError(
             f"Invalid manifest {path}: init_workflow is valid only for stage 'init_mlff'"
         )
+    schema = workflow.get("schema")
+    if schema == LEGACY_INIT_WORKFLOW_SCHEMA:
+        expected_fields = {
+            "schema",
+            "mode",
+            "state",
+            "submit_source",
+            "phases",
+        }
+    elif schema == INIT_WORKFLOW_SCHEMA:
+        expected_fields = {
+            "schema",
+            "mode",
+            "state",
+            "submit_source",
+            "submit_adapter",
+            "phases",
+        }
+    else:
+        raise ValueError(
+            f"Invalid manifest {path}: init_workflow.schema must be "
+            f"{LEGACY_INIT_WORKFLOW_SCHEMA!r} or {INIT_WORKFLOW_SCHEMA!r}"
+        )
     _require_exact_mapping_fields(
         workflow,
         path,
         "init_workflow",
-        {"schema", "mode", "state", "submit_source", "phases"},
+        expected_fields,
     )
-    if workflow["schema"] != INIT_WORKFLOW_SCHEMA:
-        raise ValueError(
-            f"Invalid manifest {path}: init_workflow.schema must be "
-            f"{INIT_WORKFLOW_SCHEMA!r}"
-        )
     if workflow["mode"] != "single-job":
         raise ValueError(
             f"Invalid manifest {path}: init_workflow.mode must be 'single-job'"
@@ -353,6 +377,48 @@ def _validate_init_workflow(
         "init_workflow.submit_source",
         include_name=True,
     )
+    if schema == INIT_WORKFLOW_SCHEMA:
+        submit_adapter = workflow["submit_adapter"]
+        _expect_mapping(submit_adapter, path, "init_workflow.submit_adapter")
+        _require_exact_mapping_fields(
+            submit_adapter,
+            path,
+            "init_workflow.submit_adapter",
+            {"schema", "marker", "launch_function", "generated_script"},
+        )
+        if submit_adapter["schema"] != INIT_MLFF_SUBMIT_ADAPTER_SCHEMA:
+            raise ValueError(
+                f"Invalid manifest {path}: init_workflow.submit_adapter.schema must be "
+                f"{INIT_MLFF_SUBMIT_ADAPTER_SCHEMA!r}"
+            )
+        if submit_adapter["marker"] != INIT_MLFF_RUN_MARKER_LINE:
+            raise ValueError(
+                f"Invalid manifest {path}: init_workflow.submit_adapter.marker must be "
+                f"{INIT_MLFF_RUN_MARKER_LINE!r}"
+            )
+        if submit_adapter["launch_function"] != INIT_MLFF_LAUNCH_FUNCTION:
+            raise ValueError(
+                "Invalid manifest "
+                f"{path}: init_workflow.submit_adapter.launch_function must be "
+                f"{INIT_MLFF_LAUNCH_FUNCTION!r}"
+            )
+        generated_script = submit_adapter["generated_script"]
+        _expect_mapping(
+            generated_script,
+            path,
+            "init_workflow.submit_adapter.generated_script",
+        )
+        _validate_file_identity(
+            generated_script,
+            path,
+            "init_workflow.submit_adapter.generated_script",
+            include_name=True,
+        )
+        if generated_script["name"] != submit_source["name"]:
+            raise ValueError(
+                f"Invalid manifest {path}: generated submit script name must match "
+                "the source submit script name"
+            )
 
     phases = workflow["phases"]
     _expect_mapping(phases, path, "init_workflow.phases")

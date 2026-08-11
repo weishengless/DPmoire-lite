@@ -68,7 +68,21 @@ rejects tilted slab cells because the spacing modes operate along z.
 If an INCAR template contains `LUSE_VDW = T`, `input_dir` must also contain
 `vdw_kernel.bindat`; it will be copied into generated calculation folders.
 
-`script_dir` must contain the Slurm script named by `dft_script`.
+`script_dir` must contain the Slurm script named by `dft_script`. In
+`init_mlff_mode: single-job`, that file is an explicit Bash template: Slurm
+directives stay before executable content, the synchronous launch function is
+declared exactly as `dpmoire_run_vasp() {`, and the launch site is exactly:
+
+```bash
+dpmoire_run_vasp # DPMOIRE-LITE:RUN
+```
+
+The function must wait for VASP and return the real launcher exit code; do not
+background it. Its closing `}` must be on a line by itself, and the marked call
+must be the final executable line (only comments or blank lines may follow).
+DPmoire-lite replaces only that marked line in a derived copy and never searches
+for or rewrites `srun`, `mpirun`, containers, pipelines, or redirections in the
+function body.
 
 `potcar_dir` should point to a VASP POTCAR root. With the default
 `potcar_policy: recommend`, DPmoire-lite tries VASP's recommended mapped folder
@@ -127,17 +141,24 @@ The initial MLFF workflow is intentionally explicit:
   generate and optionally submit any enabled relaxation or validation folders.
   After the user finishes preparing `ML_ABN` and `ML_FFN`, stage1 can use those
   files.
-- `single-job` is an explicit opt-in that currently requires `submit: false`.
-  Stage0 transactionally publishes complete static inputs in
+- `single-job` is an explicit opt-in that requires `submit: false`. Stage0
+  transactionally publishes complete static inputs in
   `init_mlff/bottom/` and `init_mlff/top/`, using `init_bottom_incar` and
   `init_top_incar`. Each phase receives its own POSCAR, local POTCAR, own-cell
   KPOINTS, rendered INCAR, and submit-script copy, while both INCAR files use the
-  workflow-wide cutoff. `init_mlff/manifest.yaml` records the versioned
-  `step-1-ready`/`planned` state and bounded size/SHA-256 evidence without POTCAR
-  payloads.
-- This release prepares and audits the two-phase workspace only. Seed-output
-  validation/promotion, the derived single-job wrapper, and automatic `sbatch`
-  are later workflow units; do not manually rename one phase over the other.
+  workflow-wide cutoff. It also renders `init_mlff/<dft_script>` from the marked
+  source template without changing that source. The manifest records both
+  script hashes and bounded workflow evidence without POTCAR payloads.
+- After build, inspect the derived script, change into `<work_dir>/init_mlff`,
+  and submit it once with `sbatch <dft_script>`. The generated adapter resolves
+  the workflow from Slurm's submit directory, so submitting from that directory
+  keeps a relocated workspace portable. In one allocation it runs bottom,
+  validates and copies the continuation seed, runs top, validates again, and
+  atomically publishes final `init_mlff/ML_ABN` and `ML_FFN`. `DPMOIRE_PHASE` is
+  `step1` or `step2` for phase-specific logging. The allocation resources must
+  suit both calculations and its walltime must cover their combined runtime.
+  Automatic `sbatch`, scheduler polling, retries, and cross-job dependencies are
+  not enabled in this unit.
 
 ## Collection Semantics
 
@@ -209,7 +230,7 @@ rejected.
 
 | Tag | Type | Meaning |
 | --- | --- | --- |
-| `dft_script` | string | Slurm submit script filename. The file is copied from `script_dir` into each generated calculation folder and submitted with `sbatch`. |
+| `dft_script` | string | Slurm submit script filename. Manual mode copies it unchanged into calculation folders. Single-job mode additionally requires the documented `dpmoire_run_vasp`/marker contract and renders an init-specific script with the same basename. |
 | `potcar_dir` | path | Root directory containing POTCAR subfolders. |
 | `potcar_policy` | `recommend` or `minimal` | POTCAR selection policy. `recommend` uses VASP recommended element-folder mapping and is the default. `minimal` scans regular POTCAR variants in `potcar_dir` and uses the unique lowest-`ZVAL` candidate; a tie fails preflight as ambiguous. |
 | `script_dir` | path | Directory containing prepared submit scripts. |
@@ -223,7 +244,7 @@ rejected.
 | `outcar_collect_freq` | positive int | OUTCAR sampling stride for relaxation and non-ML MD collection. Validation always uses stride 1. VASP-ML MD collection reads `ML_ABN`, so this tag does not affect that path. |
 | `do_relaxation` | bool | In stage0, generate relaxation folders under `rlx/`. |
 | `init_mlff` | bool | In stage0, generate the initial `init_mlff/` folder. |
-| `init_mlff_mode` | `manual` or `single-job` | Init layout. Defaults to `manual`. `single-job` creates separate `init_mlff/bottom` and `init_mlff/top` static workspaces and currently requires `submit: false`. |
+| `init_mlff_mode` | `manual` or `single-job` | Init layout. Defaults to `manual`. `single-job` creates separate bottom/top workspaces and one ready-to-submit derived script; it still requires `submit: false`, so the user invokes `sbatch` once after inspection. |
 | `init_bottom_incar` | relative path | Bottom-phase INCAR template under `input_dir`; required by `single-job`. |
 | `init_top_incar` | relative path | Top-phase INCAR template under `input_dir`; required by `single-job`. |
 | `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |

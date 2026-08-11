@@ -57,7 +57,18 @@ python -m pip install .
 
 如果某个 INCAR 模板中包含 `LUSE_VDW = T`，则 `input_dir` 中还必须有 `vdw_kernel.bindat`，它会被复制到生成出的计算目录中。
 
-`script_dir` 中必须包含 `dft_script` 指定的 Slurm 提交脚本。
+`script_dir` 中必须包含 `dft_script` 指定的 Slurm 提交脚本。使用
+`init_mlff_mode: single-job` 时，该文件是显式 Bash 模板：Slurm 指令必须位于
+可执行内容之前，同步启动函数必须精确声明为 `dpmoire_run_vasp() {`，启动位置必须是：
+
+```bash
+dpmoire_run_vasp # DPMOIRE-LITE:RUN
+```
+
+该函数必须等待 VASP 结束并返回真实 launcher exit code，不能放到后台运行。函数结束的
+`}` 必须单独成行；标记调用必须是最后一条可执行语句，后面只能有注释或空行。
+DPmoire-lite 只替换派生副本中的这一个标记行，不会搜索或改写函数体里的 `srun`、
+`mpirun`、container、pipeline 或重定向。
 
 `potcar_dir` 应指向 VASP POTCAR 根目录。默认 `potcar_policy: recommend` 时，DPmoire-lite 会先尝试 VASP 推荐的元素映射目录，例如 Li 对应 `Li_sv`，然后再回退到普通元素名目录。设置 `potcar_policy: minimal` 时，会在 `potcar_dir` 中选择常规 POTCAR 候选里 `ZVAL` 最小的目录。
 
@@ -94,15 +105,20 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
   作业；如果 `submit: true` 但不加 `--wait`，只提交这第一步 init 作业。
   stage0 仍会继续生成并可选提交已经启用的弛豫或 validation 目录。用户完成
   `ML_ABN` 和 `ML_FFN` 准备后，stage1 再使用这些文件。
-- `single-job` 是显式 opt-in，当前要求 `submit: false`。stage0 会事务性发布
+- `single-job` 是显式 opt-in，要求 `submit: false`。stage0 会事务性发布
   `init_mlff/bottom/` 与 `init_mlff/top/` 两套完整静态输入，分别使用
   `init_bottom_incar` 和 `init_top_incar`。每个 phase 都有自己的 POSCAR、
   局部元素 POTCAR、按自身晶胞生成的 KPOINTS、渲染后的 INCAR 和提交脚本副本；
-  两份 INCAR 共用全工作流 cutoff。`init_mlff/manifest.yaml` 只记录带版本的
-  `step-1-ready`/`planned` 状态以及有界 size/SHA-256 证据，不记录 POTCAR 内容。
-- 当前版本只负责生成和审计两阶段工作区。seed 输出校验/提升、派生的单作业
-  wrapper 与自动 `sbatch` 属于后续工作流单元；不要再把一个 phase 手工覆盖到
-  另一个 phase 上。
+  两份 INCAR 共用全工作流 cutoff。同时会从带标记的源模板渲染
+  `init_mlff/<dft_script>`，且源模板字节不变。manifest 会记录源脚本和派生脚本
+  hash 以及有界 workflow 证据，不记录 POTCAR 内容。
+- build 后先检查派生脚本，然后进入 `<work_dir>/init_mlff` 并执行一次
+  `sbatch <dft_script>`。派生 adapter 根据 Slurm 的提交目录定位 workflow，因此按此
+  目录提交可保证工作区整体移动后仍然可用。同一个 allocation 会依次运行 bottom、
+  校验并复制 continuation seed、运行 top、再次校验，并原子发布最终的
+  `init_mlff/ML_ABN` 与 `ML_FFN`。`DPMOIRE_PHASE` 在两步中分别为 `step1` 和
+  `step2`，可用于区分日志。资源必须同时适用于两个计算，walltime 必须覆盖两步
+  总时长。自动 `sbatch`、scheduler polling、retry 和跨作业依赖仍未启用。
 
 ## 数据收集语义
 
@@ -145,7 +161,7 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 
 | 配置项 | 类型 | 含义 |
 | --- | --- | --- |
-| `dft_script` | 字符串 | Slurm 提交脚本文件名。该文件会从 `script_dir` 复制到每个生成的计算目录中，并用 `sbatch` 提交。 |
+| `dft_script` | 字符串 | Slurm 提交脚本文件名。manual 模式会原样复制；single-job 模式还要求文档规定的 `dpmoire_run_vasp`/marker 契约，并生成同名 init 专用派生脚本。 |
 | `potcar_dir` | 路径 | POTCAR 子目录的根目录。 |
 | `potcar_policy` | `recommend` 或 `minimal` | POTCAR 选择策略。`recommend` 使用 VASP 推荐映射并作为默认值；`minimal` 会扫描 `potcar_dir` 中的常规 POTCAR 变体并选择唯一的最低 `ZVAL` 候选；最低值并列时会因歧义而在 preflight 失败。 |
 | `script_dir` | 路径 | 存放提交脚本的目录。 |
@@ -159,7 +175,7 @@ Stage0 和 Stage1 的 `submit: true` 与 `--wait` 组合当前暂时关闭，`st
 | `outcar_collect_freq` | 正整数 | 弛豫和非 ML MD 的 OUTCAR 采样间隔。validation 始终使用 1。VASP-ML MD 收集读取 `ML_ABN`，不受此项影响。 |
 | `do_relaxation` | 布尔值 | stage0 是否生成 `rlx/` 下的弛豫目录。 |
 | `init_mlff` | 布尔值 | stage0 是否生成初始 `init_mlff/` 目录。 |
-| `init_mlff_mode` | `manual` 或 `single-job` | init 布局，默认 `manual`。`single-job` 会分别生成 `init_mlff/bottom` 和 `init_mlff/top` 静态工作区，当前要求 `submit: false`。 |
+| `init_mlff_mode` | `manual` 或 `single-job` | init 布局，默认 `manual`。`single-job` 会生成 bottom/top 工作区和一个可提交的派生脚本；仍要求 `submit: false`，用户检查后只需手动执行一次 `sbatch`。 |
 | `init_bottom_incar` | 相对路径 | `input_dir` 下的 bottom phase INCAR 模板；`single-job` 必填。 |
 | `init_top_incar` | 相对路径 | `input_dir` 下的 top phase INCAR 模板；`single-job` 必填。 |
 | `sc_rlx` | 布尔值 | `true` 表示弛豫超胞堆垛结构；`false` 表示只弛豫 primitive glide structure，并在 stage1 根据 CONTCAR 扩胞。 |

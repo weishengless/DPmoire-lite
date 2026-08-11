@@ -24,6 +24,10 @@ from .init_mlff import (
     InitMlffWorkflowError,
     validate_published_init_mlff_seed,
 )
+from .init_mlff_submit import (
+    PreparedInitMlffSubmitAdapter,
+    prepare_init_mlff_submit_adapter,
+)
 from .mlab import MlabParseResult, parse_mlab
 from .manifest import ManifestReadResult, read_manifest
 from .paths import relative_to_workdir, stage_dir
@@ -120,6 +124,7 @@ class PreparedInitMlffWorkflow:
     mode: str
     initial_state: str
     root_dir: Path
+    submit_adapter: PreparedInitMlffSubmitAdapter
     phases: tuple[PreparedInitMlffPhase, ...]
 
 
@@ -406,6 +411,17 @@ def _prepare_init_mlff_workflow(
         )
         return None
     try:
+        submit_adapter = prepare_init_mlff_submit_adapter(submit_script)
+    except Exception as exc:
+        diagnostics.append(
+            PreflightDiagnostic(
+                domain="script",
+                path=submit_script.path,
+                reason=str(exc),
+            )
+        )
+        return None
+    try:
         bottom_atoms = sort(
             make_supercell(
                 prim=structures.bot_atoms.copy(),
@@ -431,6 +447,7 @@ def _prepare_init_mlff_workflow(
         mode="single-job",
         initial_state="step-1-ready",
         root_dir=root_dir,
+        submit_adapter=submit_adapter,
         phases=(
             PreparedInitMlffPhase(
                 name="bottom",

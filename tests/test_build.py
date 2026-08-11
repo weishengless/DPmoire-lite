@@ -58,7 +58,14 @@ Direct
     (input_dir / "bot_layer.poscar").write_text(bot_poscar, encoding="utf-8")
     for name in ["init_INCAR", "rlx_INCAR", "MD_INCAR", "MD_monolayer_INCAR", "val_INCAR"]:
         (input_dir / name).write_text("ENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\nLANGEVIN_GAMMA = 1\n", encoding="utf-8")
-    (scripts / "DFT_script.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (scripts / "DFT_script.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "dpmoire_run_vasp() {\n"
+        "    true\n"
+        "}\n"
+        "dpmoire_run_vasp # DPMOIRE-LITE:RUN\n",
+        encoding="utf-8",
+    )
     return input_dir, scripts, potcars
 
 
@@ -382,7 +389,7 @@ def test_single_job_init_mode_generates_auditable_two_phase_workspace(tmp_path):
     manifest = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["directories"] == ["init_mlff/bottom", "init_mlff/top"]
     workflow = manifest["init_workflow"]
-    assert workflow["schema"] == "dpmoire-lite.init-workflow.v1"
+    assert workflow["schema"] == "dpmoire-lite.init-workflow.v2"
     assert workflow["mode"] == "single-job"
     assert workflow["state"] == "step-1-ready"
     assert workflow["phases"]["bottom"]["role"] == "step-1"

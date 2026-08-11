@@ -258,8 +258,8 @@ class DPmoireLiteConfig:
         ):
             raise ConfigError(
                 "init_mlff_mode: single-job currently requires submit: false. "
-                "Ticket #8 prepares the two-phase workspace only; automated "
-                "single-job submission is enabled by a later workflow unit."
+                "Inspect and submit the generated init_mlff derived script once; "
+                "automatic single-job submission is enabled by a later workflow unit."
             )
 
 

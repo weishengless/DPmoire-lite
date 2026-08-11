@@ -1,6 +1,6 @@
 
 ############################ ENVIRONMENT SETTINGS ############################
-dft_script: sub                             #Name of VASP submit script.
+dft_script: sub                             #Submit template. single-job requires the final marked dpmoire_run_vasp call shown in scripts/sub.
 potcar_dir: ./potcars                       #Directory containing POTCAR element folders; edit for your environment.
 potcar_policy: recommend                    #recommend: VASP recommended mapping. minimal: lowest-ZVAL regular POTCAR candidate.
 script_dir: ./scripts                       #Prepared slurm scripts.
@@ -17,7 +17,7 @@ vasp_ml: true           # *true*: use VASP MLFF for MD. Stage1 distributes init_
 outcar_collect_freq: 8   #Collect 1 data every 8 ionic steps in OUTCAR.
 do_relaxation: true      #In stage0, generate stacking relaxation folders under rlx/.
 init_mlff: true         #In stage0, generate the initial init_mlff/ folder.
-init_mlff_mode: manual  #manual: legacy single-folder init. single-job: prepare auditable init_mlff/bottom and init_mlff/top static inputs (requires submit: false for now).
+init_mlff_mode: manual  #manual: legacy single-folder init. single-job: generate bottom/top inputs plus one ready-to-sbatch derived wrapper (submit: false).
 init_bottom_incar: init_bottom_INCAR #Explicit bottom-layer scientific template required by single-job mode; path is relative to input_dir.
 init_top_incar: init_top_INCAR       #Explicit top-layer scientific template required by single-job mode; path is relative to input_dir.
 include_monolayer_md: true  #In stage1, also generate md/top_layer and md/bot_layer monolayer MD folders.

@@ -27,10 +27,20 @@ def _valid_init_workflow():
         for index, name in enumerate(("POSCAR", "POTCAR", "INCAR", "KPOINTS", "sub"))
     }
     return {
-        "schema": "dpmoire-lite.init-workflow.v1",
+        "schema": "dpmoire-lite.init-workflow.v2",
         "mode": "single-job",
         "state": "step-1-ready",
         "submit_source": {"name": "sub", "size": 7, "sha256": "a" * 64},
+        "submit_adapter": {
+            "schema": "dpmoire-lite.init-submit-adapter.v1",
+            "marker": "dpmoire_run_vasp # DPMOIRE-LITE:RUN",
+            "launch_function": "dpmoire_run_vasp",
+            "generated_script": {
+                "name": "sub",
+                "size": 10,
+                "sha256": "d" * 64,
+            },
+        },
         "phases": {
             "bottom": {
                 "role": "step-1",
@@ -67,6 +77,13 @@ def _valid_published_init_seed():
         "ml_ab_sha256": "e" * 64,
         "ml_ff_sha256": "f" * 64,
     }
+
+
+def _valid_init_workflow_v1():
+    workflow = deepcopy(_valid_init_workflow())
+    workflow["schema"] = "dpmoire-lite.init-workflow.v1"
+    del workflow["submit_adapter"]
+    return workflow
 
 
 def test_read_manifest_reports_missing_separately(tmp_path):
@@ -139,7 +156,7 @@ def test_manifest_v2_round_trip_preserves_extension_sections(tmp_path):
     assert asdict(result.manifest) == asdict(manifest)
 
 
-def test_init_workflow_v1_round_trip_preserves_bounded_evidence(tmp_path):
+def test_init_workflow_v2_round_trip_preserves_bounded_evidence(tmp_path):
     work_dir = tmp_path / "work"
     manifest = Manifest(
         stage="init_mlff",
@@ -156,6 +173,32 @@ def test_init_workflow_v1_round_trip_preserves_bounded_evidence(tmp_path):
     assert result.manifest.init_workflow == manifest.init_workflow
 
 
+def test_read_manifest_accepts_completed_init_workflow_v1_for_stage1_compatibility(
+    tmp_path,
+):
+    work_dir = tmp_path / "work"
+    workflow = _valid_init_workflow_v1()
+    workflow["state"] = "complete"
+    workflow["phases"]["bottom"]["state"] = "complete"
+    workflow["phases"]["top"]["state"] = "complete"
+    data = asdict(
+        Manifest(
+            stage="init_mlff",
+            generated_at="2026-08-11T12:00:00",
+            directories=["init_mlff/bottom", "init_mlff/top"],
+            mlff_seed=_valid_published_init_seed(),
+            init_workflow=workflow,
+        )
+    )
+    _write_yaml(work_dir, "init_mlff", data)
+
+    result = read_manifest(work_dir, "init_mlff")
+
+    assert result.kind == "current"
+    assert result.manifest is not None
+    assert result.manifest.init_workflow == workflow
+
+
 @pytest.mark.parametrize(
     ("workflow_state", "bottom_state", "top_state"),
     [
@@ -168,7 +211,7 @@ def test_init_workflow_v1_round_trip_preserves_bounded_evidence(tmp_path):
         ("complete", "complete", "complete"),
     ],
 )
-def test_init_workflow_v1_round_trip_accepts_transactional_lifecycle_states(
+def test_init_workflow_v2_round_trip_accepts_transactional_lifecycle_states(
     tmp_path,
     workflow_state,
     bottom_state,
@@ -198,7 +241,7 @@ def test_init_workflow_v1_round_trip_accepts_transactional_lifecycle_states(
     assert result.manifest.init_workflow == workflow
 
 
-def test_init_workflow_v1_rejects_inconsistent_transactional_phase_states(tmp_path):
+def test_init_workflow_v2_rejects_inconsistent_transactional_phase_states(tmp_path):
     work_dir = tmp_path / "work"
     workflow = deepcopy(_valid_init_workflow())
     workflow["state"] = "step-2-ready"
@@ -235,7 +278,7 @@ def test_complete_init_workflow_requires_bounded_published_seed_evidence(tmp_pat
 @pytest.mark.parametrize(
     ("field_path", "value", "match"),
     [
-        (("schema",), "dpmoire-lite.init-workflow.v2", "schema"),
+        (("schema",), "dpmoire-lite.init-workflow.v3", "schema"),
         (("state",), "running", "state"),
         (("phases", "bottom", "role"), "step-2", "role"),
         (("phases", "bottom", "directory"), "../outside", "safe relative path"),
@@ -244,9 +287,29 @@ def test_complete_init_workflow_requires_bounded_published_seed_evidence(tmp_pat
             "not-a-digest",
             "SHA-256",
         ),
+        (
+            ("submit_adapter", "schema"),
+            "dpmoire-lite.init-submit-adapter.v2",
+            "submit_adapter.schema",
+        ),
+        (
+            ("submit_adapter", "marker"),
+            "# arbitrary marker",
+            "submit_adapter.marker",
+        ),
+        (
+            ("submit_adapter", "launch_function"),
+            "arbitrary_launch",
+            "submit_adapter.launch_function",
+        ),
+        (
+            ("submit_adapter", "generated_script", "name"),
+            "different-sub",
+            "name must match",
+        ),
     ],
 )
-def test_read_manifest_rejects_invalid_init_workflow_v1(
+def test_read_manifest_rejects_invalid_init_workflow_v2(
     tmp_path,
     field_path,
     value,

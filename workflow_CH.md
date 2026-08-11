@@ -77,7 +77,7 @@ Stage1 会把新解析的计划与新版 relaxation manifest 中的 cutoff 证�
 3. 在目标集群上手动提交或运行 `init_mlff/`。
 4. 在 stage1 前确认 `init_mlff/ML_ABN` 和 `init_mlff/ML_FFN` 已经存在。
 
-可审计的两阶段准备路径：
+可审计的单 allocation 两阶段路径：
 
 ```yaml
 stage: 0
@@ -94,13 +94,53 @@ init_top_incar: init_top_INCAR
 静态 VASP 输入；不会再用一层的 POSCAR、POTCAR 或依赖元素的 INCAR 字段覆盖另一层。
 完整候选目录树和 manifest 会一起发布。
 
-`init_mlff/manifest.yaml` 使用 `dpmoire-lite.init-workflow.v1`，把 bottom 记录为
-`step-1-ready`、top 记录为 `planned`，并保存静态文件以及已预检模板/提交脚本的
+single-job 模式要求 Bash 提交模板把有效 `#SBATCH` 指令放在可执行内容之前，并使用
+以下精确接口：
+
+```bash
+dpmoire_run_vasp() {
+    # 必须同步运行并返回真实 VASP launcher exit code。
+    srun vasp_std > "sout.${DPMOIRE_PHASE:-manual}"
+}
+
+dpmoire_run_vasp # DPMOIRE-LITE:RUN
+```
+
+函数声明、单独成行的结束 `}` 和带标记的调用行都是契约语法；launch function 定义和
+marker 都必须恰好出现一次，且不能嵌套在其他 shell function 中。marker 必须是函数后
+第一条顶层可执行语句，也是文件中最后一条可执行语句；其后只能有注释或空行。函数除
+已 export 的环境和已安装命令外应当自包含，不能追加 `&`，也不能吞掉 launcher exit
+status。DPmoire-lite 保证源模板字节不变，只替换派生 `init_mlff/<dft_script>` 副本中的
+精确标记调用，不解析或改写任意 launcher、container、pipeline 或重定向文本。
+
+`init_mlff/manifest.yaml` 使用 `dpmoire-lite.init-workflow.v2`，把 bottom 记录为
+`step-1-ready`、top 记录为 `planned`，并保存静态文件、源模板与派生 adapter 的
 size/SHA-256 identity。这些证据可以识别后续 conflict，但不会暴露 POTCAR 内容或
 其他私有 payload。
 
-当前单元中的 `single-job` 只负责准备工作区，因此要求 `submit: false`。输出校验与
-seed promotion、wrapper 渲染和一键 Slurm 提交尚未启用。
+运行 `DPmoireLite build config.yaml` 后，检查并且只提交根目录下的派生脚本：
+
+```bash
+cd <work_dir>/init_mlff
+sbatch <dft_script>
+```
+
+派生 adapter 会 export `dpmoire_run_vasp`，以 `SLURM_SUBMIT_DIR/..` 作为 work directory
+并调用可信两阶段 workflow。必须按上例从派生脚本目录提交：Slurm 可能执行 spool 中的
+脚本副本，因此运行时脚本路径不能作为可靠的 workspace 锚点；固定的提交目录相对路径
+也允许整体移动 workspace。两个同步子进程
+分别在 bottom/top 工作目录运行，环境中提供 `DPMOIRE_PHASE=step1|step2`，以及
+`DPMOIRE_PHASE_ROLE`、`DPMOIRE_PHASE_NAME`。即使模板未使用 `set -e`，bottom 非零
+退出或 MLFF 输出校验失败也会记录失败并阻止 top 启动；只有通过校验的 top 输出才会
+发布根目录 `ML_ABN`/`ML_FFN`。
+
+已完成的 `dpmoire-lite.init-workflow.v1` manifest 仍可读取，因此 Stage1 可以继续使用
+此前已发布且通过 hash 校验的 seed；只有 v2 manifest 包含启动该自动两阶段命令所需的
+submit-adapter 证据。
+
+两次 VASP 启动共享同一个 Slurm allocation，因此资源必须同时适用于两步，walltime
+必须覆盖两步总时长。该模式仍要求 `submit: false`；自动 `sbatch` 属于后续单元。
+这里不会第二次提交，也不会使用 `sacct`、polling、retry、resume 或跨作业 dependency。
 
 非等待提交路径：
 
@@ -142,8 +182,9 @@ DPmoire-lite 的网格平移锚点；其 `F F T` 掩码表示固定 x/y、允许
 
 设置 `submit: true` 后，生成目录会被 Slurm 提交。
 
-该行为适用于默认的 `init_mlff_mode: manual`。当前的 `single-job` 准备模式会在
-写入任何目标前拒绝 `submit: true`。
+自动提交行为适用于默认的 `init_mlff_mode: manual`。`single-job` 会生成可提交的根
+adapter，但仍会在写入任何目标前拒绝 `submit: true`；请按上文检查后手动执行一次
+`sbatch`。
 
 不加 `--wait` 时，DPmoire-lite 会提交当前 stage 请求的所有目录，然后退出：
 

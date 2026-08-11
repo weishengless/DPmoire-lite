@@ -15,6 +15,7 @@ from .atomic_io import (
 )
 from .inputs import PreparedSource, prepare_source
 from .manifest import (
+    INIT_WORKFLOW_SCHEMA,
     Manifest,
     read_manifest,
     set_init_workflow_state,
@@ -26,6 +27,15 @@ from .mlff_seed import SeedPrefixVerifier
 
 class InitMlffWorkflowError(RuntimeError):
     """A bounded init-MLFF lifecycle or evidence failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        calculation_exit_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.calculation_exit_code = calculation_exit_code
 
 
 @dataclass(frozen=True)
@@ -198,6 +208,11 @@ class InitMlffWorkflow:
             raise InitMlffWorkflowError(
                 "init MLFF preflight invariant failed: automated workflow evidence is missing"
             )
+        if workflow["schema"] != INIT_WORKFLOW_SCHEMA:
+            raise InitMlffWorkflowError(
+                "init MLFF preflight invariant failed: the current submit adapter "
+                "workflow schema is required for execution"
+            )
         state = workflow["state"]
         if state != "step-1-ready":
             raise InitMlffWorkflowError(
@@ -290,7 +305,8 @@ class InitMlffWorkflow:
             self._fail(manifest, failure_state, error)
         if exit_code != 0:
             error = InitMlffWorkflowError(
-                f"init MLFF {request.phase} calculation failed with exit code {exit_code}"
+                f"init MLFF {request.phase} calculation failed with exit code {exit_code}",
+                calculation_exit_code=exit_code,
             )
             self._fail(manifest, failure_state, error)
 
