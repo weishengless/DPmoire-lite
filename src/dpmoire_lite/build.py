@@ -13,7 +13,7 @@ import numpy as np
 from ase.build import make_supercell, sort
 from ase import Atoms
 from ase.constraints import FixedLine
-from ase.io.vasp import read_vasp, write_vasp
+from ase.io.vasp import write_vasp
 
 from .atomic_io import (
     PinnedDirectory,
@@ -53,13 +53,10 @@ from .manifest import (
     write_manifest_to_directory,
 )
 from .mlab import seed_prefix_identity
-from .paths import backup_existing_directory, relative_to_workdir
+from .paths import relative_to_workdir
 from . import provenance as provenance_module
 from .slurm import SlurmJob, SlurmRunner
 from .structures import StructureHandler, supercell_matrix
-
-
-VASP_RELAXATION_CONVERGED_PHRASE = "reached required accuracy - stopping structural energy minimisation"
 
 
 class InitMlffSubmissionError(RuntimeError):
@@ -744,48 +741,6 @@ def build_stage_all(
     raise ConfigError("stage: all is unavailable")
 
 
-def check_relaxation_converged(directory: Path) -> None:
-    directory = Path(directory)
-    outcar = directory / "OUTCAR"
-    if not outcar.exists():
-        raise FileNotFoundError(f"Missing OUTCAR in {directory}")
-    text = outcar.read_text(encoding="utf-8", errors="ignore")
-    if VASP_RELAXATION_CONVERGED_PHRASE not in text:
-        raise ValueError(f"Relaxation did not converge in {directory}")
-
-    contcar = directory / "CONTCAR"
-    if not contcar.exists():
-        raise FileNotFoundError(f"Missing CONTCAR in {directory}")
-    try:
-        read_vasp(contcar)
-    except Exception as exc:
-        raise ValueError(f"CONTCAR is not readable by ASE in {directory}") from exc
-
-
-def check_stage1_inputs(config: DPmoireLiteConfig, stackings: list[tuple[int, int]]) -> None:
-    failures: list[tuple[Path, str]] = []
-    init_mlff_dir = config.work_dir / "init_mlff"
-    if config.vasp_ml:
-        for name in ("ML_ABN", "ML_FFN"):
-            path = init_mlff_dir / name
-            if not path.exists():
-                failures.append((path, "missing required MLFF file"))
-
-    for i, j in stackings:
-        source_dir = config.work_dir / "rlx" / f"{i}_{j}"
-        try:
-            check_relaxation_converged(source_dir)
-        except (FileNotFoundError, ValueError) as exc:
-            failures.append((source_dir, _stage1_failure_reason(exc, source_dir)))
-
-    if failures:
-        details = "\n".join(
-            f"- {relative_to_workdir(config.work_dir, path)}: {reason}"
-            for path, reason in failures
-        )
-        raise RuntimeError(f"Stage 1 input preflight failed:\n{details}")
-
-
 def prepare_init_mlff_step2(init_dir: Path, input_dir: Path, sc: tuple[int, int]) -> None:
     init_dir = Path(init_dir)
     input_dir = Path(input_dir)
@@ -1185,21 +1140,6 @@ def _build_validation(
     return bool(jobs)
 
 
-def _check_mlff_files(init_mlff_dir: Path) -> None:
-    for name in ("ML_ABN", "ML_FFN"):
-        path = Path(init_mlff_dir) / name
-        if not path.exists():
-            raise FileNotFoundError(f"vasp_ml requires {path}")
-
-
-def _stage1_failure_reason(exc: Exception, source_dir: Path) -> str:
-    text = str(exc)
-    suffix = f" in {source_dir}"
-    if text.endswith(suffix):
-        return text[: -len(suffix)]
-    return text
-
-
 def _normalize_stage1_structure(
     atoms: Atoms,
     *,
@@ -1347,15 +1287,6 @@ def _write_vasp_inputs(
 
 def _ordered_elements(atoms: Atoms) -> list[str]:
     return get_ordered_elements(atoms)
-
-
-def _backup_targets(work_dir: Path, stage: str, targets: list[Path], timestamp: str) -> list[str]:
-    backups = []
-    for target in targets:
-        backup = backup_existing_directory(work_dir, stage, target, timestamp)
-        if backup is not None:
-            backups.append(relative_to_workdir(work_dir, backup))
-    return backups
 
 
 def _submit_dirs(

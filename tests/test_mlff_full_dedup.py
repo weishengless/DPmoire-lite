@@ -1058,7 +1058,6 @@ def test_full_dedup_fresh_start_retains_every_unique_final_configuration(
 
 def test_restart_time_ml_ab_count_is_never_used_by_full_dedup(
     tmp_path,
-    monkeypatch,
 ):
     collect_full_dedup_mlab_sources = _full_dedup_source_api()
 
@@ -1074,12 +1073,9 @@ def test_restart_time_ml_ab_count_is_never_used_by_full_dedup(
         "complete_vasp_651.mlab",
         filename="ML_AB",
     )
+    current_ml_ab.write_bytes(b"unrelated restart input must not be parsed\n")
     before = current_ml_ab.read_bytes()
 
-    def unexpected_count(*args, **kwargs):
-        raise AssertionError("full-dedup must not inspect current ML_AB")
-
-    monkeypatch.setattr(collect_module, "count_ml_ab_configs", unexpected_count)
     result = collect_full_dedup_mlab_sources(
         work_dir=work_dir,
         source_paths=(final_path,),

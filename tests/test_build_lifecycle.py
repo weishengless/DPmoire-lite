@@ -1807,7 +1807,7 @@ def test_generation_does_not_reparse_written_or_validated_poscars(
     config, work = _prepare_stage1_lifecycle_case(tmp_path)
     state = {"preflight_complete": False, "result": None}
     real_preflight = build_module.preflight_stage1
-    real_read_vasp = build_module.read_vasp
+    real_read_vasp = preflight_module.read_vasp
     handler_type = build_module.StructureHandler
     real_handler_read = handler_type.read_atoms
 
@@ -1832,7 +1832,7 @@ def test_generation_does_not_reparse_written_or_validated_poscars(
 
     monkeypatch.setattr(build_module, "preflight_stage1", observe_preflight)
     monkeypatch.setattr(build_module, "StructureHandler", reuse_preflight_handler)
-    monkeypatch.setattr(build_module, "read_vasp", forbid_build_read_vasp)
+    monkeypatch.setattr(preflight_module, "read_vasp", forbid_build_read_vasp)
     monkeypatch.setattr(handler_type, "read_atoms", forbid_handler_reparse)
 
     run_build(config, wait=False)
