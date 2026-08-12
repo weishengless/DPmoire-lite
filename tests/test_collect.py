@@ -1798,6 +1798,32 @@ def test_no_data_without_previous_output_creates_no_extxyz(tmp_path):
     assert _current_collect_record(work)["preserved_previous_output"] is False
 
 
+def test_current_publication_follows_the_stage_output_contract(
+    tmp_path,
+    monkeypatch,
+):
+    publish_no_data_candidate = _no_data_publication_api()
+    output_name = "contract_data.extxyz"
+    monkeypatch.setitem(collect_module.COLLECT_OUTPUTS, "md", output_name)
+    work = tmp_path / "work"
+    manifest = _write_current_no_data_manifest(work)
+    candidate = _seed_aware_no_data_candidate()
+
+    result = publish_no_data_candidate(
+        work_dir=work,
+        stage="md",
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.SEED_AWARE,
+        transaction_id="ticket17-current-contract",
+    )
+
+    assert result.status is models.CollectStatus.NO_DATA
+    assert result.publication_committed is True
+    assert _current_collect_record(work)["output"] == output_name
+    assert not (work / output_name).exists()
+
+
 def test_no_data_records_preserved_previous_and_previous_frame_count(tmp_path):
     publish_no_data_candidate = _no_data_publication_api()
     work = tmp_path / "work"
@@ -2027,6 +2053,40 @@ def test_legacy_no_data_writes_only_compatibility_result_manifest(tmp_path):
     assert compatibility["collect"]["sources"] == [
         candidate.source_results[0].as_diagnostic()
     ]
+
+
+def test_compatibility_publication_follows_the_stage_output_contract(
+    tmp_path,
+    monkeypatch,
+):
+    publish_no_data_candidate = _no_data_publication_api()
+    output_name = "contract_data.extxyz"
+    monkeypatch.setitem(collect_module.COLLECT_OUTPUTS, "md", output_name)
+    work = tmp_path / "work"
+    legacy_path = manifest_path(work, "md")
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(
+        "stage: md\ndirectories:\n  - md/run-a\nlegacy_key: preserve-me\n",
+        encoding="utf-8",
+    )
+    manifest = read_manifest(work, "md")
+    candidate = _seed_aware_no_data_candidate()
+
+    result = publish_no_data_candidate(
+        work_dir=work,
+        stage="md",
+        manifest=manifest,
+        candidate=candidate,
+        collection_mode=models.MLFFCollectMode.SEED_AWARE,
+        transaction_id="ticket17-compatibility-contract",
+    )
+
+    compatibility_path = work / "MD_data.collect.yaml"
+    compatibility = yaml.safe_load(compatibility_path.read_text(encoding="utf-8"))
+    assert result.status is models.CollectStatus.NO_DATA
+    assert result.publication_committed is True
+    assert compatibility["collect"]["output"] == output_name
+    assert not (work / output_name).exists()
 
 
 def test_missing_scan_no_data_does_not_create_stage_manifest(tmp_path):

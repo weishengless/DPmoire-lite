@@ -56,14 +56,10 @@ from .outcar import (
     find_outcar_series,
     open_outcar_frames,
 )
-from .paths import manifest_path, relative_to_workdir
+from .paths import STAGE_OUTPUTS, manifest_path, relative_to_workdir
 
 
-COLLECT_OUTPUTS = {
-    "rlx": "rlx_data.extxyz",
-    "md": "MD_data.extxyz",
-    "validation": "valid.extxyz",
-}
+COLLECT_OUTPUTS = STAGE_OUTPUTS
 
 
 class CollectionInvariantError(ValueError):

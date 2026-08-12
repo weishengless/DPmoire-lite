@@ -211,6 +211,42 @@ def test_collect_cli_complete_returns_zero(monkeypatch, tmp_path, capsys):
     )
 
 
+def test_collect_cli_follows_the_stage_output_contract(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    config_path = _write_collect_cli_config(tmp_path, stage="rlx")
+    result = _recovered_cli_result(
+        CollectStatus.COMPLETE,
+        frames=1,
+        complete=1,
+    )
+    calls = _replace_orchestrate_collect(monkeypatch, result)
+    monkeypatch.setitem(
+        collect_module.COLLECT_OUTPUTS,
+        "contract-stage",
+        "contract_data.extxyz",
+    )
+
+    exit_code = main(
+        ["collect", str(config_path), "--stage", "contract-stage"]
+    )
+
+    assert exit_code == 0
+    _assert_orchestration_request(
+        calls,
+        config_path=config_path,
+        stage="contract-stage",
+        collection_mode=MLFFCollectMode.SEED_AWARE,
+    )
+    _assert_one_stderr_summary(
+        capsys,
+        "collect status=complete frames=1 sources=1 complete=1 partial=0 "
+        "skipped=0 failed=0 output=contract_data.extxyz",
+    )
+
+
 def test_collect_cli_fatal_returns_one(monkeypatch, tmp_path, capsys):
     config_path = _write_collect_cli_config(tmp_path, stage="rlx")
     result = CollectResult(

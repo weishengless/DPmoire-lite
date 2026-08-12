@@ -11,6 +11,7 @@ from .collect_models import (
     DEFAULT_MLFF_COLLECT_MODE,
     MLFFCollectMode,
 )
+from .paths import STAGE_OUTPUTS
 
 
 _COLLECT_EXIT_CODES = {
@@ -63,14 +64,14 @@ def collect_command(
     *,
     collection_mode: MLFFCollectMode = DEFAULT_MLFF_COLLECT_MODE,
 ) -> int:
-    from .collect import COLLECT_OUTPUTS, run_collect
+    from .collect import run_collect
 
     result = run_collect(
         Path(config_path),
         stage=stage,
         collection_mode=collection_mode,
     )
-    output = COLLECT_OUTPUTS.get(stage, "unavailable")
+    output = STAGE_OUTPUTS.get(stage, "unavailable")
     print(_collect_summary(result, output=output), file=sys.stderr)
     return _COLLECT_EXIT_CODES[result.status]
 
@@ -132,7 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect = subparsers.add_parser("collect", help="Collect a dataset from completed calculations")
     collect.add_argument("config", help="Path to config.yaml")
-    collect.add_argument("--stage", required=True, choices=["rlx", "md", "validation"], help="Stage to collect")
+    collect.add_argument(
+        "--stage",
+        required=True,
+        choices=tuple(STAGE_OUTPUTS),
+        help="Stage to collect",
+    )
     collect.add_argument(
         "--mlff-collect-mode",
         type=MLFFCollectMode,

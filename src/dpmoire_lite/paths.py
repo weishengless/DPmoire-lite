@@ -2,7 +2,13 @@ from pathlib import Path
 from shutil import move
 
 
-VALID_STAGES = {"init_mlff", "rlx", "md", "validation"}
+STAGE_OUTPUTS = {
+    "rlx": "rlx_data.extxyz",
+    "md": "MD_data.extxyz",
+    "validation": "valid.extxyz",
+}
+
+VALID_STAGES = {"init_mlff", *STAGE_OUTPUTS}
 
 
 def stage_dir(work_dir: Path, stage: str) -> Path:

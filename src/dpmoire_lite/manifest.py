@@ -15,7 +15,7 @@ from .init_mlff_contract import (
     INIT_MLFF_RUN_MARKER_LINE,
     INIT_MLFF_SUBMIT_ADAPTER_SCHEMA,
 )
-from dpmoire_lite.paths import manifest_path
+from dpmoire_lite.paths import STAGE_OUTPUTS as _COLLECT_OUTPUTS, manifest_path
 
 
 MANIFEST_SCHEMA_VERSION = 2
@@ -36,12 +36,6 @@ _INIT_WORKFLOW_STATE_PHASES = {
 }
 _INIT_WORKFLOW_STATES = set(_INIT_WORKFLOW_STATE_PHASES)
 _INIT_PHASE_ROLES = {"bottom": "step-1", "top": "step-2"}
-
-_COLLECT_OUTPUTS = {
-    "rlx": "rlx_data.extxyz",
-    "md": "MD_data.extxyz",
-    "validation": "valid.extxyz",
-}
 
 _MANIFEST_FIELDS = {
     "stage",

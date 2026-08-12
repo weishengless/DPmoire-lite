@@ -24,14 +24,7 @@ from .manifest import (
     serialize_manifest,
     validate_current_manifest_text,
 )
-from .paths import manifest_path
-
-
-_STAGE_OUTPUTS = {
-    "rlx": "rlx_data.extxyz",
-    "md": "MD_data.extxyz",
-    "validation": "valid.extxyz",
-}
+from .paths import STAGE_OUTPUTS as _STAGE_OUTPUTS, manifest_path
 
 _COMPATIBILITY_SCHEMA_VERSION = 1
 _COMPATIBILITY_KIND = "dpmoire-lite-collect-result"
@@ -561,7 +554,8 @@ def _validate_result_request_target(
     target_path = Path(request.target.path).resolve()
 
     if request.target.kind == ResultManifestTargetKind.MD_COMPATIBILITY:
-        expected_output = work_dir / "MD_data.extxyz"
+        expected_output_name = _STAGE_OUTPUTS["md"]
+        expected_output = work_dir / expected_output_name
         expected_target = work_dir / "MD_data.collect.yaml"
         if (
             request.stage != "md"
@@ -570,8 +564,9 @@ def _validate_result_request_target(
             or request.compatibility_evidence is None
         ):
             raise CandidateValidationError(
-                "compatibility target requires stage 'md', work_dir/MD_data.extxyz, "
-                "work_dir/MD_data.collect.yaml, and compatibility evidence"
+                "compatibility target requires stage 'md', "
+                f"work_dir/{expected_output_name}, work_dir/MD_data.collect.yaml, "
+                "and compatibility evidence"
             )
     elif request.target.kind == ResultManifestTargetKind.CURRENT_STAGE:
         output_name = _STAGE_OUTPUTS.get(request.stage)
@@ -989,9 +984,11 @@ def _validate_compatibility_manifest_text(
         raise CandidateValidationError(
             "compatibility manifest candidate collect fields do not match schema version 1"
         )
-    if collect.get("output") != "MD_data.extxyz":
+    expected_output_name = _STAGE_OUTPUTS["md"]
+    if collect.get("output") != expected_output_name:
         raise CandidateValidationError(
-            "compatibility manifest candidate output must be MD_data.extxyz"
+            "compatibility manifest candidate output must be "
+            f"{expected_output_name}"
         )
     if expected_collect is None and (
         collect.get("frames") != request.expected_frame_count
@@ -1386,7 +1383,7 @@ def _validate_session_target(session: PublicationSession) -> None:
     elif session.target.kind == ResultManifestTargetKind.MD_COMPATIBILITY:
         if (
             session.stage != "md"
-            or session.final_output != session.work_dir / "MD_data.extxyz"
+            or session.final_output != session.work_dir / _STAGE_OUTPUTS["md"]
             or session.target.path != session.work_dir / "MD_data.collect.yaml"
         ):
             raise PublicationError(
