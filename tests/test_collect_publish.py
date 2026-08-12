@@ -4,6 +4,7 @@ import errno
 import importlib
 import os
 import shutil
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -527,6 +528,67 @@ def test_data_candidate_reread_matches_expected_frame_count(tmp_path):
         api.prepare_candidates(request)
 
     assert not request.final_output.exists()
+
+
+def test_publication_isolated_from_a_mutating_data_writer(tmp_path):
+    api = _publication_api()
+    request = _request(tmp_path, target_kind="compatibility")
+    callback_received_authoritative_dataset = []
+
+    def mutating_writer(dataset: Dataset, path: Path) -> None:
+        callback_received_authoritative_dataset.append(dataset is request.dataset)
+        dataset.save_extxyz(path)
+        dataset.data[0].positions[0, 0] = 91.0
+        request.dataset.data[1].positions[0, 0] = 92.0
+        request.source_diagnostics[0]["status"] = "failed"
+        request.compatibility_evidence.dedup["retained"] = 99
+
+    request = replace(request, data_writer=mutating_writer)
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        result = session.publish(_request_for_session(request, session))
+
+    published = Dataset()
+    published.load_extxyz(request.final_output)
+    manifest = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+    assert callback_received_authoritative_dataset == [False]
+    assert published.n_configs == 2
+    assert published.data[0].positions[0, 0] == pytest.approx(0.0)
+    assert published.data[1].positions[0, 0] == pytest.approx(0.2)
+    assert manifest["dedup"]["retained"] == 2
+    assert manifest["collect"]["sources"][0]["status"] == "complete"
+    assert manifest["collect"]["output_sha256"] == result.data_sha256
+
+
+def test_writer_output_from_a_mutated_callback_copy_fails_before_commit(tmp_path):
+    api = _publication_api()
+    request = _request(tmp_path)
+    previous_manifest = request.target.path.read_bytes()
+
+    def mutate_then_write(dataset: Dataset, path: Path) -> None:
+        dataset.data[0].positions[0, 0] = 91.0
+        dataset.save_extxyz(path)
+
+    request = replace(request, data_writer=mutate_then_write)
+
+    with pytest.raises(api.PublicationError, match="changed positions"):
+        with api.PublicationSession(
+            work_dir=request.work_dir,
+            stage=request.stage,
+            final_output=request.final_output,
+            target=request.target,
+        ) as session:
+            session.publish(_request_for_session(request, session))
+
+    assert not request.final_output.exists()
+    assert request.target.path.read_bytes() == previous_manifest
+    assert not _journal_path(request.final_output).exists()
+    assert not list(request.work_dir.rglob("*.candidate"))
 
 
 def test_data_candidate_requires_energy_forces_and_stress(tmp_path):
@@ -1950,6 +2012,61 @@ def test_manifest_only_publish_is_atomic_under_same_lock(
     }
     assert not _journal_path(request.final_output).exists()
     assert not list(request.work_dir.rglob("*.candidate"))
+
+
+def test_manifest_only_publication_snapshots_caller_owned_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    api = _publication_api()
+    request = _request(tmp_path)
+    _write_previous_output(request)
+    read_started = threading.Event()
+    allow_read = threading.Event()
+    real_ase_read = api.ase_read
+
+    def blocking_ase_read(path, *args, **kwargs):
+        if Path(path) == request.final_output:
+            read_started.set()
+            if not allow_read.wait(timeout=5):
+                raise AssertionError("test did not release output reread")
+        return real_ase_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(api, "ase_read", blocking_ase_read)
+
+    with api.PublicationSession(
+        work_dir=request.work_dir,
+        stage=request.stage,
+        final_output=request.final_output,
+        target=request.target,
+    ) as session:
+        manifest_request = _manifest_only_request(
+            api,
+            request,
+            session,
+            transaction_id="collect-manifest-only-snapshot",
+        )
+
+        def mutate_caller_owned_evidence():
+            if not read_started.wait(timeout=5):
+                return
+            manifest_request.source_diagnostics[0]["status"] = "complete"
+            manifest_request.current_manifest.directories[:] = ["md/mutated"]
+            allow_read.set()
+
+        mutator = threading.Thread(
+            target=mutate_caller_owned_evidence,
+            daemon=True,
+        )
+        mutator.start()
+        result = session.publish_manifest_only(manifest_request)
+        mutator.join(timeout=5)
+
+    assert not mutator.is_alive()
+    manifest = yaml.safe_load(request.target.path.read_text(encoding="utf-8"))
+    assert manifest["directories"] == ["md/run-a", "md/run-b"]
+    assert manifest["collect"]["sources"][0]["status"] == "failed"
+    assert manifest["collect"]["transaction_id"] == result.transaction_id
 
 
 def test_compatibility_manifest_only_publish_does_not_create_stage_manifest(tmp_path):

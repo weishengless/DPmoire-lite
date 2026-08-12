@@ -253,6 +253,65 @@ class ManifestOnlyRequest:
     compatibility_evidence: CompatibilityManifestEvidence | None = None
 
 
+def _snapshot_collection_audit(
+    evidence: CollectionAuditEvidence | None,
+) -> CollectionAuditEvidence | None:
+    if evidence is None:
+        return None
+    return replace(
+        evidence,
+        inventory=copy.deepcopy(dict(evidence.inventory)),
+        dedup=(
+            None
+            if evidence.dedup is None
+            else copy.deepcopy(dict(evidence.dedup))
+        ),
+    )
+
+
+def _snapshot_compatibility_evidence(
+    evidence: CompatibilityManifestEvidence | None,
+) -> CompatibilityManifestEvidence | None:
+    if evidence is None:
+        return None
+    return replace(
+        evidence,
+        declared_directories=tuple(evidence.declared_directories),
+        discovered_directories=tuple(evidence.discovered_directories),
+        dedup=copy.deepcopy(dict(evidence.dedup)),
+    )
+
+
+def _snapshot_candidate_request(request: CandidateRequest) -> CandidateRequest:
+    return replace(
+        request,
+        dataset=copy.deepcopy(request.dataset),
+        source_diagnostics=tuple(
+            copy.deepcopy(dict(source)) for source in request.source_diagnostics
+        ),
+        collection_audit=_snapshot_collection_audit(request.collection_audit),
+        current_manifest=copy.deepcopy(request.current_manifest),
+        compatibility_evidence=_snapshot_compatibility_evidence(
+            request.compatibility_evidence
+        ),
+    )
+
+
+def _snapshot_manifest_only_request(
+    request: ManifestOnlyRequest,
+) -> ManifestOnlyRequest:
+    return replace(
+        request,
+        source_diagnostics=tuple(
+            copy.deepcopy(dict(source)) for source in request.source_diagnostics
+        ),
+        current_manifest=copy.deepcopy(request.current_manifest),
+        compatibility_evidence=_snapshot_compatibility_evidence(
+            request.compatibility_evidence
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class CandidateArtifacts:
     data_candidate_path: Path
@@ -450,7 +509,7 @@ def _prepare_data_candidate(request: CandidateRequest) -> tuple[Path, str]:
     candidate = atomic_io.create_candidate(request.final_output)
     try:
         writer = request.data_writer or _write_dataset
-        writer(request.dataset, candidate)
+        writer(copy.deepcopy(request.dataset), candidate)
         atomic_io.fsync_path(candidate)
         _validate_data_candidate(request, candidate)
         return candidate, atomic_io.sha256_file(candidate)
@@ -1101,16 +1160,19 @@ class PublicationSession:
         backup: BackupArtifacts | None = None
 
         try:
-            _validate_session_request(self, request)
-            _validate_request(request)
-            self._lock.update_diagnostics(transaction_id=request.transaction_id)
+            publish_request = _snapshot_candidate_request(request)
+            _validate_session_request(self, publish_request)
+            _validate_request(publish_request)
+            self._lock.update_diagnostics(
+                transaction_id=publish_request.transaction_id
+            )
 
-            data_candidate, data_sha256 = _prepare_data_candidate(request)
+            data_candidate, data_sha256 = _prepare_data_candidate(publish_request)
             backup = prepare_backup(
                 work_dir=self.work_dir,
                 stage=self.stage,
                 final_output=self.final_output,
-                transaction_id=request.transaction_id,
+                transaction_id=publish_request.transaction_id,
             )
             if backup.previous_output_sha256 != self.previous_output_sha256:
                 raise PublicationError(
@@ -1130,7 +1192,7 @@ class PublicationSession:
                 else None
             )
             publish_request = replace(
-                request,
+                publish_request,
                 previous_output_frames=backup.previous_output_frames,
                 previous_output_sha256=backup.previous_output_sha256,
                 previous_manifest_sha256=self.previous_manifest_sha256,
@@ -1180,7 +1242,7 @@ class PublicationSession:
             atomic_io.fsync_directory(self.journal_path.parent)
 
             result = PublicationResult(
-                transaction_id=request.transaction_id,
+                transaction_id=publish_request.transaction_id,
                 final_output=self.final_output,
                 data_sha256=data_sha256,
                 result_manifest_target_kind=self.target.kind,
@@ -1224,9 +1286,12 @@ class PublicationSession:
 
         manifest_candidate: Path | None = None
         try:
-            _validate_session_request(self, request)
-            _validate_manifest_only_request(request)
-            self._lock.update_diagnostics(transaction_id=request.transaction_id)
+            publish_request = _snapshot_manifest_only_request(request)
+            _validate_session_request(self, publish_request)
+            _validate_manifest_only_request(publish_request)
+            self._lock.update_diagnostics(
+                transaction_id=publish_request.transaction_id
+            )
 
             if (
                 _optional_file_sha256(self.final_output)
@@ -1245,11 +1310,11 @@ class PublicationSession:
 
             previous_output_frames = _safe_output_frame_count(self.final_output)
             collect = _manifest_only_collect_record(
-                request,
+                publish_request,
                 previous_output_frames=previous_output_frames,
             )
             manifest_candidate, manifest_sha256 = _prepare_manifest_only_candidate(
-                request,
+                publish_request,
                 collect,
             )
 
@@ -1273,7 +1338,7 @@ class PublicationSession:
             atomic_io.fsync_directory(self.target.path.parent)
 
             result = PublicationResult(
-                transaction_id=request.transaction_id,
+                transaction_id=publish_request.transaction_id,
                 final_output=self.final_output,
                 data_sha256=self.previous_output_sha256,
                 result_manifest_target_kind=self.target.kind,
