@@ -165,6 +165,52 @@ def test_collect_lock_rejects_windows_reparse_metadata_before_diagnostics(
     assert lock.lock_path.read_bytes() == original
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows reparse points are unavailable on this platform",
+)
+def test_collect_lock_rejects_a_real_windows_junction_before_touching_target(
+    tmp_path,
+):
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    external_target = tmp_path / "outside-junction-target"
+    external_target.mkdir()
+    sentinel = external_target / "sentinel"
+    original = b"outside content must stay unchanged"
+    sentinel.write_bytes(original)
+    command = [
+        os.environ.get("COMSPEC", "cmd.exe"),
+        "/d",
+        "/c",
+        "mklink",
+        "/J",
+        os.fspath(lock.lock_path),
+        os.fspath(external_target),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            "directory junctions are unavailable on this platform: "
+            f"{result.stderr or result.stdout}"
+        )
+
+    try:
+        assert getattr(lock.lock_path.lstat(), "st_reparse_tag", 0) != 0
+        with pytest.raises(collect_lock_error, match="lock invariant"):
+            with lock:
+                pass
+        assert sentinel.read_bytes() == original
+    finally:
+        lock.lock_path.rmdir()
+
+
 def test_collect_lock_rejects_path_identity_change_after_open(
     monkeypatch,
     tmp_path,
@@ -202,6 +248,34 @@ def test_collect_lock_rejects_path_identity_change_after_open(
 
     assert lock.lock_path.read_bytes() == original
     assert replacement.read_bytes() == replacement_content
+
+
+def test_collect_lock_rejects_a_file_created_during_absent_path_open(
+    monkeypatch,
+    tmp_path,
+):
+    module = importlib.import_module("dpmoire_lite.file_lock")
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    original = b"raced-in lock content"
+    real_open = module.os.open
+    injected = False
+
+    def create_file_before_open(path, flags, mode=0o777):
+        nonlocal injected
+        if path == os.fspath(lock.lock_path) and not injected:
+            lock.lock_path.write_bytes(original)
+            injected = True
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(module.os, "open", create_file_before_open)
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert lock.lock_path.read_bytes() == original
 
 
 def test_collect_lock_rechecks_before_initializing_an_empty_lock(

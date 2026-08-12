@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import errno
 import os
-import stat
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -18,6 +16,10 @@ from .atomic_io import (
     sha256_file,
 )
 from .inputs import PreparedSource, prepare_source
+from .lock_safety import (
+    open_verified_lock_file,
+    verify_open_lock_file,
+)
 from .manifest import (
     INIT_WORKFLOW_SCHEMA,
     Manifest,
@@ -48,69 +50,6 @@ class InitMlffWorkflowError(RuntimeError):
         self.calculation_exit_code = calculation_exit_code
 
 
-def _lock_file_is_safe(file_stat: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(file_stat.st_mode)
-        and file_stat.st_nlink == 1
-        and getattr(file_stat, "st_reparse_tag", 0) == 0
-    )
-
-
-def _same_file_identity(
-    first: os.stat_result,
-    second: os.stat_result,
-) -> bool:
-    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
-
-
-def _verify_open_lock_file(descriptor: int, lock_path: Path) -> os.stat_result:
-    opened = os.fstat(descriptor)
-    current = lock_path.lstat()
-    if not _lock_file_is_safe(opened) or not _lock_file_is_safe(current):
-        raise OSError(
-            errno.EPERM,
-            "lock path is not a single-link regular file",
-            os.fspath(lock_path),
-        )
-    if not _same_file_identity(opened, current):
-        raise OSError(
-            errno.EPERM,
-            "lock path changed while it was being opened",
-            os.fspath(lock_path),
-        )
-    return current
-
-
-def _open_verified_lock_file(lock_path: Path) -> int:
-    try:
-        before = lock_path.lstat()
-    except FileNotFoundError:
-        before = None
-    else:
-        if not _lock_file_is_safe(before):
-            raise OSError(
-                errno.EPERM,
-                "lock path is not a single-link regular file",
-                os.fspath(lock_path),
-            )
-
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(os.fspath(lock_path), flags, 0o666)
-    try:
-        current = _verify_open_lock_file(descriptor, lock_path)
-        if before is not None and not _same_file_identity(before, current):
-            raise OSError(
-                errno.EPERM,
-                "lock path changed while it was being opened",
-                os.fspath(lock_path),
-            )
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
-
-
 @contextmanager
 def init_mlff_manifest_lock(work_dir: Path) -> Iterator[None]:
     """Serialize submission evidence with the workflow's first state transition."""
@@ -118,7 +57,7 @@ def init_mlff_manifest_lock(work_dir: Path) -> Iterator[None]:
     descriptor = -1
     handle = None
     try:
-        descriptor = _open_verified_lock_file(lock_path)
+        descriptor = open_verified_lock_file(lock_path)
         handle = os.fdopen(descriptor, "r+b")
         descriptor = -1
         handle.seek(0, os.SEEK_END)
@@ -131,7 +70,7 @@ def init_mlff_manifest_lock(work_dir: Path) -> Iterator[None]:
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _verify_open_lock_file(handle.fileno(), lock_path)
+        verify_open_lock_file(handle.fileno(), lock_path)
     except OSError as exc:
         if handle is not None:
             handle.close()

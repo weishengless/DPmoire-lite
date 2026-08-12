@@ -6,7 +6,8 @@ import json
 import os
 from pathlib import Path
 import socket
-import stat
+
+from .lock_safety import open_verified_lock_file, verify_open_lock_file
 
 
 if os.name == "nt":
@@ -19,65 +20,25 @@ class CollectLockError(RuntimeError):
     """Raised when a collection lock cannot be acquired or used."""
 
 
-def _lock_file_is_safe(file_stat: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(file_stat.st_mode)
-        and file_stat.st_nlink == 1
-        and getattr(file_stat, "st_reparse_tag", 0) == 0
-    )
-
-
-def _same_file_identity(
-    first: os.stat_result,
-    second: os.stat_result,
-) -> bool:
-    return first.st_dev == second.st_dev and first.st_ino == second.st_ino
-
-
 def _lock_invariant_error(lock_path: Path) -> CollectLockError:
     return CollectLockError(f"collection lock invariant failed: {lock_path}")
 
 
-def _verify_open_lock_file(descriptor: int, lock_path: Path) -> os.stat_result:
+def _verify_collection_lock_file(
+    descriptor: int,
+    lock_path: Path,
+) -> os.stat_result:
     try:
-        opened = os.fstat(descriptor)
-        current = lock_path.lstat()
+        return verify_open_lock_file(descriptor, lock_path)
     except OSError as exc:
         raise _lock_invariant_error(lock_path) from exc
 
-    if not _lock_file_is_safe(opened) or not _lock_file_is_safe(current):
-        raise _lock_invariant_error(lock_path)
-    if not _same_file_identity(opened, current):
-        raise _lock_invariant_error(lock_path)
-    return current
 
-
-def _open_verified_lock_file(lock_path: Path) -> int:
+def _open_verified_collection_lock_file(lock_path: Path) -> int:
     try:
-        before = lock_path.lstat()
-    except FileNotFoundError:
-        before = None
+        return open_verified_lock_file(lock_path)
     except OSError as exc:
         raise _lock_invariant_error(lock_path) from exc
-    else:
-        if not _lock_file_is_safe(before):
-            raise _lock_invariant_error(lock_path)
-
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(os.fspath(lock_path), flags, 0o666)
-    except OSError as exc:
-        raise _lock_invariant_error(lock_path) from exc
-
-    try:
-        current = _verify_open_lock_file(descriptor, lock_path)
-        if before is not None and not _same_file_identity(before, current):
-            raise _lock_invariant_error(lock_path)
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
 
 
 class CollectFileLock:
@@ -109,7 +70,7 @@ class CollectFileLock:
         return self._lock_path
 
     def _open_handle(self):
-        descriptor = _open_verified_lock_file(self._lock_path)
+        descriptor = _open_verified_collection_lock_file(self._lock_path)
         try:
             handle = os.fdopen(descriptor, "r+b")
         except BaseException:
@@ -119,7 +80,7 @@ class CollectFileLock:
         try:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
-                _verify_open_lock_file(handle.fileno(), self._lock_path)
+                _verify_collection_lock_file(handle.fileno(), self._lock_path)
                 handle.seek(0)
                 handle.write(b"\0")
                 handle.flush()
@@ -167,7 +128,7 @@ class CollectFileLock:
             raise CollectLockError("collection lock is not held")
 
         payload = self._diagnostic_payload(transaction_id)
-        _verify_open_lock_file(handle.fileno(), self._lock_path)
+        _verify_collection_lock_file(handle.fileno(), self._lock_path)
         handle.seek(1)
         handle.write(payload)
         handle.truncate()

@@ -1,7 +1,6 @@
 import hashlib
 import os
 from pathlib import Path
-import stat
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -362,14 +361,34 @@ def test_init_mlff_lock_rejects_a_hard_link_before_touching_its_target(tmp_path)
     assert external_target.read_bytes() == b""
 
 
-def test_init_mlff_lock_rejects_windows_reparse_metadata():
-    reparse_stat = SimpleNamespace(
-        st_mode=stat.S_IFREG | 0o600,
-        st_nlink=1,
-        st_reparse_tag=0xA000000C,
-    )
+def test_init_mlff_lock_rejects_windows_reparse_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    lock_path = work_dir / ".dpmoire-lite-init-mlff.lock"
+    original = b"existing lock content"
+    lock_path.write_bytes(original)
+    real_lstat = Path.lstat
 
-    assert init_mlff_module._lock_file_is_safe(reparse_stat) is False
+    def lstat_with_reparse_metadata(path):
+        result = real_lstat(path)
+        if path == lock_path:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_nlink=result.st_nlink,
+                st_reparse_tag=0xA000000C,
+            )
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_reparse_metadata)
+
+    with pytest.raises(InitMlffWorkflowError, match="lock invariant"):
+        with init_mlff_manifest_lock(work_dir):
+            pass
+
+    assert lock_path.read_bytes() == original
 
 
 def test_init_mlff_lock_rejects_path_identity_change_after_open(
