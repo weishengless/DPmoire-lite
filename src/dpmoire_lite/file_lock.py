@@ -36,7 +36,11 @@ def _verify_collection_lock_file(
 
 def _open_verified_collection_lock_file(lock_path: Path) -> int:
     try:
-        return open_verified_lock_file(lock_path)
+        return open_verified_lock_file(lock_path, exclusive_create=True)
+    except FileExistsError as exc:
+        raise CollectLockError(
+            f"collection lock is already held: {lock_path}"
+        ) from exc
     except OSError as exc:
         raise _lock_invariant_error(lock_path) from exc
 

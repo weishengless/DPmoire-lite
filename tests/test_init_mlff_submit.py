@@ -429,6 +429,56 @@ def test_init_mlff_lock_rejects_path_identity_change_after_open(
     assert replacement.read_bytes() == b"replacement"
 
 
+def test_init_mlff_first_use_contenders_serialize(
+    monkeypatch,
+    tmp_path,
+):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    lock_path = work_dir / ".dpmoire-lite-init-mlff.lock"
+    first_lstats = threading.Barrier(2)
+    observed = threading.local()
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    errors = []
+    real_lstat = Path.lstat
+
+    def synchronized_first_lstat(path):
+        if path == lock_path and not getattr(observed, "lock_path", False):
+            observed.lock_path = True
+            first_lstats.wait(timeout=5)
+            raise FileNotFoundError(os.fspath(path))
+        return real_lstat(path)
+
+    def contender():
+        try:
+            with init_mlff_manifest_lock(work_dir):
+                if first_entered.is_set():
+                    second_entered.set()
+                else:
+                    first_entered.set()
+                    if not release_first.wait(timeout=5):
+                        raise AssertionError("test did not release the first holder")
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(Path, "lstat", synchronized_first_lstat)
+    threads = [threading.Thread(target=contender, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+
+    assert first_entered.wait(timeout=5)
+    assert second_entered.wait(timeout=0.2) is False
+    release_first.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert second_entered.is_set()
+    assert errors == []
+
+
 @pytest.mark.parametrize("script_name", ["--help", "-W"])
 def test_single_job_rejects_option_like_submit_script_name_before_runner(
     monkeypatch,

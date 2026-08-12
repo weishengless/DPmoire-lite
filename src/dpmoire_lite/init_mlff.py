@@ -57,7 +57,7 @@ def init_mlff_manifest_lock(work_dir: Path) -> Iterator[None]:
     descriptor = -1
     handle = None
     try:
-        descriptor = open_verified_lock_file(lock_path)
+        descriptor = open_verified_lock_file(lock_path, exclusive_create=False)
         handle = os.fdopen(descriptor, "r+b")
         descriptor = -1
         handle.seek(0, os.SEEK_END)

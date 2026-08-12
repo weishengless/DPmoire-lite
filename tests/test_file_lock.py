@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -271,7 +272,7 @@ def test_collect_lock_rejects_a_file_created_during_absent_path_open(
 
     monkeypatch.setattr(module.os, "open", create_file_before_open)
 
-    with pytest.raises(collect_lock_error, match="lock invariant"):
+    with pytest.raises(collect_lock_error, match="already held"):
         with lock:
             pass
 
@@ -329,6 +330,112 @@ def test_second_process_cannot_acquire_same_stage_output_lock(tmp_path):
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert collect_lock_error.__name__ == "CollectLockError"
+
+
+def test_simultaneous_first_collectors_report_normal_contention(tmp_path):
+    output = tmp_path / "MD_data.extxyz"
+    start = tmp_path / "start"
+    release = tmp_path / "release"
+    ready_paths = [tmp_path / f"ready-{index}" for index in range(2)]
+    result_paths = [tmp_path / f"result-{index}" for index in range(2)]
+    child = """
+        import errno
+        import os
+        import sys
+        import time
+        from pathlib import Path
+        from dpmoire_lite.file_lock import CollectFileLock, CollectLockError
+
+        output = Path(sys.argv[1])
+        ready = Path(sys.argv[2])
+        start = Path(sys.argv[3])
+        release = Path(sys.argv[4])
+        result = Path(sys.argv[5])
+        lock = CollectFileLock("md", output, transaction_id="child")
+        real_lstat = Path.lstat
+        state = {"first": True}
+
+        def synchronized_first_lstat(path):
+            if path == lock.lock_path and state["first"]:
+                state["first"] = False
+                ready.write_text("ready", encoding="utf-8")
+                deadline = time.monotonic() + 10
+                while not start.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("start barrier was not released")
+                    time.sleep(0.01)
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    "synchronized absent lock path",
+                    os.fspath(path),
+                )
+            return real_lstat(path)
+
+        Path.lstat = synchronized_first_lstat
+        try:
+            with lock:
+                result.write_text("acquired", encoding="utf-8")
+                deadline = time.monotonic() + 10
+                while not release.exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("release barrier was not opened")
+                    time.sleep(0.01)
+        except CollectLockError as exc:
+            result.write_text(f"error:{exc}", encoding="utf-8")
+        except BaseException as exc:
+            result.write_text(
+                f"unexpected:{type(exc).__name__}:{exc}",
+                encoding="utf-8",
+            )
+    """
+    processes = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent(child),
+                os.fspath(output),
+                os.fspath(ready_paths[index]),
+                os.fspath(start),
+                os.fspath(release),
+                os.fspath(result_paths[index]),
+            ],
+            env=_child_environment(),
+            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for index in range(2)
+    ]
+
+    try:
+        deadline = time.monotonic() + 10
+        while not all(path.exists() for path in ready_paths):
+            assert all(process.poll() is None for process in processes)
+            if time.monotonic() >= deadline:
+                pytest.fail("collectors did not reach the start barrier")
+            time.sleep(0.01)
+        start.write_text("start", encoding="utf-8")
+
+        deadline = time.monotonic() + 10
+        while not all(path.exists() for path in result_paths):
+            if time.monotonic() >= deadline:
+                pytest.fail("collectors did not report their lock outcomes")
+            time.sleep(0.01)
+
+        outcomes = sorted(path.read_text(encoding="utf-8") for path in result_paths)
+        assert outcomes[0] == "acquired"
+        assert outcomes[1].startswith("error:collection lock is already held:")
+        assert "invariant" not in outcomes[1]
+    finally:
+        release.write_text("release", encoding="utf-8")
+        for process in processes:
+            try:
+                _stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _stdout, stderr = process.communicate(timeout=5)
+            assert process.returncode == 0, stderr
 
 
 def test_different_stage_outputs_use_independent_locks(tmp_path):

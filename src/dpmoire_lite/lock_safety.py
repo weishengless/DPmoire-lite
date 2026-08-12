@@ -42,7 +42,11 @@ def verify_open_lock_file(
     return current
 
 
-def open_verified_lock_file(lock_path: Path) -> int:
+def open_verified_lock_file(
+    lock_path: Path,
+    *,
+    exclusive_create: bool,
+) -> int:
     try:
         before = lock_path.lstat()
     except FileNotFoundError:
@@ -57,7 +61,7 @@ def open_verified_lock_file(lock_path: Path) -> int:
 
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    if before is None:
+    if before is None and exclusive_create:
         flags |= os.O_EXCL
     descriptor = os.open(os.fspath(lock_path), flags, 0o666)
     try:
