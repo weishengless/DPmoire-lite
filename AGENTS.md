@@ -49,3 +49,12 @@
 - Read every narrower AGENTS.md that governs a file before editing it.
 - Narrower instructions may refine workflow but cannot override authoritative
   scientific or safety decisions.
+
+## Agent Skills
+
+### DPmoire-lite guide
+
+For package learning, operation, diagnosis, or changes, use the repository skill
+at `.agents/skills/dpmoire-guide/SKILL.md` (`$dpmoire-guide` in Codex). Start with
+one task tag: `[LEARN]`, `[RUN]`, `[DEBUG]`, or `[CHANGE]`. See
+`docs/dpmoire-agent-guide.zh-CN.md` for beginner prompts and error meanings.
