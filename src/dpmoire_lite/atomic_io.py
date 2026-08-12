@@ -6,6 +6,7 @@ import hashlib
 import os
 import platform
 import shutil
+import stat
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,6 +31,55 @@ class AtomicCopyPlan:
 class _PublishedCopy:
     destination: Path
     sha256: str
+
+
+@dataclass(frozen=True)
+class DirectoryIdentity:
+    path: Path
+    device: int
+    inode: int
+
+
+def verify_plain_directory(
+    path: Path,
+    expected: DirectoryIdentity | None = None,
+) -> DirectoryIdentity:
+    path = Path(path)
+    observed = path.lstat()
+    if not stat.S_ISDIR(observed.st_mode) or getattr(observed, "st_reparse_tag", 0):
+        raise OSError(
+            errno.EPERM,
+            "directory path is not a plain directory",
+            os.fspath(path),
+        )
+    identity = DirectoryIdentity(
+        path=path,
+        device=observed.st_dev,
+        inode=observed.st_ino,
+    )
+    if expected is not None and identity != expected:
+        raise OSError(
+            errno.EPERM,
+            "directory path identity changed",
+            os.fspath(path),
+        )
+    return identity
+
+
+def claim_directory_no_replace(
+    path: Path,
+    *,
+    parent: DirectoryIdentity | None = None,
+) -> DirectoryIdentity:
+    path = Path(path)
+    if parent is not None:
+        if path.parent != parent.path:
+            raise ValueError("Claimed directory must be a direct child of its parent")
+        verify_plain_directory(parent.path, parent)
+    path.mkdir()
+    if parent is not None:
+        verify_plain_directory(parent.path, parent)
+    return verify_plain_directory(path)
 
 
 def sha256_file(path: Path) -> str:

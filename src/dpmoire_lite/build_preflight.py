@@ -179,7 +179,7 @@ def _stage1_target_stages(
     return (("md", stage_dir(config.work_dir, "md")),)
 
 
-def _check_target_stages_absent(
+def check_target_stages_absent(
     config: DPmoireLiteConfig,
     targets: tuple[tuple[str, Path], ...],
 ) -> None:
@@ -191,7 +191,7 @@ def _check_target_stages_absent(
     if not conflicts:
         return
     details = "\n".join(
-        f"- {stage} ({relative_to_workdir(config.work_dir, path)}) already exists"
+        f"- {stage} ({path.relative_to(config.work_dir).as_posix()}) already exists"
         for stage, path in conflicts
     )
     raise RuntimeError(
@@ -257,7 +257,7 @@ def _validate_output_dirs(
 
 def preflight_stage0(config: DPmoireLiteConfig) -> BuildPreflightResult:
     stage_targets = _stage0_target_stages(config)
-    _check_target_stages_absent(config, stage_targets)
+    check_target_stages_absent(config, stage_targets)
     diagnostics: list[PreflightDiagnostic] = []
     warning_diagnostics: list[PreflightDiagnostic] = []
     templates = _validate_templates(
@@ -555,7 +555,7 @@ def _record_init_phase_filename_collisions(
 
 def preflight_stage1(config: DPmoireLiteConfig) -> BuildPreflightResult:
     stage_targets = _stage1_target_stages(config)
-    _check_target_stages_absent(config, stage_targets)
+    check_target_stages_absent(config, stage_targets)
     diagnostics: list[PreflightDiagnostic] = []
     warning_diagnostics: list[PreflightDiagnostic] = []
     templates = _validate_templates(

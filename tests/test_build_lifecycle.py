@@ -1,9 +1,16 @@
 import hashlib
+import os
 import shutil
+import subprocess
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 from ase import Atoms
 
 import dpmoire_lite.build as build_module
@@ -110,6 +117,42 @@ def _assert_prepared_source_identity(source, path: Path) -> None:
     assert source.sha256 == hashlib.sha256(payload).hexdigest()
 
 
+def _create_directory_redirect(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+        return
+
+    result = subprocess.run(
+        [
+            os.environ.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            os.fspath(link),
+            os.fspath(target),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            "directory junctions are unavailable on this platform: "
+            f"{result.stderr or result.stdout}"
+        )
+
+
+def _remove_directory_redirect(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+    else:
+        path.rmdir()
+
+
 def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
     config = write_build_config(
         tmp_path,
@@ -130,6 +173,414 @@ def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
     assert not (work / "rlx").exists()
     assert not (work / "validation").exists()
     assert not (work / "backups").exists()
+
+
+def test_legacy_init_target_appearing_after_preflight_is_not_overwritten(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        init_mlff_mode="manual",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+    )
+    target = tmp_path / "work" / "init_mlff"
+    sentinel = target / "POSCAR"
+    sentinel_bytes = b"late target sentinel\n"
+    real_preflight = build_module.preflight_stage0
+
+    def create_late_target(config_value):
+        result = real_preflight(config_value)
+        target.mkdir(parents=True)
+        sentinel.write_bytes(sentinel_bytes)
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage0", create_late_target)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        run_build(config, wait=False)
+
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert list(target.iterdir()) == [sentinel]
+
+
+def test_relaxation_target_appearing_after_preflight_is_not_overwritten(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    target = tmp_path / "work" / "rlx" / "0_0"
+    sentinel = target / "POSCAR"
+    sentinel_bytes = b"late relaxation sentinel\n"
+    real_claim_directory = build_module.claim_directory_no_replace
+
+    def create_late_target(path, *, parent=None):
+        if path == target:
+            target.mkdir()
+            sentinel.write_bytes(sentinel_bytes)
+        return real_claim_directory(path, parent=parent)
+
+    monkeypatch.setattr(
+        build_module,
+        "claim_directory_no_replace",
+        create_late_target,
+    )
+
+    with pytest.raises(RuntimeError, match="appeared after preflight"):
+        run_build(config, wait=False)
+
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert list(target.iterdir()) == [sentinel]
+    assert not (tmp_path / "work" / "rlx" / "manifest.yaml").exists()
+
+
+def test_validation_target_appearing_after_preflight_is_not_overwritten(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=False,
+        twist_val=True,
+        min_val_n=2,
+        max_val_n=2,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    sentinel_bytes = b"late validation sentinel\n"
+    injected = {}
+    real_preflight = build_module.preflight_stage0
+
+    def create_late_target(config_value):
+        result = real_preflight(config_value)
+        target = result.output_dirs[0]
+        target.mkdir(parents=True)
+        sentinel = target / "POSCAR"
+        sentinel.write_bytes(sentinel_bytes)
+        injected["target"] = target
+        injected["sentinel"] = sentinel
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage0", create_late_target)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        run_build(config, wait=False)
+
+    target = injected["target"]
+    sentinel = injected["sentinel"]
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert list(target.iterdir()) == [sentinel]
+    assert not (tmp_path / "work" / "validation" / "manifest.yaml").exists()
+
+
+def test_bilayer_md_target_appearing_after_preflight_is_not_overwritten(
+    monkeypatch,
+    tmp_path,
+):
+    config, work = _prepare_stage1_lifecycle_case(tmp_path)
+    target = work / "md" / "0_0"
+    sentinel = target / "POSCAR"
+    sentinel_bytes = b"late bilayer MD sentinel\n"
+    real_preflight = build_module.preflight_stage1
+
+    def create_late_target(config_value):
+        result = real_preflight(config_value)
+        target.mkdir(parents=True)
+        sentinel.write_bytes(sentinel_bytes)
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage1", create_late_target)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        run_build(config, wait=False)
+
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert list(target.iterdir()) == [sentinel]
+    assert not (work / "md" / "manifest.yaml").exists()
+
+
+def test_monolayer_md_target_appearing_after_preflight_is_not_overwritten(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        include_monolayer_md=True,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+    write_relaxation_manifest(work, [(0, 0)])
+    sentinel_bytes = b"late monolayer MD sentinel\n"
+    injected = {}
+    real_preflight = build_module.preflight_stage1
+
+    def create_late_target(config_value):
+        result = real_preflight(config_value)
+        target = next(path for path in result.output_dirs if path.name == "top_layer")
+        target.mkdir(parents=True)
+        sentinel = target / "POSCAR"
+        sentinel.write_bytes(sentinel_bytes)
+        injected["target"] = target
+        injected["sentinel"] = sentinel
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage1", create_late_target)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        run_build(config, wait=False)
+
+    target = injected["target"]
+    sentinel = injected["sentinel"]
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert list(target.iterdir()) == [sentinel]
+    assert not (work / "md" / "manifest.yaml").exists()
+
+
+def test_late_stage_root_blocks_all_stage0_generation(monkeypatch, tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        init_mlff_mode="manual",
+        do_relaxation=True,
+        twist_val=True,
+        min_val_n=2,
+        max_val_n=2,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    work = tmp_path / "work"
+    late_root = work / "rlx"
+    real_preflight = build_module.preflight_stage0
+
+    def create_late_root(config_value):
+        result = real_preflight(config_value)
+        late_root.mkdir(parents=True)
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage0", create_late_root)
+
+    with pytest.raises(RuntimeError, match="Build target conflict"):
+        run_build(config, wait=False)
+
+    assert list(late_root.iterdir()) == []
+    assert not (work / "init_mlff").exists()
+    assert not (work / "validation").exists()
+    assert not (work / "sym_reduced_stackings.txt").exists()
+
+
+def test_claimed_stage_root_rejects_windows_reparse_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    stage_root = tmp_path / "work" / "rlx"
+    real_lstat = Path.lstat
+
+    def lstat_with_reparse_metadata(path):
+        result = real_lstat(path)
+        if path == stage_root:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino,
+                st_reparse_tag=0xA0000003,
+            )
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_reparse_metadata)
+
+    with pytest.raises(RuntimeError, match="unsafe|reparse"):
+        run_build(config, wait=False)
+
+    assert stage_root.is_dir()
+    assert list(stage_root.iterdir()) == []
+
+
+def test_stage_root_redirected_after_claim_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    stage_root = tmp_path / "work" / "rlx"
+    external = tmp_path / "external-rlx"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel_bytes = b"external directory must stay unchanged\n"
+    sentinel.write_bytes(sentinel_bytes)
+    real_claim_stage_roots = build_module._claim_stage_roots
+
+    def redirect_after_claim(*args, **kwargs):
+        result = real_claim_stage_roots(*args, **kwargs)
+        stage_root.rmdir()
+        _create_directory_redirect(stage_root, external)
+        return result
+
+    monkeypatch.setattr(
+        build_module,
+        "_claim_stage_roots",
+        redirect_after_claim,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="unsafe|identity|contain"):
+            run_build(config, wait=False)
+
+        assert sentinel.read_bytes() == sentinel_bytes
+        assert list(external.iterdir()) == [sentinel]
+    finally:
+        if stage_root.exists() or stage_root.is_symlink():
+            _remove_directory_redirect(stage_root)
+
+
+def test_concurrent_stage0_builders_do_not_interleave_different_stage_roots(
+    monkeypatch,
+    tmp_path,
+):
+    init_config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        init_mlff_mode="manual",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    init_config = init_config.replace(tmp_path / "init-config.yaml")
+    relaxation_data = yaml.safe_load(init_config.read_text(encoding="utf-8"))
+    relaxation_data["init_mlff"] = False
+    relaxation_data["do_relaxation"] = True
+    relaxation_config = tmp_path / "relaxation-config.yaml"
+    relaxation_config.write_text(
+        yaml.safe_dump(relaxation_data),
+        encoding="utf-8",
+    )
+
+    init_active = threading.Event()
+    release_init = threading.Event()
+    generation_overlap = threading.Event()
+    real_build_init = build_module._build_init_mlff
+    real_build_relaxations = build_module._build_relaxations
+
+    def hold_init_generation(*args, **kwargs):
+        init_active.set()
+        release_init.wait(timeout=1.0)
+        try:
+            return real_build_init(*args, **kwargs)
+        finally:
+            init_active.clear()
+
+    def observe_relaxation_generation(*args, **kwargs):
+        if init_active.is_set():
+            generation_overlap.set()
+        release_init.set()
+        return real_build_relaxations(*args, **kwargs)
+
+    monkeypatch.setattr(build_module, "_build_init_mlff", hold_init_generation)
+    monkeypatch.setattr(
+        build_module,
+        "_build_relaxations",
+        observe_relaxation_generation,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        init_future = executor.submit(run_build, init_config, False)
+        assert init_active.wait(timeout=5.0)
+        relaxation_future = executor.submit(run_build, relaxation_config, False)
+        init_outcome = init_future.result(timeout=10.0)
+        relaxation_outcome = relaxation_future.result(timeout=10.0)
+
+    assert init_outcome.status == "generated"
+    assert relaxation_outcome.status == "generated"
+    assert not generation_overlap.is_set()
+
+
+def test_concurrent_builders_allow_exactly_one_owner_of_the_same_target(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    barrier = threading.Barrier(2)
+    real_preflight = build_module.preflight_stage0
+
+    def synchronize_after_preflight(config_value):
+        result = real_preflight(config_value)
+        barrier.wait(timeout=5.0)
+        return result
+
+    monkeypatch.setattr(
+        build_module,
+        "preflight_stage0",
+        synchronize_after_preflight,
+    )
+
+    outcomes = []
+    errors = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run_build, config, False) for _index in range(2)]
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=10.0))
+            except RuntimeError as exc:
+                errors.append(exc)
+
+    assert [outcome.status for outcome in outcomes] == ["generated"]
+    assert len(errors) == 1
+    assert "Build target conflict" in str(errors[0])
+    _assert_explicit_delete_message(errors[0], "rlx")
+    assert (tmp_path / "work" / "rlx" / "0_0" / "POSCAR").is_file()
+    assert read_manifest(tmp_path / "work", "rlx").manifest is not None
+
+
+def test_work_directory_identity_change_after_lock_blocks_generation(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    work = tmp_path / "work"
+    real_build_lock = build_module.build_execution_lock
+    real_lstat = Path.lstat
+    changed = False
+
+    def lstat_with_changed_identity(path):
+        result = real_lstat(path)
+        if changed and path == work:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino + 1,
+                st_reparse_tag=getattr(result, "st_reparse_tag", 0),
+            )
+        return result
+
+    @contextmanager
+    def change_identity_after_lock(work_dir):
+        nonlocal changed
+        with real_build_lock(work_dir) as work_directory:
+            changed = True
+            yield work_directory
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_changed_identity)
+    monkeypatch.setattr(
+        build_module,
+        "build_execution_lock",
+        change_identity_after_lock,
+    )
+
+    with pytest.raises(RuntimeError, match="identity|unsafe|stable"):
+        run_build(config, wait=False)
+
+    assert not (work / "rlx").exists()
 
 
 def test_stage0_treats_dangling_init_target_as_preflight_conflict(
