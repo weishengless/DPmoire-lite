@@ -13,6 +13,7 @@ import pytest
 import yaml
 from ase import Atoms
 
+import dpmoire_lite.atomic_io as atomic_io_module
 import dpmoire_lite.build as build_module
 import dpmoire_lite.build_preflight as preflight_module
 import dpmoire_lite.inputs as inputs_module
@@ -153,6 +154,66 @@ def _remove_directory_redirect(path: Path) -> None:
         path.rmdir()
 
 
+def _assert_poscar_write_redirect_is_contained(
+    monkeypatch,
+    tmp_path,
+    config,
+    target: Path,
+    *,
+    poscar_write_number: int = 1,
+) -> None:
+    external = tmp_path / f"external-{target.name}"
+    external.mkdir()
+    sentinel = external / "POSCAR"
+    sentinel_bytes = b"external POSCAR must stay unchanged\n"
+    sentinel.write_bytes(sentinel_bytes)
+    real_write_vasp = build_module.write_vasp
+    write_count = 0
+    redirected = False
+    replacement_blocked = False
+
+    def redirect_before_poscar_write(path, *args, **kwargs):
+        nonlocal write_count, redirected, replacement_blocked
+        if Path(path).name == "POSCAR":
+            write_count += 1
+        if write_count == poscar_write_number and not redirected and not replacement_blocked:
+            try:
+                target.rmdir()
+            except OSError:
+                replacement_blocked = True
+            else:
+                _create_directory_redirect(target, external)
+                redirected = True
+        return real_write_vasp(path, *args, **kwargs)
+
+    monkeypatch.setattr(build_module, "write_vasp", redirect_before_poscar_write)
+
+    try:
+        outcome = None
+        error = None
+        try:
+            outcome = run_build(config, wait=False)
+        except (OSError, RuntimeError) as exc:
+            error = exc
+
+        assert sentinel.read_bytes() == sentinel_bytes
+        assert list(external.iterdir()) == [sentinel]
+        if redirected:
+            assert error is not None
+            assert any(
+                word in str(error).lower()
+                for word in ("unsafe", "identity", "directory", "path")
+            )
+        else:
+            assert replacement_blocked is True
+            assert error is None
+            assert outcome is not None
+            assert outcome.status == "generated"
+    finally:
+        if redirected and (target.exists() or target.is_symlink()):
+            _remove_directory_redirect(target)
+
+
 def test_stage0_existing_empty_init_mlff_blocks_every_target(tmp_path):
     config = write_build_config(
         tmp_path,
@@ -208,6 +269,29 @@ def test_legacy_init_target_appearing_after_preflight_is_not_overwritten(
     assert list(target.iterdir()) == [sentinel]
 
 
+def test_legacy_init_leaf_redirected_before_poscar_write_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=True,
+        init_mlff_mode="manual",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+
+    _assert_poscar_write_redirect_is_contained(
+        monkeypatch,
+        tmp_path,
+        config,
+        tmp_path / "work" / "init_mlff",
+    )
+
+
 def test_relaxation_target_appearing_after_preflight_is_not_overwritten(
     monkeypatch,
     tmp_path,
@@ -216,17 +300,19 @@ def test_relaxation_target_appearing_after_preflight_is_not_overwritten(
     target = tmp_path / "work" / "rlx" / "0_0"
     sentinel = target / "POSCAR"
     sentinel_bytes = b"late relaxation sentinel\n"
-    real_claim_directory = build_module.claim_directory_no_replace
+    real_claim_directory = build_module.claim_pinned_directory_no_replace
 
-    def create_late_target(path, *, parent=None):
+    @contextmanager
+    def create_late_target(path, *, parent):
         if path == target:
             target.mkdir()
             sentinel.write_bytes(sentinel_bytes)
-        return real_claim_directory(path, parent=parent)
+        with real_claim_directory(path, parent=parent) as claimed:
+            yield claimed
 
     monkeypatch.setattr(
         build_module,
-        "claim_directory_no_replace",
+        "claim_pinned_directory_no_replace",
         create_late_target,
     )
 
@@ -279,6 +365,31 @@ def test_validation_target_appearing_after_preflight_is_not_overwritten(
     assert not (tmp_path / "work" / "validation" / "manifest.yaml").exists()
 
 
+def test_validation_leaf_redirected_before_poscar_write_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=False,
+        twist_val=True,
+        min_val_n=2,
+        max_val_n=2,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+    )
+    prepared = build_module.preflight_stage0(load_config(config))
+
+    _assert_poscar_write_redirect_is_contained(
+        monkeypatch,
+        tmp_path,
+        config,
+        prepared.output_dirs[0],
+    )
+
+
 def test_bilayer_md_target_appearing_after_preflight_is_not_overwritten(
     monkeypatch,
     tmp_path,
@@ -303,6 +414,86 @@ def test_bilayer_md_target_appearing_after_preflight_is_not_overwritten(
     assert sentinel.read_bytes() == sentinel_bytes
     assert list(target.iterdir()) == [sentinel]
     assert not (work / "md" / "manifest.yaml").exists()
+
+
+def test_bilayer_md_leaf_redirected_before_poscar_write_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config, work = _prepare_stage1_lifecycle_case(tmp_path)
+
+    _assert_poscar_write_redirect_is_contained(
+        monkeypatch,
+        tmp_path,
+        config,
+        work / "md" / "0_0",
+    )
+
+
+def test_bilayer_md_submission_stays_bound_to_acquired_target(
+    monkeypatch,
+    tmp_path,
+):
+    config, work = _prepare_stage1_lifecycle_case(tmp_path)
+    config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    config_data["submit"] = True
+    config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+    target = work / "md" / "0_0"
+    displaced = tmp_path / "displaced-md-target"
+    external = tmp_path / "external-md-submit"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel_bytes = b"submission redirect must stay unchanged\n"
+    sentinel.write_bytes(sentinel_bytes)
+    outcome = {}
+
+    class RedirectingRunner:
+        def submit_many(self, items, *, wait):
+            assert wait is False
+            assert len(items) == 1
+            execution_path, relative_path = items[0]
+            assert relative_path == "md/0_0"
+            try:
+                target.rename(displaced)
+            except OSError:
+                outcome["replacement_blocked"] = True
+            else:
+                _create_directory_redirect(target, external)
+                outcome["redirected"] = True
+            (execution_path / "submission.marker").write_text(
+                "submitted through retained target\n",
+                encoding="utf-8",
+            )
+            return [
+                build_module.SlurmJob(
+                    job_id="123",
+                    path=relative_path,
+                )
+            ]
+
+    monkeypatch.setattr(
+        build_module,
+        "SlurmRunner",
+        lambda *_args, **_kwargs: RedirectingRunner(),
+    )
+
+    try:
+        result = run_build(config, wait=False)
+
+        assert result.status == "submission_requested"
+        assert sentinel.read_bytes() == sentinel_bytes
+        assert list(external.iterdir()) == [sentinel]
+        if outcome.get("redirected"):
+            assert (displaced / "submission.marker").is_file()
+        else:
+            assert outcome == {"replacement_blocked": True}
+            assert (target / "submission.marker").is_file()
+    finally:
+        if outcome.get("redirected"):
+            if target.exists() or target.is_symlink():
+                _remove_directory_redirect(target)
+            if displaced.exists():
+                displaced.rename(target)
 
 
 def test_monolayer_md_target_appearing_after_preflight_is_not_overwritten(
@@ -343,6 +534,30 @@ def test_monolayer_md_target_appearing_after_preflight_is_not_overwritten(
     assert sentinel.read_bytes() == sentinel_bytes
     assert list(target.iterdir()) == [sentinel]
     assert not (work / "md" / "manifest.yaml").exists()
+
+
+def test_monolayer_md_leaf_redirected_before_poscar_write_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        include_monolayer_md=True,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+    write_relaxation_manifest(work, [(0, 0)])
+
+    _assert_poscar_write_redirect_is_contained(
+        monkeypatch,
+        tmp_path,
+        config,
+        work / "md" / "top_layer",
+        poscar_write_number=2,
+    )
 
 
 def test_late_stage_root_blocks_all_stage0_generation(monkeypatch, tmp_path):
@@ -418,12 +633,21 @@ def test_stage_root_redirected_after_claim_cannot_escape_workdir(
     sentinel_bytes = b"external directory must stay unchanged\n"
     sentinel.write_bytes(sentinel_bytes)
     real_claim_stage_roots = build_module._claim_stage_roots
+    redirected = False
+    replacement_blocked = False
 
+    @contextmanager
     def redirect_after_claim(*args, **kwargs):
-        result = real_claim_stage_roots(*args, **kwargs)
-        stage_root.rmdir()
-        _create_directory_redirect(stage_root, external)
-        return result
+        nonlocal redirected, replacement_blocked
+        with real_claim_stage_roots(*args, **kwargs) as result:
+            try:
+                stage_root.rmdir()
+            except OSError:
+                replacement_blocked = True
+            else:
+                _create_directory_redirect(stage_root, external)
+                redirected = True
+            yield result
 
     monkeypatch.setattr(
         build_module,
@@ -432,14 +656,78 @@ def test_stage_root_redirected_after_claim_cannot_escape_workdir(
     )
 
     try:
-        with pytest.raises(RuntimeError, match="unsafe|identity|contain"):
-            run_build(config, wait=False)
+        outcome = None
+        error = None
+        try:
+            outcome = run_build(config, wait=False)
+        except RuntimeError as exc:
+            error = exc
 
         assert sentinel.read_bytes() == sentinel_bytes
         assert list(external.iterdir()) == [sentinel]
+        if redirected:
+            assert error is not None
+            assert any(
+                word in str(error).lower()
+                for word in ("unsafe", "identity", "contain")
+            )
+        else:
+            assert replacement_blocked is True
+            assert error is None
+            assert outcome is not None
+            assert outcome.status == "generated"
     finally:
-        if stage_root.exists() or stage_root.is_symlink():
+        if redirected and (stage_root.exists() or stage_root.is_symlink()):
             _remove_directory_redirect(stage_root)
+
+
+def test_leaf_target_appearing_during_atomic_claim_is_not_adopted(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    stage_root = tmp_path / "work" / "rlx"
+    target = stage_root / "0_0"
+    sentinel = target / "sentinel"
+    sentinel_bytes = b"late target must stay unchanged\n"
+    real_publish = atomic_io_module.atomic_directory_publish_no_replace
+    injected = False
+
+    def create_target_before_atomic_claim(candidate, destination):
+        nonlocal injected
+        if Path(destination).name == target.name and not injected:
+            target.mkdir()
+            sentinel.write_bytes(sentinel_bytes)
+            injected = True
+        return real_publish(candidate, destination)
+
+    monkeypatch.setattr(
+        atomic_io_module,
+        "atomic_directory_publish_no_replace",
+        create_target_before_atomic_claim,
+    )
+
+    with pytest.raises(RuntimeError, match="appeared after preflight"):
+        run_build(config, wait=False)
+
+    assert injected is True
+    assert sentinel.read_bytes() == sentinel_bytes
+    assert list(target.iterdir()) == [sentinel]
+    assert not any(path.name.startswith(".0_0.claim-") for path in stage_root.iterdir())
+
+
+def test_relaxation_leaf_redirected_before_poscar_write_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+
+    _assert_poscar_write_redirect_is_contained(
+        monkeypatch,
+        tmp_path,
+        config,
+        tmp_path / "work" / "rlx" / "0_0",
+    )
 
 
 def test_concurrent_stage0_builders_do_not_interleave_different_stage_roots(
@@ -581,6 +869,69 @@ def test_work_directory_identity_change_after_lock_blocks_generation(
         run_build(config, wait=False)
 
     assert not (work / "rlx").exists()
+
+
+def test_work_directory_redirected_during_stage_claim_cannot_escape_workdir(
+    monkeypatch,
+    tmp_path,
+):
+    config = _stage0_relaxation_config(tmp_path)
+    work = tmp_path / "work"
+    displaced = tmp_path / "displaced-work"
+    external = tmp_path / "external-work-claim"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel_bytes = b"external work target must stay unchanged\n"
+    sentinel.write_bytes(sentinel_bytes)
+    real_publish = atomic_io_module.atomic_directory_publish_no_replace
+    redirected = False
+    replacement_blocked = False
+
+    def redirect_during_stage_claim(candidate, destination):
+        nonlocal redirected, replacement_blocked
+        if (
+            Path(destination).name == "rlx"
+            and not redirected
+            and not replacement_blocked
+        ):
+            try:
+                work.rename(displaced)
+            except OSError:
+                replacement_blocked = True
+            else:
+                _create_directory_redirect(work, external)
+                redirected = True
+        return real_publish(candidate, destination)
+
+    monkeypatch.setattr(
+        atomic_io_module,
+        "atomic_directory_publish_no_replace",
+        redirect_during_stage_claim,
+    )
+
+    try:
+        outcome = None
+        error = None
+        try:
+            outcome = run_build(config, wait=False)
+        except (OSError, RuntimeError) as exc:
+            error = exc
+
+        assert sentinel.read_bytes() == sentinel_bytes
+        assert list(external.iterdir()) == [sentinel]
+        if redirected:
+            assert error is not None
+        else:
+            assert replacement_blocked is True
+            assert error is None
+            assert outcome is not None
+            assert outcome.status == "generated"
+    finally:
+        if redirected:
+            if work.exists() or work.is_symlink():
+                _remove_directory_redirect(work)
+            if displaced.exists():
+                displaced.rename(work)
 
 
 def test_stage0_treats_dangling_init_target_as_preflight_conflict(

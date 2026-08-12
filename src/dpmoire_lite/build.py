@@ -3,7 +3,8 @@ from __future__ import annotations
 import shutil
 import tempfile
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,13 +16,11 @@ from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
 
 from .atomic_io import (
-    DirectoryIdentity,
+    PinnedDirectory,
     atomic_bytes_publish,
     atomic_directory_publish_no_replace,
-    atomic_text_publish,
-    claim_directory_no_replace,
+    claim_pinned_directory_no_replace,
     sha256_file,
-    verify_plain_directory,
 )
 from .build_preflight import (
     BuildPreflightResult,
@@ -47,7 +46,12 @@ from .inputs import (
     write_supercell_poscar,
 )
 from .init_mlff import init_mlff_manifest_lock
-from .manifest import INIT_WORKFLOW_SCHEMA, Manifest, serialize_manifest, write_manifest
+from .manifest import (
+    INIT_WORKFLOW_SCHEMA,
+    Manifest,
+    write_manifest,
+    write_manifest_to_directory,
+)
 from .mlab import seed_prefix_identity
 from .paths import backup_existing_directory, relative_to_workdir
 from . import provenance as provenance_module
@@ -120,70 +124,109 @@ def _assert_no_prepared_output_dirs_remain(output_dirs) -> None:
 
 def _verify_work_directory(
     work_dir: Path,
-    expected: DirectoryIdentity,
-) -> DirectoryIdentity:
+    expected: PinnedDirectory,
+) -> PinnedDirectory:
+    if Path(work_dir) != expected.path:
+        raise RuntimeError("Build work directory disagrees with its pinned path")
     try:
-        return verify_plain_directory(work_dir, expected)
+        expected.verify()
     except OSError as exc:
         raise RuntimeError(
             f"Build work directory is unsafe; refusing to write it: {work_dir}"
         ) from exc
+    return expected
 
 
+@contextmanager
 def _claim_output_directory(
     target: Path,
-    parent: DirectoryIdentity,
-) -> DirectoryIdentity:
-    try:
-        return claim_directory_no_replace(target, parent=parent)
-    except FileExistsError as exc:
-        raise RuntimeError(
-            f"Build target appeared after preflight; refusing to overwrite it: {target}"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(
-            f"Build target is unsafe after preflight; refusing to write it: {target}"
-        ) from exc
+    parent: PinnedDirectory,
+) -> Iterator[PinnedDirectory]:
+    with ExitStack() as stack:
+        try:
+            claimed = stack.enter_context(
+                claim_pinned_directory_no_replace(target, parent=parent)
+            )
+        except FileExistsError as exc:
+            raise RuntimeError(
+                "Build target appeared after preflight; refusing to overwrite it: "
+                f"{target}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"Build target is unsafe after preflight; refusing to write it: {target}"
+            ) from exc
+        yield claimed
 
 
+@contextmanager
 def _claim_stage_roots(
     config: DPmoireLiteConfig,
     stage_targets: tuple[tuple[str, Path], ...],
-    work_directory: DirectoryIdentity,
+    work_directory: PinnedDirectory,
     *,
     deferred_stages: frozenset[str] = frozenset(),
-) -> dict[str, DirectoryIdentity]:
+) -> Iterator[dict[str, PinnedDirectory]]:
     pending = tuple(
         (stage, target)
         for stage, target in stage_targets
         if stage not in deferred_stages
     )
     check_target_stages_absent(config, pending)
-    claimed = {}
-    for stage, target in pending:
-        claimed[stage] = _claim_output_directory(target, work_directory)
-    return claimed
+    with ExitStack() as stack:
+        claimed = {}
+        for stage, target in pending:
+            claimed[stage] = stack.enter_context(
+                _claim_output_directory(target, work_directory)
+            )
+        yield claimed
 
 
+@contextmanager
 def _claim_output_directories(
     targets: tuple[Path, ...],
-    stage_root: DirectoryIdentity,
-) -> tuple[DirectoryIdentity, ...]:
-    return tuple(_claim_output_directory(target, stage_root) for target in targets)
+    stage_root: PinnedDirectory,
+) -> Iterator[tuple[PinnedDirectory, ...]]:
+    with ExitStack() as stack:
+        yield tuple(
+            stack.enter_context(_claim_output_directory(target, stage_root))
+            for target in targets
+        )
 
 
 def _verify_claimed_directory(
     target: Path,
-    claimed: DirectoryIdentity,
+    claimed: PinnedDirectory,
 ) -> None:
     if target != claimed.path:
         raise RuntimeError("Build target disagrees with its claimed directory identity")
     try:
-        verify_plain_directory(target, claimed)
+        claimed.verify()
     except OSError as exc:
         raise RuntimeError(
             f"Build target identity is unsafe; refusing to write it: {target}"
         ) from exc
+
+
+@contextmanager
+def _verified_build_directory(
+    claimed: PinnedDirectory,
+) -> Iterator[PinnedDirectory]:
+    _verify_claimed_directory(claimed.path, claimed)
+    try:
+        yield claimed
+    finally:
+        _verify_claimed_directory(claimed.path, claimed)
+
+
+def _write_claimed_manifest(
+    work_dir: Path,
+    stage_root: PinnedDirectory,
+    manifest: Manifest,
+) -> None:
+    with _verified_build_directory(stage_root) as output_directory:
+        write_manifest_to_directory(work_dir, output_directory.write_path, manifest)
+        output_directory.verify()
 
 
 def build_stage0(config: DPmoireLiteConfig, wait: bool = False) -> bool:
@@ -202,7 +245,7 @@ def _build_stage0_after_preflight(
     config: DPmoireLiteConfig,
     preflight: BuildPreflightResult,
     wait: bool,
-    expected_work_directory: DirectoryIdentity,
+    expected_work_directory: PinnedDirectory,
 ) -> bool:
     if preflight.structures is None or preflight.rcut is None:
         raise RuntimeError("Stage0 preflight did not return prepared structures and rcut")
@@ -250,96 +293,111 @@ def _build_stage0_after_preflight(
         config.work_dir,
         expected_work_directory,
     )
-    stage_roots = _claim_stage_roots(
-        config,
-        preflight.stage_targets,
-        work_directory,
-        deferred_stages=(
-            frozenset({"init_mlff"})
-            if preflight.init_mlff_workflow is not None
-            else frozenset()
-        ),
-    )
-    init_directory = (
-        stage_roots["init_mlff"]
-        if config.init_mlff and preflight.init_mlff_workflow is None
-        else None
-    )
-    relaxation_directories = (
-        _claim_output_directories(relaxation_dirs, stage_roots["rlx"])
-        if config.do_relaxation
-        else ()
-    )
-    validation_directories = (
-        _claim_output_directories(validation_dirs, stage_roots["validation"])
-        if config.twist_val
-        else ()
-    )
-    _verify_claimed_directory(config.work_dir, work_directory)
-    if config.symm_reduce:
-        structures.write_sym_reduced_stackings(list(stackings))
-    runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub) if config.submit else None
-    submitted = False
+    with ExitStack() as claims:
+        stage_roots = claims.enter_context(
+            _claim_stage_roots(
+                config,
+                preflight.stage_targets,
+                work_directory,
+                deferred_stages=(
+                    frozenset({"init_mlff"})
+                    if preflight.init_mlff_workflow is not None
+                    else frozenset()
+                ),
+            )
+        )
+        init_directory = (
+            stage_roots["init_mlff"]
+            if config.init_mlff and preflight.init_mlff_workflow is None
+            else None
+        )
+        relaxation_directories = (
+            claims.enter_context(
+                _claim_output_directories(relaxation_dirs, stage_roots["rlx"])
+            )
+            if config.do_relaxation
+            else ()
+        )
+        validation_directories = (
+            claims.enter_context(
+                _claim_output_directories(
+                    validation_dirs,
+                    stage_roots["validation"],
+                )
+            )
+            if config.twist_val
+            else ()
+        )
+        _verify_claimed_directory(config.work_dir, work_directory)
+        if config.symm_reduce:
+            structures.write_sym_reduced_stackings(
+                list(stackings),
+                output_dir=work_directory.write_path,
+            )
+            work_directory.verify()
+        runner = (
+            SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub)
+            if config.submit
+            else None
+        )
+        submitted = False
 
-    if preflight.init_mlff_workflow is not None:
-        submitted = _build_two_phase_init_mlff(
-            config,
-            preflight.init_mlff_workflow,
-            workflow_cutoff,
-            preflight.submit_script,
-            rcut,
-            generated_at,
-            runner,
-            wait,
-        ) or submitted
-    elif config.init_mlff:
-        if init_directory is None:
-            raise RuntimeError("Stage0 did not claim the legacy init MLFF target")
-        submitted = _build_init_mlff(
-            config,
-            structures,
-            init_dirs[0],
-            init_directory,
-            _prepared_template(templates, "init_INCAR"),
-            workflow_cutoff,
-            preflight.submit_script,
-            rcut,
-            generated_at,
-            runner,
-            wait,
-        ) or submitted
-    if config.do_relaxation:
-        submitted = _build_relaxations(
-            config,
-            structures,
-            stackings,
-            relaxation_dirs,
-            relaxation_directories,
-            stage_roots["rlx"],
-            _prepared_template(templates, "rlx_INCAR"),
-            workflow_cutoff,
-            preflight.submit_script,
-            rcut,
-            generated_at,
-            runner,
-            wait,
-        ) or submitted
-    if config.twist_val:
-        submitted = _build_validation(
-            config,
-            preflight.validation_structures,
-            validation_dirs,
-            validation_directories,
-            stage_roots["validation"],
-            _prepared_template(templates, "val_INCAR"),
-            workflow_cutoff,
-            preflight.submit_script,
-            rcut,
-            generated_at,
-            runner,
-            wait,
-        ) or submitted
-    return submitted
+        if preflight.init_mlff_workflow is not None:
+            submitted = _build_two_phase_init_mlff(
+                config,
+                preflight.init_mlff_workflow,
+                workflow_cutoff,
+                preflight.submit_script,
+                rcut,
+                generated_at,
+                runner,
+                wait,
+            ) or submitted
+        elif config.init_mlff:
+            if init_directory is None:
+                raise RuntimeError("Stage0 did not claim the legacy init MLFF target")
+            submitted = _build_init_mlff(
+                config,
+                structures,
+                init_directory,
+                _prepared_template(templates, "init_INCAR"),
+                workflow_cutoff,
+                preflight.submit_script,
+                rcut,
+                generated_at,
+                runner,
+                wait,
+            ) or submitted
+        if config.do_relaxation:
+            submitted = _build_relaxations(
+                config,
+                structures,
+                stackings,
+                relaxation_directories,
+                stage_roots["rlx"],
+                _prepared_template(templates, "rlx_INCAR"),
+                workflow_cutoff,
+                preflight.submit_script,
+                rcut,
+                generated_at,
+                runner,
+                wait,
+            ) or submitted
+        if config.twist_val:
+            submitted = _build_validation(
+                config,
+                preflight.validation_structures,
+                validation_directories,
+                stage_roots["validation"],
+                _prepared_template(templates, "val_INCAR"),
+                workflow_cutoff,
+                preflight.submit_script,
+                rcut,
+                generated_at,
+                runner,
+                wait,
+            ) or submitted
+        return submitted
 
 
 def build_stage1(
@@ -364,7 +422,7 @@ def _build_stage1_after_preflight(
     preflight: BuildPreflightResult,
     wait: bool,
     runner: SlurmRunner | None,
-    expected_work_directory: DirectoryIdentity,
+    expected_work_directory: PinnedDirectory,
 ) -> bool:
     if preflight.structures is None or preflight.rcut is None:
         raise RuntimeError("Stage1 preflight did not return prepared structures and rcut")
@@ -396,145 +454,181 @@ def _build_stage1_after_preflight(
         config.work_dir,
         expected_work_directory,
     )
-    stage_roots = _claim_stage_roots(
-        config,
-        preflight.stage_targets,
-        work_directory,
-    )
-    md_root = stage_roots["md"]
-    relaxation_output_directories = _claim_output_directories(
-        relaxation_output_dirs,
-        md_root,
-    )
-    monolayer_output_directories = _claim_output_directories(
-        monolayer_output_dirs,
-        md_root,
-    )
-    backups = []
-
-    directories = []
-    md_anchor_records: dict[str, list[dict[str, object]]] = {}
-    provenance = preflight.provenance
-    if provenance is None or provenance.trusted_sc_rlx is None:
-        md_sc = None if config.sc_rlx else config.sc
-    else:
-        md_sc = None if provenance.trusted_sc_rlx else provenance.trusted_sc
-    validated_anchor_indices = (
-        provenance.validated_anchor_indices
-        if config.preserve_grid_shift_md and provenance is not None
-        else ()
-    )
-    for relaxation_index, (relaxation, target, target_directory) in enumerate(
-        zip(
-            preflight.relaxations,
-            relaxation_output_dirs,
-            relaxation_output_directories,
-            strict=True,
-        )
-    ):
-        i, j = relaxation.stacking
-        _verify_claimed_directory(target, target_directory)
-        atoms, anchor_records = _write_md_poscar(
-            relaxation.atoms.copy(),
-            target / "POSCAR",
-            md_sc,
-            preserve_constraints=config.preserve_grid_shift_md,
-            validated_anchor_indices=(
-                validated_anchor_indices[relaxation_index]
-                if config.preserve_grid_shift_md
-                else None
-            ),
-        )
-        _verify_claimed_directory(target, target_directory)
-        if anchor_records is not None:
-            md_anchor_records[relative_to_workdir(config.work_dir, target)] = anchor_records
-        _write_vasp_inputs(
-            config,
-            target,
-            atoms,
-            _prepared_template(templates, "MD_INCAR"),
-            rcut,
-            workflow_cutoff,
-            preflight.submit_script,
-        )
-        if config.vasp_ml:
-            _verify_claimed_directory(target, target_directory)
-            _stage_prepared_mlff_files(initial_seed, target)
-            _verify_staged_mlff_files(initial_seed, target, mlff_seed)
-        directories.append(target)
-
-    monolayer_constraint_warning_emitted = False
-    if config.include_monolayer_md:
-        layer_sources = {
-            "top_layer": structures.top_atoms,
-            "bot_layer": structures.bot_atoms,
-        }
-        for (layer_name, source_atoms), target, target_directory in zip(
-            layer_sources.items(),
-            monolayer_output_dirs,
-            monolayer_output_directories,
-            strict=True,
-        ):
-            if source_atoms is None:
-                raise RuntimeError(f"Stage1 preflight did not return {layer_name} atoms")
-            _verify_claimed_directory(target, target_directory)
-            atoms = source_atoms.copy()
-            had_constraints = _normalize_stage1_structure(
-                atoms,
-                clear_constraints=True,
-                warn_on_constraints=not monolayer_constraint_warning_emitted,
-            )
-            if had_constraints:
-                monolayer_constraint_warning_emitted = True
-            atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(config.sc)))
-            _assert_stage1_structure_cleared(atoms_sc)
-            write_vasp(target / "POSCAR", atoms=atoms_sc)
-            _verify_claimed_directory(target, target_directory)
-            _write_vasp_inputs(
+    with ExitStack() as claims:
+        stage_roots = claims.enter_context(
+            _claim_stage_roots(
                 config,
-                target,
-                atoms_sc,
-                _prepared_template(templates, "MD_monolayer_INCAR"),
-                rcut,
-                workflow_cutoff,
-                preflight.submit_script,
+                preflight.stage_targets,
+                work_directory,
             )
-            if config.vasp_ml:
-                _verify_claimed_directory(target, target_directory)
-                _stage_prepared_mlff_files(initial_seed, target)
-                _verify_staged_mlff_files(initial_seed, target, mlff_seed)
+        )
+        md_root = stage_roots["md"]
+        relaxation_output_directories = claims.enter_context(
+            _claim_output_directories(
+                relaxation_output_dirs,
+                md_root,
+            )
+        )
+        monolayer_output_directories = claims.enter_context(
+            _claim_output_directories(
+                monolayer_output_dirs,
+                md_root,
+            )
+        )
+        backups = []
+
+        directories = []
+        md_anchor_records: dict[str, list[dict[str, object]]] = {}
+        provenance = preflight.provenance
+        if provenance is None or provenance.trusted_sc_rlx is None:
+            md_sc = None if config.sc_rlx else config.sc
+        else:
+            md_sc = None if provenance.trusted_sc_rlx else provenance.trusted_sc
+        validated_anchor_indices = (
+            provenance.validated_anchor_indices
+            if config.preserve_grid_shift_md and provenance is not None
+            else ()
+        )
+        for relaxation_index, (relaxation, target_directory) in enumerate(
+            zip(
+                preflight.relaxations,
+                relaxation_output_directories,
+                strict=True,
+            )
+        ):
+            target = target_directory.path
+            with _verified_build_directory(target_directory) as output_directory:
+                atoms, anchor_records = _write_md_poscar(
+                    relaxation.atoms.copy(),
+                    output_directory.write_path / "POSCAR",
+                    md_sc,
+                    preserve_constraints=config.preserve_grid_shift_md,
+                    validated_anchor_indices=(
+                        validated_anchor_indices[relaxation_index]
+                        if config.preserve_grid_shift_md
+                        else None
+                    ),
+                )
+                output_directory.verify()
+                if anchor_records is not None:
+                    md_anchor_records[
+                        relative_to_workdir(config.work_dir, target)
+                    ] = anchor_records
+                _write_vasp_inputs(
+                    config,
+                    output_directory.write_path,
+                    atoms,
+                    _prepared_template(templates, "MD_INCAR"),
+                    rcut,
+                    workflow_cutoff,
+                    preflight.submit_script,
+                )
+                output_directory.verify()
+                if config.vasp_ml:
+                    _stage_prepared_mlff_files(
+                        initial_seed,
+                        output_directory.write_path,
+                    )
+                    _verify_staged_mlff_files(
+                        initial_seed,
+                        output_directory.write_path,
+                        mlff_seed,
+                    )
+                    output_directory.verify()
             directories.append(target)
 
-    if not config.submit:
-        runner = None
-    elif runner is None:
-        runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub)
-    for target, target_directory in zip(
-        relaxation_output_dirs + monolayer_output_dirs,
-        relaxation_output_directories + monolayer_output_directories,
-        strict=True,
-    ):
-        _verify_claimed_directory(target, target_directory)
-    jobs = _submit_dirs(config, runner, directories, wait)
-    _verify_claimed_directory(config.work_dir / "md", md_root)
-    write_manifest(
-        config.work_dir,
-        Manifest(
-            stage="md",
-            generated_at=generated_at,
-            config_summary=_config_summary(config, workflow_cutoff),
-            directories=[relative_to_workdir(config.work_dir, path) for path in directories],
-            backups=backups,
-            jobs=[job.as_dict() for job in jobs],
-            stackings=[[i, j] for i, j in stackings],
-            structure_provenance=provenance_module.stage1_structure_provenance(
-                preflight.provenance
+        monolayer_constraint_warning_emitted = False
+        if config.include_monolayer_md:
+            layer_sources = {
+                "top_layer": structures.top_atoms,
+                "bot_layer": structures.bot_atoms,
+            }
+            for (layer_name, source_atoms), target_directory in zip(
+                layer_sources.items(),
+                monolayer_output_directories,
+                strict=True,
+            ):
+                if source_atoms is None:
+                    raise RuntimeError(
+                        f"Stage1 preflight did not return {layer_name} atoms"
+                    )
+                target = target_directory.path
+                with _verified_build_directory(target_directory) as output_directory:
+                    atoms = source_atoms.copy()
+                    had_constraints = _normalize_stage1_structure(
+                        atoms,
+                        clear_constraints=True,
+                        warn_on_constraints=not monolayer_constraint_warning_emitted,
+                    )
+                    if had_constraints:
+                        monolayer_constraint_warning_emitted = True
+                    atoms_sc = sort(
+                        make_supercell(prim=atoms, P=supercell_matrix(config.sc))
+                    )
+                    _assert_stage1_structure_cleared(atoms_sc)
+                    write_vasp(
+                        output_directory.write_path / "POSCAR",
+                        atoms=atoms_sc,
+                    )
+                    output_directory.verify()
+                    _write_vasp_inputs(
+                        config,
+                        output_directory.write_path,
+                        atoms_sc,
+                        _prepared_template(templates, "MD_monolayer_INCAR"),
+                        rcut,
+                        workflow_cutoff,
+                        preflight.submit_script,
+                    )
+                    output_directory.verify()
+                    if config.vasp_ml:
+                        _stage_prepared_mlff_files(
+                            initial_seed,
+                            output_directory.write_path,
+                        )
+                        _verify_staged_mlff_files(
+                            initial_seed,
+                            output_directory.write_path,
+                            mlff_seed,
+                        )
+                        output_directory.verify()
+                directories.append(target)
+
+        if not config.submit:
+            runner = None
+        elif runner is None:
+            runner = SlurmRunner(config.dft_script, config.n_nodes, config.auto_resub)
+        for target_directory in (
+            relaxation_output_directories + monolayer_output_directories
+        ):
+            _verify_claimed_directory(target_directory.path, target_directory)
+        jobs = _submit_dirs(
+            config,
+            runner,
+            list(relaxation_output_directories + monolayer_output_directories),
+            wait,
+        )
+        _write_claimed_manifest(
+            config.work_dir,
+            md_root,
+            Manifest(
+                stage="md",
+                generated_at=generated_at,
+                config_summary=_config_summary(config, workflow_cutoff),
+                directories=[
+                    relative_to_workdir(config.work_dir, path) for path in directories
+                ],
+                backups=backups,
+                jobs=[job.as_dict() for job in jobs],
+                stackings=[[i, j] for i, j in stackings],
+                structure_provenance=provenance_module.stage1_structure_provenance(
+                    preflight.provenance
+                ),
+                grid_shift_anchors=md_anchor_records,
+                mlff_seed=mlff_seed,
             ),
-            grid_shift_anchors=md_anchor_records,
-            mlff_seed=mlff_seed,
-        ),
-    )
-    return bool(jobs)
+        )
+        return bool(jobs)
 
 
 def _stage1_mlff_seed_identity(
@@ -703,8 +797,7 @@ def prepare_init_mlff_step2(init_dir: Path, input_dir: Path, sc: tuple[int, int]
 def _build_init_mlff(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
-    init_dir: Path,
-    init_directory: DirectoryIdentity,
+    init_directory: PinnedDirectory,
     template: PreparedIncarTemplate,
     workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
@@ -714,43 +807,53 @@ def _build_init_mlff(
     wait: bool,
 ) -> bool:
     backups = []
-    if structures.bot_atoms is None:
-        raise RuntimeError("Stage0 preflight did not return bottom-layer atoms")
-    atoms = sort(
-        make_supercell(
-            prim=structures.bot_atoms.copy(),
-            P=supercell_matrix(config.sc),
+    init_dir = init_directory.path
+    with _verified_build_directory(init_directory) as output_directory:
+        if structures.bot_atoms is None:
+            raise RuntimeError("Stage0 preflight did not return bottom-layer atoms")
+        atoms = sort(
+            make_supercell(
+                prim=structures.bot_atoms.copy(),
+                P=supercell_matrix(config.sc),
+            )
         )
-    )
-    _verify_claimed_directory(init_dir, init_directory)
-    write_vasp(init_dir / "POSCAR", atoms=atoms)
-    _verify_claimed_directory(init_dir, init_directory)
-    _write_vasp_inputs(
-        config,
-        init_dir,
-        atoms,
-        template,
-        rcut,
-        workflow_cutoff,
-        submit_script,
-    )
-    jobs = _submit_dirs(config, runner, [init_dir], wait)
-    if runner is not None and wait:
-        _verify_claimed_directory(init_dir, init_directory)
-        prepare_init_mlff_step2(init_dir, config.input_dir, config.sc)
-        jobs.extend(_submit_dirs(config, runner, [init_dir], wait=True))
-    _verify_claimed_directory(init_dir, init_directory)
-    write_manifest(
-        config.work_dir,
-        Manifest(
+        write_vasp(output_directory.write_path / "POSCAR", atoms=atoms)
+        output_directory.verify()
+        _write_vasp_inputs(
+            config,
+            output_directory.write_path,
+            atoms,
+            template,
+            rcut,
+            workflow_cutoff,
+            submit_script,
+        )
+        output_directory.verify()
+        jobs = _submit_dirs(config, runner, [init_directory], wait)
+        if runner is not None and wait:
+            output_directory.verify()
+            prepare_init_mlff_step2(
+                output_directory.write_path,
+                config.input_dir,
+                config.sc,
+            )
+            output_directory.verify()
+            jobs.extend(_submit_dirs(config, runner, [init_directory], wait=True))
+        output_directory.verify()
+        manifest = Manifest(
             stage="init_mlff",
             generated_at=generated_at,
             config_summary=_config_summary(config, workflow_cutoff),
             directories=[relative_to_workdir(config.work_dir, init_dir)],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
-        ),
-    )
+        )
+        write_manifest_to_directory(
+            config.work_dir,
+            output_directory.write_path,
+            manifest,
+        )
+        output_directory.verify()
     return bool(jobs)
 
 
@@ -850,11 +953,7 @@ def _build_two_phase_init_mlff(
                 "phases": phase_records,
             },
         )
-        atomic_text_publish(
-            candidate / "manifest.yaml",
-            serialize_manifest(config.work_dir, manifest),
-            encoding="utf-8",
-        )
+        write_manifest_to_directory(config.work_dir, candidate, manifest)
         if runner is None:
             _publish_init_mlff_candidate(candidate, init_root)
         else:
@@ -940,9 +1039,8 @@ def _build_relaxations(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
     stackings: tuple[tuple[int, int], ...],
-    target_dirs: tuple[Path, ...],
-    target_directories: tuple[DirectoryIdentity, ...],
-    stage_root: DirectoryIdentity,
+    target_directories: tuple[PinnedDirectory, ...],
+    stage_root: PinnedDirectory,
     template: PreparedIncarTemplate,
     workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
@@ -955,59 +1053,68 @@ def _build_relaxations(
     directories = []
     rlx_poscars = {}
     grid_shift_anchors = {}
-    for (i, j), target, target_directory in zip(
+    for (i, j), target_directory in zip(
         stackings,
-        target_dirs,
         target_directories,
         strict=True,
     ):
-        _verify_claimed_directory(target, target_directory)
-        atoms = structures.shift_atoms(i, j, c_constrain=True, sc=config.sc) if config.sc_rlx else structures.shift_primitive_atoms(i, j)
-        write_vasp(target / "POSCAR", atoms=atoms)
-        _verify_claimed_directory(target, target_directory)
-        relative_path = relative_to_workdir(config.work_dir, target / "POSCAR")
-        identity = provenance_module.structure_identity_record(target / "POSCAR", relative_path)
-        rlx_poscars[relative_path] = identity
-        top_indexes, bot_indexes = structures.find_layer_idx(atoms)
-        anchor_relative_path = relative_to_workdir(config.work_dir, target)
-        grid_shift_anchors[anchor_relative_path] = provenance_module.stage0_grid_shift_anchor_record(
-            target / "POSCAR",
-            identity,
-            top_indexes,
-            bot_indexes,
-        )
-        _verify_claimed_directory(target, target_directory)
-        _write_vasp_inputs(
-            config,
-            target,
-            atoms,
-            template,
-            rcut,
-            workflow_cutoff,
-            submit_script,
-        )
+        target = target_directory.path
+        with _verified_build_directory(target_directory) as output_directory:
+            atoms = (
+                structures.shift_atoms(i, j, c_constrain=True, sc=config.sc)
+                if config.sc_rlx
+                else structures.shift_primitive_atoms(i, j)
+            )
+            poscar = output_directory.write_path / "POSCAR"
+            write_vasp(poscar, atoms=atoms)
+            output_directory.verify()
+            relative_path = relative_to_workdir(config.work_dir, target / "POSCAR")
+            identity = provenance_module.structure_identity_record(
+                poscar,
+                relative_path,
+            )
+            rlx_poscars[relative_path] = identity
+            top_indexes, bot_indexes = structures.find_layer_idx(atoms)
+            anchor_relative_path = relative_to_workdir(config.work_dir, target)
+            grid_shift_anchors[anchor_relative_path] = (
+                provenance_module.stage0_grid_shift_anchor_record(
+                    poscar,
+                    identity,
+                    top_indexes,
+                    bot_indexes,
+                )
+            )
+            output_directory.verify()
+            _write_vasp_inputs(
+                config,
+                output_directory.write_path,
+                atoms,
+                template,
+                rcut,
+                workflow_cutoff,
+                submit_script,
+            )
+            output_directory.verify()
         directories.append(target)
-    for target, target_directory in zip(
-        target_dirs,
-        target_directories,
-        strict=True,
-    ):
-        _verify_claimed_directory(target, target_directory)
-    jobs = _submit_dirs(config, runner, directories, wait)
+    for target_directory in target_directories:
+        _verify_claimed_directory(target_directory.path, target_directory)
+    jobs = _submit_dirs(config, runner, list(target_directories), wait)
     provenance = provenance_module.stage0_structure_provenance(
         config,
         structures,
         stackings,
         rlx_poscars,
     )
-    _verify_claimed_directory(config.work_dir / "rlx", stage_root)
-    write_manifest(
+    _write_claimed_manifest(
         config.work_dir,
+        stage_root,
         Manifest(
             stage="rlx",
             generated_at=generated_at,
             config_summary=_config_summary(config, workflow_cutoff),
-            directories=[relative_to_workdir(config.work_dir, path) for path in directories],
+            directories=[
+                relative_to_workdir(config.work_dir, path) for path in directories
+            ],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
             stackings=[[i, j] for i, j in stackings],
@@ -1021,9 +1128,8 @@ def _build_relaxations(
 def _build_validation(
     config: DPmoireLiteConfig,
     validation_structures: tuple[PreparedValidationStructure, ...],
-    target_dirs: tuple[Path, ...],
-    target_directories: tuple[DirectoryIdentity, ...],
-    stage_root: DirectoryIdentity,
+    target_directories: tuple[PinnedDirectory, ...],
+    stage_root: PinnedDirectory,
     template: PreparedIncarTemplate,
     workflow_cutoff: PreparedWorkflowCutoff,
     submit_script: PreparedSource,
@@ -1032,47 +1138,50 @@ def _build_validation(
     runner: SlurmRunner | None,
     wait: bool,
 ) -> bool:
-    directories = list(target_dirs)
+    directories = [target_directory.path for target_directory in target_directories]
     backups = []
-    for record, target, target_directory in zip(
-        validation_structures,
-        target_dirs,
-        target_directories,
-        strict=True,
-    ):
-        _verify_claimed_directory(target, target_directory)
-        atoms = record.atoms.copy()
-        write_vasp(target / "POSCAR", atoms=atoms)
-        _verify_claimed_directory(target, target_directory)
-        _write_vasp_inputs(
-            config,
-            target,
-            atoms,
-            template,
-            rcut,
-            workflow_cutoff,
-            submit_script,
-        )
-    for target, target_directory in zip(
-        target_dirs,
-        target_directories,
-        strict=True,
-    ):
-        _verify_claimed_directory(target, target_directory)
-    jobs = _submit_dirs(config, runner, directories, wait)
-    _verify_claimed_directory(config.work_dir / "validation", stage_root)
-    write_manifest(
-        config.work_dir,
-        Manifest(
+    with _verified_build_directory(stage_root) as stage_directory:
+        for record, target_directory in zip(
+            validation_structures,
+            target_directories,
+            strict=True,
+        ):
+            target = target_directory.path
+            with _verified_build_directory(target_directory) as output_directory:
+                atoms = record.atoms.copy()
+                write_vasp(output_directory.write_path / "POSCAR", atoms=atoms)
+                output_directory.verify()
+                _write_vasp_inputs(
+                    config,
+                    output_directory.write_path,
+                    atoms,
+                    template,
+                    rcut,
+                    workflow_cutoff,
+                    submit_script,
+                )
+                output_directory.verify()
+        for target_directory in target_directories:
+            _verify_claimed_directory(target_directory.path, target_directory)
+        jobs = _submit_dirs(config, runner, list(target_directories), wait)
+        stage_directory.verify()
+        manifest = Manifest(
             stage="validation",
             generated_at=generated_at,
             config_summary=_config_summary(config, workflow_cutoff),
-            directories=[relative_to_workdir(config.work_dir, path) for path in directories],
+            directories=[
+                relative_to_workdir(config.work_dir, path) for path in directories
+            ],
             backups=backups,
             jobs=[job.as_dict() for job in jobs],
             angles=[record.angle for record in validation_structures],
-        ),
-    )
+        )
+        write_manifest_to_directory(
+            config.work_dir,
+            stage_directory.write_path,
+            manifest,
+        )
+        stage_directory.verify()
     return bool(jobs)
 
 
@@ -1249,13 +1358,35 @@ def _backup_targets(work_dir: Path, stage: str, targets: list[Path], timestamp: 
     return backups
 
 
-def _submit_dirs(config: DPmoireLiteConfig, runner: SlurmRunner | None, directories: list[Path], wait: bool) -> list[SlurmJob]:
+def _submit_dirs(
+    config: DPmoireLiteConfig,
+    runner: SlurmRunner | None,
+    directories: list[Path | PinnedDirectory],
+    wait: bool,
+) -> list[SlurmJob]:
     if runner is None:
         return []
-    items = [(path, relative_to_workdir(config.work_dir, path)) for path in directories]
+    items = []
+    for directory in directories:
+        if isinstance(directory, PinnedDirectory):
+            directory.verify()
+            public_path = directory.path
+            execution_path = directory.write_path
+        else:
+            public_path = directory
+            execution_path = directory
+        items.append(
+            (
+                execution_path,
+                relative_to_workdir(config.work_dir, public_path),
+            )
+        )
     if hasattr(runner, "submit_many"):
         return runner.submit_many(items, wait=wait)
-    jobs = [runner.submit(path, relative_to_workdir(config.work_dir, path)) for path in directories]
+    jobs = [
+        runner.submit(execution_path, relative_path)
+        for execution_path, relative_path in items
+    ]
     return runner.wait(jobs) if wait else jobs
 
 

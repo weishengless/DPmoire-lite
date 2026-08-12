@@ -130,7 +130,21 @@ def write_manifest(work_dir: Path, manifest: Manifest | ManifestReadResult) -> N
     else:
         stage = manifest.stage
 
-    path = manifest_path(work_dir, stage)
+    write_manifest_to_directory(
+        work_dir,
+        manifest_path(work_dir, stage).parent,
+        manifest,
+    )
+
+
+def write_manifest_to_directory(
+    work_dir: Path,
+    output_dir: Path,
+    manifest: Manifest | ManifestReadResult,
+) -> None:
+    """Validate and publish a manifest through an already bounded directory."""
+
+    path = Path(output_dir) / "manifest.yaml"
     serialized = serialize_manifest(work_dir, manifest)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_io.atomic_text_publish(path, serialized, encoding="utf-8")

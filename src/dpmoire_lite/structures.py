@@ -314,11 +314,17 @@ class StructureHandler:
                 unique_stackings.append(stacking)
         return unique_stackings
 
-    def write_sym_reduced_stackings(self, stackings: list[tuple[int, int]]) -> None:
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+    def write_sym_reduced_stackings(
+        self,
+        stackings: list[tuple[int, int]],
+        *,
+        output_dir: Path | None = None,
+    ) -> None:
+        destination_dir = self.work_dir if output_dir is None else Path(output_dir)
+        destination_dir.mkdir(parents=True, exist_ok=True)
         text = "".join(f"{i} {j}\n" for i, j in stackings)
         atomic_text_publish(
-            self.work_dir / "sym_reduced_stackings.txt",
+            destination_dir / "sym_reduced_stackings.txt",
             text,
             encoding="utf-8",
         )

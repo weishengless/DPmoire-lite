@@ -40,6 +40,16 @@ class DirectoryIdentity:
     inode: int
 
 
+@dataclass(frozen=True)
+class PinnedDirectory:
+    path: Path
+    write_path: Path
+    identity: DirectoryIdentity
+
+    def verify(self) -> None:
+        verify_plain_directory(self.path, self.identity)
+
+
 def verify_plain_directory(
     path: Path,
     expected: DirectoryIdentity | None = None,
@@ -66,20 +76,245 @@ def verify_plain_directory(
     return identity
 
 
-def claim_directory_no_replace(
+@contextmanager
+def claim_pinned_directory_no_replace(
     path: Path,
     *,
-    parent: DirectoryIdentity | None = None,
-) -> DirectoryIdentity:
+    parent: PinnedDirectory,
+) -> Iterator[PinnedDirectory]:
+    """Atomically publish and retain an exclusively owned child directory."""
+
     path = Path(path)
-    if parent is not None:
-        if path.parent != parent.path:
-            raise ValueError("Claimed directory must be a direct child of its parent")
-        verify_plain_directory(parent.path, parent)
-    path.mkdir()
-    if parent is not None:
-        verify_plain_directory(parent.path, parent)
-    return verify_plain_directory(path)
+    if path.parent != parent.path:
+        raise ValueError("Claimed directory must be a direct child of its parent")
+    parent.verify()
+    candidate = Path(
+        tempfile.mkdtemp(
+            prefix=f".{path.name}.claim-",
+            dir=parent.write_path,
+        )
+    )
+    candidate_identity = verify_plain_directory(candidate)
+    published = False
+    try:
+        if os.name == "nt":
+            movable_handle = _open_pinned_windows_directory(
+                candidate,
+                share_delete=True,
+            )
+            try:
+                _verify_windows_directory_handle(movable_handle, candidate_identity)
+                verify_plain_directory(candidate, candidate_identity)
+                atomic_directory_publish_no_replace(
+                    candidate,
+                    parent.write_path / path.name,
+                )
+                published = True
+                claimed_identity = DirectoryIdentity(
+                    path=path,
+                    device=candidate_identity.device,
+                    inode=candidate_identity.inode,
+                )
+                parent.verify()
+                verify_plain_directory(path, claimed_identity)
+                guard_handle = _open_pinned_windows_directory(path)
+                try:
+                    _verify_windows_directory_handle(guard_handle, claimed_identity)
+                    verify_plain_directory(path, claimed_identity)
+                    _close_windows_handle(movable_handle)
+                    movable_handle = -1
+                    yield PinnedDirectory(
+                        path=path,
+                        write_path=path,
+                        identity=claimed_identity,
+                    )
+                finally:
+                    _close_windows_handle(guard_handle)
+            finally:
+                if movable_handle != -1:
+                    _close_windows_handle(movable_handle)
+            return
+
+        with pinned_directory(candidate, candidate_identity) as candidate_directory:
+            parent.verify()
+            atomic_directory_publish_no_replace(
+                candidate,
+                parent.write_path / path.name,
+            )
+            published = True
+            claimed_identity = DirectoryIdentity(
+                path=path,
+                device=candidate_identity.device,
+                inode=candidate_identity.inode,
+            )
+            parent.verify()
+            verify_plain_directory(path, claimed_identity)
+            yield PinnedDirectory(
+                path=path,
+                write_path=candidate_directory.write_path,
+                identity=claimed_identity,
+            )
+    finally:
+        if not published:
+            try:
+                verify_plain_directory(candidate, candidate_identity)
+            except (FileNotFoundError, OSError):
+                pass
+            else:
+                candidate.rmdir()
+
+
+@contextmanager
+def pinned_directory(
+    path: Path,
+    expected: DirectoryIdentity,
+) -> Iterator[PinnedDirectory]:
+    """Bind writes to an already-claimed plain directory.
+
+    Linux writers use the opened directory descriptor through procfs, so a
+    replacement of the public pathname cannot redirect a later child open.
+    Windows holds a reparse-point-aware directory handle without delete sharing,
+    which prevents the claimed directory from being renamed or replaced while
+    pathname-based writers are active.
+    """
+
+    path = Path(path)
+    verify_plain_directory(path, expected)
+    if os.name == "nt":
+        handle = _open_pinned_windows_directory(path)
+        try:
+            _verify_windows_directory_handle(handle, expected)
+            verify_plain_directory(path, expected)
+            yield PinnedDirectory(path=path, write_path=path, identity=expected)
+        finally:
+            _close_windows_handle(handle)
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != expected.device
+            or opened.st_ino != expected.inode
+        ):
+            raise OSError(
+                errno.EPERM,
+                "opened directory identity disagrees with claimed path",
+                os.fspath(path),
+            )
+        verify_plain_directory(path, expected)
+        descriptor_root = Path("/proc/self/fd")
+        if not descriptor_root.is_dir():
+            raise OSError(
+                errno.ENOTSUP,
+                "descriptor-bound directory writes require procfs",
+                os.fspath(path),
+            )
+        yield PinnedDirectory(
+            path=path,
+            write_path=descriptor_root / str(descriptor),
+            identity=expected,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _open_pinned_windows_directory(
+    path: Path,
+    *,
+    share_delete: bool = False,
+) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    generic_read = 0x80000000
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+    share_mode = file_share_read | file_share_write
+    if share_delete:
+        share_mode |= file_share_delete
+    handle = create_file(
+        os.fspath(path),
+        generic_read,
+        share_mode,
+        None,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_backup_semantics,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(handle)
+
+
+def _verify_windows_directory_handle(
+    handle: int,
+    expected: DirectoryIdentity,
+) -> None:
+    class FileId128(ctypes.Structure):
+        _fields_ = [("identifier", ctypes.c_ubyte * 16)]
+
+    class FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("volume_serial_number", ctypes.c_ulonglong),
+            ("file_id", FileId128),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_file_information = kernel32.GetFileInformationByHandleEx
+    get_file_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    get_file_information.restype = ctypes.c_int
+    file_id_info_class = 18
+    information = FileIdInfo()
+    if not get_file_information(
+        ctypes.c_void_p(handle),
+        file_id_info_class,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    opened_identity = DirectoryIdentity(
+        path=expected.path,
+        device=int(information.volume_serial_number),
+        inode=int.from_bytes(bytes(information.file_id.identifier), "little"),
+    )
+    if opened_identity != expected:
+        raise OSError(
+            errno.EPERM,
+            "opened directory identity disagrees with claimed path",
+            os.fspath(expected.path),
+        )
+
+
+def _close_windows_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    if not close_handle(ctypes.c_void_p(handle)):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def sha256_file(path: Path) -> str:
