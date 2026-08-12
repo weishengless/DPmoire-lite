@@ -508,8 +508,10 @@ def prepare_candidates(request: CandidateRequest) -> CandidateArtifacts:
 def _prepare_data_candidate(request: CandidateRequest) -> tuple[Path, str]:
     candidate = atomic_io.create_candidate(request.final_output)
     try:
-        writer = request.data_writer or _write_dataset
-        writer(copy.deepcopy(request.dataset), candidate)
+        if request.data_writer is None:
+            _write_dataset(request.dataset, candidate)
+        else:
+            request.data_writer(copy.deepcopy(request.dataset), candidate)
         atomic_io.fsync_path(candidate)
         _validate_data_candidate(request, candidate)
         return candidate, atomic_io.sha256_file(candidate)
