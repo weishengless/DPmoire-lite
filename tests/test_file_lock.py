@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,6 +85,148 @@ def test_collect_lock_allows_one_holder(tmp_path):
     assert isinstance(diagnostics["pid"], int)
     assert diagnostics["hostname"]
     assert diagnostics["acquired_at"]
+
+
+def test_collect_lock_rejects_a_hard_link_before_touching_its_target(tmp_path):
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    external_target = tmp_path / "outside-lock-target"
+    original = b"outside content must stay unchanged"
+    external_target.write_bytes(original)
+    os.link(external_target, lock.lock_path)
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert external_target.read_bytes() == original
+
+
+def test_collect_lock_rejects_a_symlink_before_touching_its_target(tmp_path):
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    external_target = tmp_path / "outside-symlink-target"
+    original = b"outside content must stay unchanged"
+    external_target.write_bytes(original)
+    try:
+        lock.lock_path.symlink_to(external_target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks are unavailable on this platform: {exc}")
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert external_target.read_bytes() == original
+
+
+def test_collect_lock_rejects_a_non_regular_lock_path(tmp_path):
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    lock.lock_path.mkdir()
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert lock.lock_path.is_dir()
+
+
+def test_collect_lock_rejects_windows_reparse_metadata_before_diagnostics(
+    monkeypatch,
+    tmp_path,
+):
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    original = b"existing lock content"
+    lock.lock_path.write_bytes(original)
+    real_lstat = Path.lstat
+
+    def lstat_with_reparse_metadata(path):
+        result = real_lstat(path)
+        if path == lock.lock_path:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_nlink=result.st_nlink,
+                st_reparse_tag=0xA000000C,
+            )
+        return result
+
+    monkeypatch.setattr(Path, "lstat", lstat_with_reparse_metadata)
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert lock.lock_path.read_bytes() == original
+
+
+def test_collect_lock_rejects_path_identity_change_after_open(
+    monkeypatch,
+    tmp_path,
+):
+    module = importlib.import_module("dpmoire_lite.file_lock")
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    original = b"existing lock content"
+    lock.lock_path.write_bytes(original)
+    replacement = tmp_path / "replacement-lock"
+    replacement_content = b"replacement lock content"
+    replacement.write_bytes(replacement_content)
+    real_open = module.os.open
+    real_lstat = Path.lstat
+    opened = False
+
+    def open_then_expose_replacement(path, flags, mode=0o777):
+        nonlocal opened
+        descriptor = real_open(path, flags, mode)
+        opened = True
+        return descriptor
+
+    def lstat_with_replacement_identity(path):
+        if path == lock.lock_path and opened:
+            return real_lstat(replacement)
+        return real_lstat(path)
+
+    monkeypatch.setattr(module.os, "open", open_then_expose_replacement)
+    monkeypatch.setattr(Path, "lstat", lstat_with_replacement_identity)
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert lock.lock_path.read_bytes() == original
+    assert replacement.read_bytes() == replacement_content
+
+
+def test_collect_lock_rechecks_before_initializing_an_empty_lock(
+    monkeypatch,
+    tmp_path,
+):
+    module = importlib.import_module("dpmoire_lite.file_lock")
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="transaction-one")
+    external_alias = tmp_path / "outside-lock-alias"
+    real_fdopen = module.os.fdopen
+
+    def fdopen_then_add_link(descriptor, *args, **kwargs):
+        handle = real_fdopen(descriptor, *args, **kwargs)
+        os.link(lock.lock_path, external_alias)
+        return handle
+
+    monkeypatch.setattr(module.os, "fdopen", fdopen_then_add_link)
+
+    with pytest.raises(collect_lock_error, match="lock invariant"):
+        with lock:
+            pass
+
+    assert external_alias.read_bytes() == b""
 
 
 def test_second_process_cannot_acquire_same_stage_output_lock(tmp_path):
@@ -200,3 +343,20 @@ def test_only_lock_holder_may_update_diagnostic_metadata(tmp_path):
 
     with pytest.raises(collect_lock_error):
         lock.update_diagnostics(transaction_id="after")
+
+
+def test_collect_lock_rechecks_hard_links_before_updating_diagnostics(tmp_path):
+    collect_file_lock, collect_lock_error = _lock_api()
+    output = tmp_path / "MD_data.extxyz"
+    lock = collect_file_lock("md", output, transaction_id="initial")
+    external_alias = tmp_path / "outside-lock-alias"
+
+    with lock as held:
+        before = _read_diagnostics(held.lock_path)
+        os.link(held.lock_path, external_alias)
+
+        with pytest.raises(collect_lock_error, match="lock invariant"):
+            held.update_diagnostics(transaction_id="updated")
+
+        assert _read_diagnostics(held.lock_path) == before
+        assert _read_diagnostics(external_alias) == before
