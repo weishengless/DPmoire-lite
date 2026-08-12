@@ -5,7 +5,6 @@
 #SBATCH -N 1 --ntasks-per-node=64
 #SBATCH --time=2-0:0:0
 ##SBATCH --mem=224GB
-##SBATCH -d afterok:287
 #SBATCH -o out.%j
 #SBATCH -e err.%j
 
@@ -18,4 +17,12 @@ module load oneapi-2022/hdf5-1.14.3
 module load oneapi-2022/libxc-6.2.2
 module load oneapi-2022/dftd4-3.6.0
 
-mpirun  /gpfs/home/cwang/bin/vasp641c-ol > sout
+dpmoire_run_vasp() {
+    if [ -n "${DPMOIRE_PHASE:-}" ]; then
+        mpirun vasp_std > "sout.${DPMOIRE_PHASE}"
+    else
+        mpirun vasp_std > sout
+    fi
+}
+
+dpmoire_run_vasp # DPMOIRE-LITE:RUN

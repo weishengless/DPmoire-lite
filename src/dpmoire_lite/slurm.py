@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -62,12 +63,15 @@ class SlurmRunner:
         self.auto_resub = auto_resub
 
     def submit(self, work_dir: Path, rel_path: str) -> SlurmJob:
+        environment = os.environ.copy()
+        environment.pop("SBATCH_WAIT", None)
         result = subprocess.run(
             ["sbatch", self.script_name],
             cwd=str(work_dir),
             check=True,
             text=True,
             capture_output=True,
+            env=environment,
         )
         return SlurmJob(job_id=parse_sbatch_output(result.stdout), path=rel_path)
 

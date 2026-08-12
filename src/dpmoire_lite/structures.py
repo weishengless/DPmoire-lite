@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import copy
 import re
-import tempfile
+from importlib import import_module
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,8 @@ from ase import Atoms
 from ase.build import make_supercell, sort, stack
 from ase.constraints import FixedLine
 from ase.io.vasp import read_vasp, write_vasp
+
+from .atomic_io import atomic_text_publish
 
 
 def generate_stackings(n_sectors: tuple[int, int]) -> list[tuple[int, int]]:
@@ -195,6 +198,38 @@ class StructureHandler:
         d_mode: str = "surface_gap",
         d_reference: dict[str, str | tuple[str, ...]] | None = None,
     ):
+        self._configure(input_dir, work_dir, n_sectors, d, d_mode, d_reference)
+        self.read_all_layers()
+        self._build_combined_structure()
+
+    @classmethod
+    def from_atoms(
+        cls,
+        input_dir: Path,
+        work_dir: Path,
+        n_sectors: tuple[int, int],
+        d: float,
+        top_atoms: Atoms,
+        bot_atoms: Atoms,
+        d_mode: str = "surface_gap",
+        d_reference: dict[str, str | tuple[str, ...]] | None = None,
+    ) -> StructureHandler:
+        handler = cls.__new__(cls)
+        handler._configure(input_dir, work_dir, n_sectors, d, d_mode, d_reference)
+        handler.top_atoms = top_atoms.copy()
+        handler.bot_atoms = bot_atoms.copy()
+        handler._build_combined_structure()
+        return handler
+
+    def _configure(
+        self,
+        input_dir: Path,
+        work_dir: Path,
+        n_sectors: tuple[int, int],
+        d: float,
+        d_mode: str,
+        d_reference: dict[str, str | tuple[str, ...]] | None,
+    ) -> None:
         self.input_dir = Path(input_dir)
         self.work_dir = Path(work_dir)
         self.n_sectors = n_sectors
@@ -206,7 +241,8 @@ class StructureHandler:
         self.top_indexes: list[int] = []
         self.bot_indexes: list[int] = []
         self.new_struct: Atoms | None = None
-        self.read_all_layers()
+
+    def _build_combined_structure(self) -> None:
         self.new_struct, self.top_indexes, self.bot_indexes = self.build_new_struct(d=self.d)
 
     def read_atoms(self, in_file: Path | str) -> Atoms:
@@ -223,20 +259,7 @@ class StructureHandler:
             if normalized == labels:
                 raise
             lines[symbol_line_idx] = "  " + "  ".join(normalized) + "\n"
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".normalized",
-                delete=False,
-            ) as handle:
-                handle.write("".join(lines))
-                tmp_file = Path(handle.name)
-            try:
-                return read_vasp(tmp_file)
-            finally:
-                tmp_file.unlink(missing_ok=True)
+            return read_vasp(StringIO("".join(lines)))
 
     def read_all_layers(self) -> None:
         self.top_atoms = self.read_atoms(self.input_dir / "top_layer.poscar")
@@ -265,8 +288,18 @@ class StructureHandler:
         return atoms
 
     def find_sym_reduced_stackings(self, prec: float = 0.0001) -> list[tuple[int, int]]:
-        from pymatgen.analysis.structure_matcher import StructureMatcher
-        from pymatgen.io.ase import AseAtomsAdaptor
+        try:
+            try:
+                from pymatgen.core.structure_matcher import StructureMatcher
+            except ImportError:
+                from pymatgen.analysis.structure_matcher import StructureMatcher
+            from pymatgen.io.ase import AseAtomsAdaptor
+
+            import_module("spglib")
+        except ImportError as exc:
+            raise RuntimeError(
+                "Symmetry reduction requires optional dependencies pymatgen and spglib"
+            ) from exc
 
         adaptor = AseAtomsAdaptor()
         matcher = StructureMatcher(ltol=prec, stol=prec, angle_tol=prec)
@@ -279,9 +312,22 @@ class StructureHandler:
             if not matched:
                 unique_structs.append(structure)
                 unique_stackings.append(stacking)
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        np.savetxt(self.work_dir / "sym_reduced_stackings.txt", np.array(unique_stackings), fmt="%d")
         return unique_stackings
+
+    def write_sym_reduced_stackings(
+        self,
+        stackings: list[tuple[int, int]],
+        *,
+        output_dir: Path | None = None,
+    ) -> None:
+        destination_dir = self.work_dir if output_dir is None else Path(output_dir)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        text = "".join(f"{i} {j}\n" for i, j in stackings)
+        atomic_text_publish(
+            destination_dir / "sym_reduced_stackings.txt",
+            text,
+            encoding="utf-8",
+        )
 
     def build_new_struct(self, d: float) -> tuple[Atoms, list[int], list[int]]:
         top_cell_mat = self.top_atoms.get_cell().array
@@ -376,12 +422,17 @@ class StructureHandler:
             atoms_sc = sort(atoms_sc)
         write_vasp(outfile, atoms_sc)
 
-    def make_twist_struct(self, N_min: int, N_max: int, out_dir: Path | str):
+    def make_twist_struct(
+        self,
+        N_min: int,
+        N_max: int,
+        out_dir: Path | str | None = None,
+    ):
+        del out_dir
         from ._find_homo_twist import search_twist
 
         angle_list, mat_list = search_twist(N_min, N_max)
         out_atoms_list = []
-        base_out_dir = Path(out_dir)
         for idx, mat in enumerate(mat_list):
             top_sc = make_supercell(copy.deepcopy(self.top_atoms), P=mat[0])
             bot_sc = make_supercell(copy.deepcopy(self.bot_atoms), P=mat[1])
@@ -392,7 +443,4 @@ class StructureHandler:
             apply_interlayer_spacing(out_atoms, top_idx, bot_idx, self.d, self.d_mode, self.d_reference)
             out_atoms = sort(out_atoms)
             out_atoms_list.append(out_atoms)
-            target_dir = base_out_dir / angle_list[idx]
-            target_dir.mkdir(parents=True, exist_ok=True)
-            write_vasp(target_dir / "POSCAR", out_atoms)
         return angle_list, out_atoms_list

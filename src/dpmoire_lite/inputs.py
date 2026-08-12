@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import shutil
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
 import numpy as np
 from ase import Atoms
 from ase.build import make_supercell, sort
 from ase.io.vasp import read_vasp, write_vasp
 
+from .atomic_io import sha256_file
+from .incar import IncarAnalysis, IncarRenderResult, parse_incar
 from .structures import supercell_matrix
 
 
@@ -69,17 +73,130 @@ MINIMAL_VALENCE_EXCLUDED_SUFFIXES = ("_AE", "_GW", "_h", "_s")
 VALID_POTCAR_POLICIES = {"recommend", "minimal"}
 
 
-def needs_vdw_kernel(incar_text: str) -> bool:
-    for raw_line in incar_text.splitlines():
-        line = raw_line.split("#", 1)[0].split("!", 1)[0].strip()
-        if not line:
-            continue
-        parts = line.replace("=", " = ").split()
-        if not parts or parts[0].upper() != "LUSE_VDW":
-            continue
-        value = "".join(parts[2:] if len(parts) > 1 and parts[1] == "=" else parts[1:]).upper()
-        return value in {".TRUE.", "TRUE", "T", ".T."}
-    return False
+@dataclass(frozen=True)
+class PreparedSource:
+    path: Path
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PreparedIncarTemplate:
+    name: str
+    source: PreparedSource
+    analysis: IncarAnalysis
+    vdw_source: PreparedSource | None = None
+
+
+@dataclass(frozen=True)
+class PreparedPotcar:
+    element: str
+    source: PreparedSource
+    enmax: float
+
+
+def prepare_source(path: Path) -> PreparedSource:
+    path = Path(path)
+    before = path.stat()
+    digest = sha256_file(path)
+    after = path.stat()
+    if before.st_size != after.st_size:
+        raise RuntimeError(f"Source changed while preparing identity: {path}")
+    return PreparedSource(path=path, size=after.st_size, sha256=digest)
+
+
+def verify_prepared_source(source: PreparedSource) -> None:
+    try:
+        size = source.path.stat().st_size
+        digest = sha256_file(source.path)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Prepared source identity changed since preflight for {source.path}: {exc}"
+        ) from exc
+    if size != source.size or digest != source.sha256:
+        raise RuntimeError(
+            "Prepared source identity changed since preflight for "
+            f"{source.path}: expected size={source.size}, sha256={source.sha256}; "
+            f"actual size={size}, sha256={digest}"
+        )
+
+
+def _copy_prepared_source_to_handle(
+    source: PreparedSource,
+    output: BinaryIO,
+) -> None:
+    digest = hashlib.sha256()
+    size = 0
+    with source.path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            output.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+    if size != source.size or digest.hexdigest() != source.sha256:
+        raise RuntimeError(
+            f"Prepared source identity changed since preflight while copying {source.path}"
+        )
+
+
+def copy_prepared_source(source: PreparedSource, output_file: Path) -> None:
+    verify_prepared_source(source)
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("wb") as output:
+        _copy_prepared_source_to_handle(source, output)
+    shutil.copystat(source.path, output_file)
+
+
+def write_prepared_potcar(
+    elements: Iterable[str],
+    potcars: tuple[PreparedPotcar, ...],
+    output_file: Path,
+) -> float:
+    by_element = {record.element: record for record in potcars}
+    selected = []
+    for element in elements:
+        record = by_element.get(element)
+        if record is None:
+            raise RuntimeError(f"Preflight did not prepare a POTCAR for {element}")
+        selected.append(record)
+
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    max_enmax = 0.0
+    with output_file.open("wb") as output:
+        for record in selected:
+            verify_prepared_source(record.source)
+            _copy_prepared_source_to_handle(record.source, output)
+            max_enmax = max(max_enmax, record.enmax)
+    return max_enmax
+
+
+def render_prepared_incar(
+    template: PreparedIncarTemplate,
+    output_file: Path,
+    encut: float,
+    rcut1: float,
+    rcut2: float,
+) -> IncarRenderResult:
+    verify_prepared_source(template.source)
+    result = template.analysis.document.render(
+        {"ENCUT": encut, "ML_RCUT1": rcut1, "ML_RCUT2": rcut2}
+    )
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(result.text, encoding="utf-8")
+    return result
+
+
+def validate_incar(
+    incar_text: str, *, source_name: str = "<memory>"
+) -> IncarAnalysis:
+    return parse_incar(incar_text, source_name=source_name).analyze()
+
+
+def needs_vdw_kernel(incar_text: str, *, source_name: str = "<memory>") -> bool:
+    analysis = validate_incar(incar_text, source_name=source_name)
+    return analysis.is_effectively_true("LUSE_VDW")
 
 
 def resolve_potcar_dir(element: str, potcar_dir: Path, potcar_policy: str = "recommend") -> Path:
@@ -111,7 +228,16 @@ def resolve_minimal_valence_potcar_dir(element: str, potcar_dir: Path) -> Path:
         candidates.append((read_zval(potcar), 0 if path.name == element else 1, path.name, path))
     if not candidates:
         raise FileNotFoundError(f"No regular POTCAR candidates found for {element} in {potcar_dir}")
-    return sorted(candidates)[0][3]
+    ranked = sorted(candidates)
+    minimum_zval = ranked[0][0]
+    minimum_candidates = [candidate for candidate in ranked if candidate[0] == minimum_zval]
+    if len(minimum_candidates) != 1:
+        names = ", ".join(candidate[2] for candidate in minimum_candidates)
+        raise ValueError(
+            f"Ambiguous minimal POTCAR candidates for {element} with "
+            f"ZVAL={minimum_zval}: {names}"
+        )
+    return ranked[0][3]
 
 
 def _is_regular_potcar_variant(element: str, name: str) -> bool:
@@ -122,10 +248,17 @@ def _is_regular_potcar_variant(element: str, name: str) -> bool:
 
 def read_enmax(potcar_file: Path) -> float:
     text = Path(potcar_file).read_text(encoding="utf-8", errors="ignore")
-    match = re.search(r"\bENMAX\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*;", text)
-    if match is None:
+    matches = re.findall(
+        r"\bENMAX\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*;",
+        text,
+    )
+    if not matches:
         raise ValueError(f"ENMAX not found in {potcar_file}")
-    return float(match.group(1))
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one ENMAX in {potcar_file}, found {len(matches)}"
+        )
+    return float(matches[0])
 
 
 def read_zval(potcar_file: Path) -> float:
@@ -137,24 +270,12 @@ def read_zval(potcar_file: Path) -> float:
 
 
 def replace_incar_values(incar_text: str, encut: float, rcut1: float, rcut2: float, elements: list[str]) -> str:
-    output = []
-    for line in incar_text.splitlines():
-        words = line.split()
-        if not words:
-            output.append(line)
-            continue
-        key = words[0].upper()
-        if key == "ENCUT":
-            output.append(f"ENCUT = {encut}")
-        elif key == "ML_RCUT1":
-            output.append(f"ML_RCUT1 = {rcut1}")
-        elif key == "ML_RCUT2":
-            output.append(f"ML_RCUT2 = {rcut2}")
-        elif key == "LANGEVIN_GAMMA":
-            output.append("LANGEVIN_GAMMA = " + " ".join(["1"] * len(elements)))
-        else:
-            output.append(line)
-    return "\n".join(output) + "\n"
+    del elements
+    document = parse_incar(incar_text)
+    result = document.render(
+        {"ENCUT": encut, "ML_RCUT1": rcut1, "ML_RCUT2": rcut2}
+    )
+    return result.text
 
 
 def get_ordered_elements(atoms: Atoms) -> list[str]:
@@ -197,16 +318,29 @@ def write_kpoints(output_dir: Path, lat_vec, k_mesh: int, k_scale: tuple[int, in
     )
 
 
-def render_incar(template_file: Path, output_file: Path, encut: float, rcut1: float, rcut2: float, elements: list[str]) -> None:
+def render_incar(
+    template_file: Path,
+    output_file: Path,
+    encut: float,
+    rcut1: float,
+    rcut2: float,
+    elements: list[str],
+) -> IncarRenderResult:
     text = Path(template_file).read_text(encoding="utf-8")
+    del elements
+    document = parse_incar(text, source_name=str(template_file))
+    result = document.render(
+        {"ENCUT": encut, "ML_RCUT1": rcut1, "ML_RCUT2": rcut2}
+    )
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(replace_incar_values(text, encut, rcut1, rcut2, elements), encoding="utf-8")
+    output_file.write_text(result.text, encoding="utf-8")
+    return result
 
 
 def copy_vdw_if_needed(template_file: Path, input_dir: Path, output_dir: Path) -> None:
     text = Path(template_file).read_text(encoding="utf-8")
-    if not needs_vdw_kernel(text):
+    if not needs_vdw_kernel(text, source_name=str(template_file)):
         return
     source = Path(input_dir) / "vdw_kernel.bindat"
     if not source.exists():

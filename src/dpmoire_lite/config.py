@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any
+import warnings
 
 from ase.data import atomic_numbers
 import yaml
@@ -13,10 +15,21 @@ class ConfigError(ValueError):
 
 
 DEFAULT_OUTCAR_PATTERNS = (
-    r"^OUTCAR$",
     r"^OUTCAR\d+$",
     r"^OUT\d+$",
     r"^out\d+$",
+    r"^OUTCAR$",
+)
+
+OUTCAR_PATTERNS_SHAPE_ERROR = (
+    "outcar_patterns must be a non-empty YAML list of non-empty regex strings"
+)
+OUTCAR_PATTERNS_EXAMPLE = (
+    "outcar_patterns:\n"
+    "  - '^OUTCAR\\d+$'\n"
+    "  - '^OUT\\d+$'\n"
+    "  - '^out\\d+$'\n"
+    "  - '^OUTCAR$'"
 )
 
 OLD_FIELD_NAMES = {
@@ -57,6 +70,7 @@ REQUIRED_FIELDS = (
 )
 
 VALID_D_MODES = {"surface_gap", "reference_plane_gap"}
+VALID_INIT_MLFF_MODES = {"manual", "single-job"}
 VALID_POTCAR_POLICIES = {"recommend", "minimal"}
 
 
@@ -93,6 +107,14 @@ def normalize_potcar_policy(value: Any) -> str:
         allowed = ", ".join(sorted(VALID_POTCAR_POLICIES))
         raise ConfigError(f"potcar_policy must be one of: {allowed}")
     return policy
+
+
+def normalize_init_mlff_mode(value: Any) -> str:
+    mode = str(value).strip()
+    if mode not in VALID_INIT_MLFF_MODES:
+        allowed = ", ".join(sorted(VALID_INIT_MLFF_MODES))
+        raise ConfigError(f"init_mlff_mode must be one of: {allowed}")
+    return mode
 
 
 def _normalize_element_symbol(value: Any, field: str) -> str:
@@ -137,6 +159,37 @@ def normalize_d_reference(value: Any) -> dict[str, str | tuple[str, ...]] | None
     }
 
 
+def _normalize_outcar_patterns(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        message = OUTCAR_PATTERNS_SHAPE_ERROR
+        if isinstance(value, str):
+            message = f"{message}\nUse a YAML list, for example:\n{OUTCAR_PATTERNS_EXAMPLE}"
+        raise ConfigError(message)
+
+    patterns: list[str] = []
+    first_indices: dict[str, int] = {}
+    for index, pattern in enumerate(value):
+        if not isinstance(pattern, str) or pattern == "":
+            raise ConfigError(f"outcar_patterns[{index}] must be a non-empty string")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ConfigError(
+                f"Invalid outcar_patterns[{index}] {pattern!r}: {exc}"
+            ) from exc
+        if pattern in first_indices:
+            warnings.warn(
+                f"Duplicate outcar_patterns[{index}] {pattern!r} ignored; "
+                f"first occurrence is outcar_patterns[{first_indices[pattern]}].",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        first_indices[pattern] = index
+        patterns.append(pattern)
+    return tuple(patterns)
+
+
 @dataclass(frozen=True)
 class DPmoireLiteConfig:
     config_path: Path
@@ -168,6 +221,10 @@ class DPmoireLiteConfig:
     min_val_n: int
     max_val_n: int
     include_monolayer_md: bool
+    preserve_grid_shift_md: bool = False
+    init_mlff_mode: str = "manual"
+    init_bottom_incar: Path | None = None
+    init_top_incar: Path | None = None
     outcar_patterns: tuple[str, ...] = field(default_factory=lambda: DEFAULT_OUTCAR_PATTERNS)
 
     @property
@@ -187,8 +244,12 @@ class DPmoireLiteConfig:
         return self.n_sectors[1]
 
     def validate_build_mode(self, wait: bool) -> None:
-        if self.stage == "all" and (not self.submit or not wait):
-            raise ConfigError("stage: all requires submit: true and DPmoireLite build ... --wait")
+        if self.stage == "all" or (self.submit and wait):
+            raise ConfigError(
+                "stage: all and submitted --wait workflows are temporarily disabled because "
+                "Slurm terminal-state validation and failure propagation are not yet reliable. "
+                "Generate stages with submit: false and submit them manually."
+            )
 
 
 def _require(data: dict[str, Any], field_name: str) -> Any:
@@ -202,6 +263,26 @@ def _resolve_path(base: Path, value: Any) -> Path:
     if not path.is_absolute():
         path = base / path
     return path.resolve()
+
+
+def _resolve_optional_input_path(
+    input_dir: Path,
+    value: Any,
+    field_name: str,
+) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{field_name} must be a non-empty path relative to input_dir")
+    raw_path = Path(value.strip())
+    if raw_path.is_absolute():
+        raise ConfigError(f"{field_name} must be relative to input_dir")
+    resolved = (input_dir / raw_path).resolve()
+    try:
+        resolved.relative_to(input_dir)
+    except ValueError as exc:
+        raise ConfigError(f"{field_name} must remain inside input_dir") from exc
+    return resolved
 
 
 def _bool(value: Any, field_name: str) -> bool:
@@ -275,17 +356,49 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         raise ConfigError(f"Missing required config field: {missing[0]}")
 
     base = config_path.parent
-    outcar_patterns = raw.get("outcar_patterns", DEFAULT_OUTCAR_PATTERNS)
+    if "outcar_patterns" in raw:
+        outcar_patterns = _normalize_outcar_patterns(raw["outcar_patterns"])
+    else:
+        outcar_patterns = _normalize_outcar_patterns(list(DEFAULT_OUTCAR_PATTERNS))
     d_mode = normalize_d_mode(raw.get("d_mode", "surface_gap"))
     d_reference = normalize_d_reference(raw.get("d_reference")) if d_mode == "reference_plane_gap" else None
     potcar_policy = normalize_potcar_policy(raw.get("potcar_policy", "recommend"))
+    input_dir = _resolve_path(base, _require(raw, "input_dir"))
+    init_mlff = _bool(_require(raw, "init_mlff"), "init_mlff")
+    init_mlff_mode = normalize_init_mlff_mode(raw.get("init_mlff_mode", "manual"))
+    init_bottom_incar = _resolve_optional_input_path(
+        input_dir,
+        raw.get("init_bottom_incar"),
+        "init_bottom_incar",
+    )
+    init_top_incar = _resolve_optional_input_path(
+        input_dir,
+        raw.get("init_top_incar"),
+        "init_top_incar",
+    )
+    if init_mlff_mode == "single-job":
+        if not init_mlff:
+            raise ConfigError("init_mlff_mode: single-job requires init_mlff: true")
+        missing_templates = [
+            field_name
+            for field_name, value in (
+                ("init_bottom_incar", init_bottom_incar),
+                ("init_top_incar", init_top_incar),
+            )
+            if value is None
+        ]
+        if missing_templates:
+            raise ConfigError(
+                "init_mlff_mode: single-job requires explicit scientific templates: "
+                + ", ".join(missing_templates)
+            )
 
     return DPmoireLiteConfig(
         config_path=config_path,
         dft_script=str(_require(raw, "dft_script")),
         potcar_dir=_resolve_path(base, _require(raw, "potcar_dir")),
         script_dir=_resolve_path(base, _require(raw, "script_dir")),
-        input_dir=_resolve_path(base, _require(raw, "input_dir")),
+        input_dir=input_dir,
         work_dir=_resolve_path(base, _require(raw, "work_dir")),
         n_nodes=_positive_int(_require(raw, "n_nodes"), "n_nodes"),
         stage=_normalize_stage(_require(raw, "stage")),
@@ -294,7 +407,7 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         vasp_ml=_bool(_require(raw, "vasp_ml"), "vasp_ml"),
         outcar_collect_freq=_positive_int(_require(raw, "outcar_collect_freq"), "outcar_collect_freq"),
         do_relaxation=_bool(_require(raw, "do_relaxation"), "do_relaxation"),
-        init_mlff=_bool(_require(raw, "init_mlff"), "init_mlff"),
+        init_mlff=init_mlff,
         sc_rlx=_bool(_require(raw, "sc_rlx"), "sc_rlx"),
         n_sectors=normalize_pair(_require(raw, "n_sectors"), field="n_sectors"),
         sc=normalize_pair(_require(raw, "sc"), field="sc"),
@@ -310,5 +423,9 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         min_val_n=_int(_require(raw, "min_val_n"), "min_val_n"),
         max_val_n=_int(_require(raw, "max_val_n"), "max_val_n"),
         include_monolayer_md=_bool(_require(raw, "include_monolayer_md"), "include_monolayer_md"),
-        outcar_patterns=tuple(outcar_patterns),
+        preserve_grid_shift_md=_bool(raw.get("preserve_grid_shift_md", False), "preserve_grid_shift_md"),
+        init_mlff_mode=init_mlff_mode,
+        init_bottom_incar=init_bottom_incar,
+        init_top_incar=init_top_incar,
+        outcar_patterns=outcar_patterns,
     )

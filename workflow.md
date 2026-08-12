@@ -48,7 +48,8 @@ run VASP.
 
 Stage0 can generate three independent groups, controlled by config tags:
 
-- `init_mlff/` when `init_mlff: true`.
+- `init_mlff/` when `init_mlff: true`; `init_mlff_mode` selects the legacy
+  single-folder or two-phase static layout.
 - `rlx/<i>_<j>/` stacking relaxation folders when `do_relaxation: true`.
 - `validation/<angle>/` twist validation folders when `twist_val: true`.
 
@@ -61,9 +62,20 @@ Each generated folder receives:
 - the configured submit script
 - optional `vdw_kernel.bindat` if required by the INCAR template
 
-If a target child directory already exists, DPmoire-lite backs up that child
-directory with a timestamp suffix and regenerates it. It does not move the whole
-`work_dir`.
+Before writing any calculation folder, preflight resolves the selected POTCAR
+variant and ENMAX for the union of all elements in the top and bottom input
+layers. One workflow cutoff is then fixed as
+`ENCUT = encut_factor * max(selected ENMAX)` and reused by init, relaxation,
+bilayer and monolayer MD, and validation inputs. A folder's POTCAR remains local:
+it contains only that folder's POSCAR elements in POSCAR order. Stage manifests
+record the selected POTCAR directory names, ENMAX values, governing element,
+factor, and final ENCUT; they never contain POTCAR payloads.
+Stage1 compares its newly resolved plan with cutoff evidence in a newly generated
+relaxation manifest and fails before MD writes if it has drifted. Historical
+manifests without that evidence remain usable with an explicit warning and a
+newly resolved plan.
+
+If any target stage exists, including an empty directory, DPmoire-lite stops before modifying any file. It never moves, backs up, overwrites, or rebuilds a stage in place. Explicitly delete the complete conflicting stage, then rerun the build.
 
 ## 3. Init MLFF Paths
 
@@ -77,26 +89,124 @@ Manual path:
 3. Submit or run `init_mlff/` manually on the desired cluster.
 4. Ensure `init_mlff/ML_ABN` and `init_mlff/ML_FFN` exist before stage1.
 
-Non-wait submit path:
+Auditable two-phase single-allocation workflow:
+
+```yaml
+stage: 0
+submit: true
+init_mlff: true
+init_mlff_mode: single-job
+init_bottom_incar: init_bottom_INCAR
+init_top_incar: init_top_INCAR
+```
+
+This explicit mode preflights both layer structures, both scientific INCAR
+templates, the submit-script source, every selected POTCAR/ENMAX, the shared
+workflow cutoff, and all target paths before formal publication. It then creates
+independent `init_mlff/bottom/` and `init_mlff/top/` directories. Each contains a
+complete static VASP input set built from its own layer and cell; no POSCAR,
+POTCAR, or species-dependent INCAR fields are copied from one layer over the
+other. The complete candidate tree and its manifest are published together.
+
+Single-job mode requires a Bash submit template with valid `#SBATCH` directives
+before executable content and this exact interface:
+
+```bash
+dpmoire_run_vasp() {
+    # Run synchronously and return the real VASP launcher exit code.
+    srun vasp_std > "sout.${DPMOIRE_PHASE:-manual}"
+}
+
+dpmoire_run_vasp # DPMOIRE-LITE:RUN
+```
+
+The declaration, standalone closing brace, and marked call are deliberate
+contract syntax. There must be exactly one launch-function definition and one
+marker; neither may be nested in another shell function. The marker must be the
+first top-level executable line after the function and the final executable line
+in the file, although comments and blank lines may follow. The function must be
+self-contained apart from exported environment and installed commands; do not
+append `&` or hide the launcher status. DPmoire-lite leaves this source file
+byte-for-byte unchanged and replaces only the exact marked call in the derived
+`init_mlff/<dft_script>` copy. It never parses or transforms arbitrary launcher,
+container, pipeline, or redirection text.
+
+When `submit: true` selects the automatic single-job path, the template must not
+contain `#SBATCH --wait`, `#SBATCH -W`, or a valid clustered short option that
+includes `W`; the deprecated `#SLURM -W` spelling and every
+`hetjob`/`packjob` component are detected too. Preflight rejects these waiting
+directives before creating the target work tree. Because `sbatch` may translate
+foreign scheduler syntax throughout the script, automatic mode rejects any
+`#PBS` or `#BSUB` prefix anywhere in the template. Use native `#SBATCH`
+directives, or generation-only `submit: false`, which keeps them unchanged for a
+later user-controlled `sbatch` call.
+
+`init_mlff/manifest.yaml` uses `dpmoire-lite.init-workflow.v2`, records bottom as
+`step-1-ready` and top as `planned`, and stores sizes/SHA-256 identities for the
+static files, source template, and generated adapter. This evidence can detect a
+later conflict without exposing POTCAR contents or other private payloads.
+
+With `submit: false`, `DPmoireLite build config.yaml` prints
+`build status=generated`. Inspect and submit exactly the derived root script:
+
+```bash
+cd <work_dir>/init_mlff
+sbatch <dft_script>
+```
+
+The generated adapter exports `dpmoire_run_vasp` and invokes the trusted
+two-phase workflow using `SLURM_SUBMIT_DIR/..` as the work directory. Submit from
+the derived script directory as shown: Slurm may execute a spooled script copy,
+so the script file's runtime path is not a reliable workspace anchor. This fixed
+relative submit-directory contract also lets the complete workspace be moved.
+Each synchronous child launch runs in its own bottom/top
+working directory with `DPMOIRE_PHASE=step1|step2`, plus
+`DPMOIRE_PHASE_ROLE` and `DPMOIRE_PHASE_NAME`. A nonzero bottom exit or invalid
+bottom MLFF output records failure and prevents the top launch even if the
+template does not use `set -e`. Only validated top outputs publish root
+`ML_ABN`/`ML_FFN`.
+
+Completed `dpmoire-lite.init-workflow.v1` manifests remain readable so Stage1
+can consume a previously published, hash-verified seed. Only v2 manifests carry
+the submit-adapter evidence required to start this automated two-phase command.
+
+Both VASP launches use the same Slurm allocation. Select resources compatible
+with both phases and request walltime for their combined runtime.
+
+With `submit: true` and no `--wait`, build submits exactly that one derived root
+script. After `sbatch` succeeds it atomically records the returned job ID and the
+script identity in `init_mlff/manifest.yaml`, prints
+`build status=submission_requested`, and returns. This status does not mean the
+calculation completed. An `sbatch` failure returns nonzero and records bounded
+`SUBMIT_FAILED` evidence without copying scheduler stderr into the manifest.
+There is no scheduler polling, second submission, `sacct` query, retry, resume,
+or cross-job dependency.
+
+The CLI emits `submission_requested` only when at least one `sbatch` request
+succeeds. If the selected stage has no enabled submission target, it reports
+`build status=generated` even when the configuration says `submit: true`.
+DPmoire-lite also removes an inherited `SBATCH_WAIT` from each programmatic
+`sbatch` environment so a parent shell cannot silently turn this path into a
+waiting submission.
+
+Inside the allocation, `run-init-mlff` prints `init_mlff status=complete` only
+after both phases validate and publish the final seed. It prints
+`init_mlff status=failed` and returns nonzero when the workflow fails.
+
+The default `manual` mode retains its historical non-wait submit path:
 
 ```bash
 DPmoireLite build config.yaml
 ```
 
-with `submit: true` submits the first init MLFF job only for the init workflow.
-The second init MLFF step is left to the user. Stage0 still continues to
+With `submit: true`, it submits the first init MLFF job only for the init
+workflow. The second init MLFF step is left to the user. Stage0 still continues to
 generate and, when enabled, submit relaxation and validation folders from the
 same configuration.
 
-Wait path:
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-with `submit: true` waits for the first init MLFF job, renames `ML_ABN` to
-`ML_AB` and `ML_FFN` to `ML_FF`, replaces `POSCAR` with the top-layer supercell,
-submits the second init MLFF job, and waits for that second job to finish.
+Submitted `--wait` is temporarily disabled. After the first init job, inspect
+its outputs, prepare the second init MLFF step manually, submit it manually, and
+confirm `ML_ABN` and `ML_FFN` before proceeding to Stage1.
 
 ## 4. Relaxation Grid
 
@@ -121,12 +231,21 @@ If `sc_rlx: true`, relaxation folders contain supercell stacking structures.
 If `sc_rlx: false`, relaxation folders contain primitive glide structures; the
 converged `CONTCAR` is expanded to `sc` during stage1.
 
+Stage1 clears MD constraints by default. Set `preserve_grid_shift_md: true` to
+preserve only DPmoire-lite grid-shift anchors; their `F F T` mask means fixed
+x/y and movable z. Arbitrary user constraints are not covered by this option.
+
 If `symm_reduce: true`, DPmoire-lite uses `pymatgen`/`spglib` to reduce
 symmetry-equivalent stackings and writes `sym_reduced_stackings.txt`.
 
 ## 5. Submitting Stage0
 
 Set `submit: true` to submit generated folders with Slurm.
+
+Automatic fire-and-forget submission applies to both init modes. The default
+`manual` mode submits its historical single-folder init job. `single-job` submits
+exactly one generated root adapter, which runs both phases in one allocation.
+Use `submit: false` when you want to inspect and submit that adapter manually.
 
 Without `--wait`, DPmoire-lite submits every folder requested by the current
 stage and exits:
@@ -135,20 +254,11 @@ stage and exits:
 DPmoireLite build config.yaml
 ```
 
-In this mode, `n_nodes` and `auto_resub` cannot be enforced because the process
-does not keep polling Slurm.
-
-With `--wait`, DPmoire-lite keeps polling Slurm:
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-In this mode:
-
-- at most `n_nodes` jobs are active in the DPmoire-lite polling loop;
-- `auto_resub: true` resubmits failed jobs once per calculation directory;
-- stage0 waits for init, relaxation, and validation jobs that it submits.
+This fire-and-forget path guarantees only a successful `sbatch` invocation. It
+does not guarantee final job success or advance dependent stages. `n_nodes`
+throttling and `auto_resub` are unavailable because the process does not keep
+polling Slurm. Submitted `--wait` is temporarily disabled, so `auto_resub` is not
+production-ready.
 
 ## 6. Stage1: Generate MD Calculations
 
@@ -190,39 +300,16 @@ If `include_monolayer_md: true`, stage1 also generates:
 - `md/top_layer`
 - `md/bot_layer`
 
-## 7. Automated `stage: all`
+## 7. Disabled `stage: all`
 
-`stage: all` runs the dependency chain automatically. It requires:
+`stage: all` is temporarily unavailable in every submit/wait combination because
+Slurm terminal-state validation and failure propagation are not yet reliable.
+There is no hidden bypass.
 
-```yaml
-stage: all
-submit: true
-```
-
-and must be launched with:
-
-```bash
-DPmoireLite build config.yaml --wait
-```
-
-The workflow is:
-
-1. generate and submit `init_mlff/`;
-2. wait for the first init MLFF step;
-3. prepare, submit, and wait for the second init MLFF step;
-4. generate and submit relaxation folders;
-5. wait for relaxation folders to finish;
-6. generate, submit, and wait for validation folders if `twist_val: true`;
-7. generate, submit, and wait for MD folders.
-
-In `stage: all`, `n_nodes` throttling and `auto_resub` apply to every waited
-submission in the automatic chain: init MLFF, relaxation, validation, and final
-MD. Validation outputs are not inputs to stage1, but validation jobs are still
-waited and throttled when `twist_val: true`.
-
-Use `stage: all` only when the same machine and scheduler can run the dependency
-chain continuously. For multi-cluster or manually staged workflows, use
-`stage: 0` and `stage: 1` separately.
+Use `stage: 0` with `submit: false`, distribute and submit the generated folders
+manually, and inspect the init MLFF, relaxation, and optional validation outputs.
+Only after those checks should you use `stage: 1` with `submit: false`, submit the
+MD folders manually, and inspect their outputs.
 
 ## 8. Validation Timeline
 
@@ -281,23 +368,63 @@ Output:
 work_dir/valid.extxyz
 ```
 
-Collection is permissive. Missing or unreadable sources are skipped when
-possible, and the manifest records collected frame counts, skipped paths, and
-failed paths.
+The CLI writes one concise aggregate line to stderr. Detailed per-source
+diagnostics remain in the selected result manifest.
 
-For `vasp_ml: true` MD, DPmoire-lite reads `ML_ABN` and collects only ab initio
-frames. If `ML_AB` exists, already-seen configurations are skipped so repeated
-collection does not duplicate the seed data.
+| Exit code | Status | Result |
+| ---: | --- | --- |
+| `0` | `complete` | Frames published with complete expected-source coverage. |
+| `1` | `fatal` | Configuration, provenance, manifest, recovery, or publication failure. |
+| `2` | `degraded` | Frames published with partial, skipped, failed, or unknown coverage. |
+| `3` | `no_data` | No new frames published. |
+
+Every nonzero code is a shell failure. `no_data` never creates, deletes, or
+replaces extxyz; an existing output stays byte-for-byte unchanged.
+
+For `vasp_ml: true` MD, the default `seed-aware` mode validates the immutable
+Stage1 seed provenance and never derives it from the current `md/ML_AB`. Older
+restart trees can explicitly request:
+
+The exact fast path preserves `mlab-seed-v1`. When VASP rewrites the trusted
+seed prefix with numerically insignificant differences, the versioned fallback
+requires identical elements, counts, atom order, and configuration order, then
+checks every numeric component with
+`abs(a-b) <= 1e-12 * max(1, abs(a), abs(b))`. Manifest v2 fallback reads only a
+path-contained, raw-hash-verified reference; legacy fallback reads only complete
+`init_mlff/ML_ABN` evidence and emits its compatibility warning. VASP-equivalent
+verification is accepted as complete coverage and removes exactly the recorded
+seed count once.
+
+```bash
+DPmoireLite collect config.yaml --stage md --mlff-collect-mode full-dedup
+```
+
+`full-dedup` reads every accepted final `ML_ABN`, retains the first exact copy
+of repeated configurations (including one shared seed), and therefore performs
+more I/O. It is valid only for MLFF MD; relaxation, validation, and non-ML MD
+return fatal/exit 1.
+
+Current Manifest v2 is authoritative. Legacy or missing-manifest compatibility
+collection writes `MD_data.collect.yaml` without fabricating or rewriting build
+provenance. Missing-manifest scanning is full-dedup-only and is at best
+`degraded` when it produces frames because expected-source coverage is unknown.
+
+For nonzero seed-aware publication, `collect.dedup.seed_verification` reports
+aggregate `exact`, `vasp_equivalent`, and `mismatch` counts. Each verified source
+has a bounded `collect.sources[].seed_verification` record containing identities,
+reference trust, maximum absolute/scaled deltas, and an optional first mismatch.
+Complete seed configurations are never serialized. Exact `mlab-seed-v1`, exact
+`mlab-config-v1`, and explicit full-dedup remain independent and unchanged.
 
 For relaxation and `vasp_ml: false` MD, DPmoire-lite reads OUTCAR series. The
 default OUTCAR patterns are:
 
 ```yaml
 outcar_patterns:
-  - '^OUTCAR$'
   - '^OUTCAR\d+$'
   - '^OUT\d+$'
   - '^out\d+$'
+  - '^OUTCAR$'
 ```
 
 This covers common restarted relaxation histories such as `OUTCAR0`, `OUT1`,

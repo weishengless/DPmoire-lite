@@ -1,5 +1,7 @@
+import hashlib
 import math
 import shutil
+from pathlib import Path
 
 from ase import Atoms
 from ase.io.vasp import read_vasp, write_vasp
@@ -7,9 +9,19 @@ import pytest
 import yaml
 
 import dpmoire_lite.build as build_module
-from dpmoire_lite.build import _ordered_elements, build_stage_all, run_build
+from dpmoire_lite.build import _ordered_elements, build_stage0, build_stage1, build_stage_all, run_build
 from dpmoire_lite.config import ConfigError, load_config
+from dpmoire_lite.incar import parse_incar
+from dpmoire_lite.manifest import Manifest, write_manifest
 from dpmoire_lite.slurm import SlurmJob, parse_sbatch_output, parse_sacct_states
+
+
+def assert_temporary_safety_error(error: ConfigError) -> None:
+    message = str(error)
+    assert "temporarily disabled" in message
+    assert "Slurm terminal-state validation and failure propagation" in message
+    assert "submit: false" in message
+    assert "manually" in message
 
 
 def write_minimal_inputs(root, *, top_a=4.0, bot_a=4.0):
@@ -46,7 +58,14 @@ Direct
     (input_dir / "bot_layer.poscar").write_text(bot_poscar, encoding="utf-8")
     for name in ["init_INCAR", "rlx_INCAR", "MD_INCAR", "MD_monolayer_INCAR", "val_INCAR"]:
         (input_dir / name).write_text("ENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\nLANGEVIN_GAMMA = 1\n", encoding="utf-8")
-    (scripts / "DFT_script.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (scripts / "DFT_script.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "dpmoire_run_vasp() {\n"
+        "    true\n"
+        "}\n"
+        "dpmoire_run_vasp # DPMOIRE-LITE:RUN\n",
+        encoding="utf-8",
+    )
     return input_dir, scripts, potcars
 
 
@@ -86,6 +105,41 @@ def write_build_config(root, **overrides):
     return path
 
 
+def write_mixed_layer_inputs(root):
+    input_dir = root / "input"
+    cell = [4.0, 4.0, 12.0]
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=cell,
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=cell,
+            pbc=True,
+        ),
+        direct=True,
+    )
+    potcar_payloads = {
+        "V_sv": "synthetic-v\n ENMAX = 240;\n",
+        "Nb_sv": "synthetic-nb\n ENMAX = 300;\n",
+        "Te": "synthetic-te\n ENMAX = 260;\n",
+    }
+    for directory, payload in potcar_payloads.items():
+        target = root / "potcars" / directory
+        target.mkdir(parents=True)
+        (target / "POTCAR").write_text(payload, encoding="utf-8")
+    return potcar_payloads
+
+
 def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_block=False):
     target = work / "rlx" / name
     target.mkdir(parents=True, exist_ok=True)
@@ -100,6 +154,31 @@ def write_converged_relaxation(work, name="0_0", *, atoms=None, with_velocity_bl
         encoding="utf-8",
     )
     return target
+
+
+def complete_generated_relaxation_and_update_config(root, config, **updates):
+    relaxation = root / "work" / "rlx" / "0_0"
+    shutil.copy2(relaxation / "POSCAR", relaxation / "CONTCAR")
+    (relaxation / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    config_data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    config_data["stage"] = 1
+    config_data.update(updates)
+    config.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+
+def write_relaxation_manifest(work, stackings):
+    write_manifest(
+        work,
+        Manifest(
+            stage="rlx",
+            generated_at="test",
+            directories=[f"rlx/{i}_{j}" for i, j in stackings],
+            stackings=[list(stacking) for stacking in stackings],
+        ),
+    )
 
 
 def read_selective_dynamics_flags(poscar):
@@ -159,17 +238,6 @@ class FakeRunner:
         return jobs
 
 
-class SubmitManyRunner(FakeRunner):
-    def __init__(self):
-        super().__init__()
-        self.submit_many_calls = []
-
-    def submit_many(self, items, wait=False, poll_seconds=30):
-        self.submit_many_calls.append(([rel_path for _work_dir, rel_path in items], wait))
-        jobs = [self.submit(work_dir, rel_path) for work_dir, rel_path in items]
-        return self.wait(jobs) if wait else jobs
-
-
 def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     config = write_build_config(tmp_path)
     run_build(config, wait=False)
@@ -178,6 +246,308 @@ def test_stage0_generates_init_and_rlx_dirs(tmp_path):
     assert (work / "rlx" / "0_0" / "INCAR").exists()
     assert (work / "rlx" / "1_0" / "KPOINTS").exists()
     assert (work / "rlx" / "manifest.yaml").exists()
+
+
+def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+
+    run_build(config, wait=False)
+
+    work = tmp_path / "work"
+    init_dir = work / "init_mlff"
+    rlx_dir = work / "rlx" / "0_0"
+    expected_encut = 450.0
+    for directory in (init_dir, rlx_dir):
+        analysis = parse_incar(
+            (directory / "INCAR").read_text(encoding="utf-8"),
+            source_name=str(directory / "INCAR"),
+        ).analyze()
+        assert float(analysis.effective_value("ENCUT")) == expected_encut
+
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    init_elements = _ordered_elements(read_vasp(init_dir / "POSCAR"))
+    assert (init_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+        payload_by_element[element] for element in init_elements
+    )
+    expected_evidence = {
+        "schema": "dpmoire-lite.workflow-cutoff.v1",
+        "selected_potcars": [
+            {"element": "Nb", "directory": "Nb_sv", "enmax": 300.0},
+            {"element": "Te", "directory": "Te", "enmax": 260.0},
+            {"element": "V", "directory": "V_sv", "enmax": 240.0},
+        ],
+        "governing_element": "Nb",
+        "governing_potcar_directory": "Nb_sv",
+        "max_enmax": 300.0,
+        "encut_factor": 1.5,
+        "encut": expected_encut,
+    }
+    for stage in ("init_mlff", "rlx"):
+        manifest = yaml.safe_load(
+            (work / stage / "manifest.yaml").read_text(encoding="utf-8")
+        )
+        assert manifest["config_summary"]["workflow_cutoff"] == expected_evidence
+
+
+def test_single_job_init_mode_generates_auditable_two_phase_workspace(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=False,
+        twist_val=False,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+    input_dir = tmp_path / "input"
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=[3.0, 3.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=[4.0, 4.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    (input_dir / "init_bottom_INCAR").write_text(
+        "SYSTEM = bottom-vte2\nENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\n",
+        encoding="utf-8",
+    )
+    (input_dir / "init_top_INCAR").write_text(
+        "SYSTEM = top-nbte2\nENCUT = 400\nML_RCUT1 = 6\nML_RCUT2 = 6\n",
+        encoding="utf-8",
+    )
+
+    run_build(config, wait=False)
+
+    root = tmp_path / "work" / "init_mlff"
+    phase_dirs = {"bottom": root / "bottom", "top": root / "top"}
+    expected_files = {"POSCAR", "POTCAR", "INCAR", "KPOINTS", "DFT_script.sh"}
+    for phase_dir in phase_dirs.values():
+        assert expected_files <= {path.name for path in phase_dir.iterdir()}
+    assert not (root / "POSCAR").exists()
+    assert "SYSTEM = bottom-vte2" in (phase_dirs["bottom"] / "INCAR").read_text(
+        encoding="utf-8"
+    )
+    assert "SYSTEM = top-nbte2" in (phase_dirs["top"] / "INCAR").read_text(
+        encoding="utf-8"
+    )
+    for phase_dir in phase_dirs.values():
+        analysis = parse_incar(
+            (phase_dir / "INCAR").read_text(encoding="utf-8"),
+            source_name=str(phase_dir / "INCAR"),
+        ).analyze()
+        assert float(analysis.effective_value("ENCUT")) == 450.0
+    assert (
+        (phase_dirs["bottom"] / "KPOINTS")
+        .read_text(encoding="utf-8")
+        .splitlines()[3]
+        == "5 5 1"
+    )
+    assert (
+        (phase_dirs["top"] / "KPOINTS")
+        .read_text(encoding="utf-8")
+        .splitlines()[3]
+        == "7 7 1"
+    )
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Nb": potcar_payloads["Nb_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    for phase_dir in phase_dirs.values():
+        elements = _ordered_elements(read_vasp(phase_dir / "POSCAR"))
+        assert (phase_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+            payload_by_element[element] for element in elements
+        )
+
+    manifest = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["directories"] == ["init_mlff/bottom", "init_mlff/top"]
+    workflow = manifest["init_workflow"]
+    assert workflow["schema"] == "dpmoire-lite.init-workflow.v2"
+    assert workflow["mode"] == "single-job"
+    assert workflow["state"] == "step-1-ready"
+    assert workflow["phases"]["bottom"]["role"] == "step-1"
+    assert workflow["phases"]["top"]["role"] == "step-2"
+    assert workflow["phases"]["bottom"]["state"] == "step-1-ready"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    submit_payload = (tmp_path / "scripts" / "DFT_script.sh").read_bytes()
+    assert workflow["submit_source"] == {
+        "name": "DFT_script.sh",
+        "size": len(submit_payload),
+        "sha256": hashlib.sha256(submit_payload).hexdigest(),
+    }
+    for phase, phase_dir in phase_dirs.items():
+        evidence = workflow["phases"][phase]
+        assert evidence["directory"] == f"init_mlff/{phase}"
+        template_path = input_dir / f"init_{phase}_INCAR"
+        template_payload = template_path.read_bytes()
+        assert evidence["incar_template"] == {
+            "name": template_path.name,
+            "size": len(template_payload),
+            "sha256": hashlib.sha256(template_payload).hexdigest(),
+        }
+        assert set(evidence["static_inputs"]) == expected_files
+        for name, identity in evidence["static_inputs"].items():
+            payload = (phase_dir / name).read_bytes()
+            assert identity == {
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+
+
+def test_stage0_validation_uses_workflow_wide_encut_and_local_potcar_order(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        init_mlff=False,
+        do_relaxation=False,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        twist_val=True,
+        min_val_n=1,
+        max_val_n=1,
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+
+    run_build(config, wait=False)
+
+    validation_root = tmp_path / "work" / "validation"
+    manifest = yaml.safe_load(
+        (validation_root / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    validation_dir = validation_root / manifest["angles"][0]
+    analysis = parse_incar(
+        (validation_dir / "INCAR").read_text(encoding="utf-8"),
+        source_name=str(validation_dir / "INCAR"),
+    ).analyze()
+    assert float(analysis.effective_value("ENCUT")) == 450.0
+
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Nb": potcar_payloads["Nb_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    elements = _ordered_elements(read_vasp(validation_dir / "POSCAR"))
+    assert (validation_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+        payload_by_element[element] for element in elements
+    )
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == 450.0
+
+
+def test_stage1_uses_workflow_wide_encut_for_bilayer_and_monolayer_md(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        include_monolayer_md=True,
+        encut_factor=1.5,
+    )
+    potcar_payloads = write_mixed_layer_inputs(tmp_path)
+    run_build(config, wait=False)
+    complete_generated_relaxation_and_update_config(tmp_path, config)
+
+    run_build(config, wait=False)
+
+    md_dir = tmp_path / "work" / "md"
+    expected_encut = 450.0
+    for directory in (md_dir / "0_0", md_dir / "top_layer", md_dir / "bot_layer"):
+        analysis = parse_incar(
+            (directory / "INCAR").read_text(encoding="utf-8"),
+            source_name=str(directory / "INCAR"),
+        ).analyze()
+        assert float(analysis.effective_value("ENCUT")) == expected_encut
+
+    payload_by_element = {
+        "V": potcar_payloads["V_sv"],
+        "Nb": potcar_payloads["Nb_sv"],
+        "Te": potcar_payloads["Te"],
+    }
+    for layer_name in ("top_layer", "bot_layer"):
+        layer_dir = md_dir / layer_name
+        elements = _ordered_elements(read_vasp(layer_dir / "POSCAR"))
+        assert (layer_dir / "POTCAR").read_text(encoding="utf-8") == "".join(
+            payload_by_element[element] for element in elements
+        )
+    manifest = yaml.safe_load((md_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == expected_encut
+    assert manifest["config_summary"]["workflow_cutoff"]["governing_element"] == "Nb"
+
+
+def test_stage1_rejects_workflow_cutoff_drift_from_stage0_manifest(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        include_monolayer_md=False,
+        encut_factor=1.5,
+    )
+    write_mixed_layer_inputs(tmp_path)
+    run_build(config, wait=False)
+    complete_generated_relaxation_and_update_config(
+        tmp_path,
+        config,
+        encut_factor=1.6,
+    )
+
+    with pytest.raises(RuntimeError, match="workflow cutoff.*drift"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
+def test_stage1_warns_when_manifest_predates_workflow_cutoff_evidence(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=1,
+        n_sectors=[1, 1],
+        vasp_ml=False,
+        include_monolayer_md=False,
+    )
+    work = tmp_path / "work"
+    write_converged_relaxation(work)
+    write_relaxation_manifest(work, [(0, 0)])
+
+    with pytest.warns(UserWarning, match="predates workflow cutoff evidence"):
+        run_build(config, wait=False)
+
+    manifest = yaml.safe_load((work / "md" / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == 150.0
 
 
 @pytest.mark.parametrize(("sc_rlx", "expected_rlx_mesh"), [(False, "5 5 1"), (True, "3 3 1")])
@@ -288,6 +658,43 @@ def test_build_stage_all_validates_direct_calls(tmp_path, overrides, wait):
         build_stage_all(config, wait=wait)
 
 
+@pytest.mark.parametrize("stage", [0, 1])
+def test_safety_gate_runs_before_work_dir_creation(monkeypatch, tmp_path, stage):
+    config_path = write_build_config(tmp_path, stage=stage, submit=True)
+    work_dir = tmp_path / "work"
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("SlurmRunner was constructed before the safety gate")
+
+    monkeypatch.setattr(build_module, "SlurmRunner", fail_if_constructed)
+
+    with pytest.raises(ConfigError) as exc_info:
+        run_build(config_path, wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize(("stage", "builder"), [(0, build_stage0), (1, build_stage1)])
+def test_safety_gate_runs_before_runner_construction(monkeypatch, tmp_path, stage, builder):
+    config_path = write_build_config(tmp_path, stage=stage, submit=True)
+    config = load_config(config_path)
+    runner_constructed = False
+
+    def fail_if_constructed(*_args, **_kwargs):
+        nonlocal runner_constructed
+        runner_constructed = True
+        raise AssertionError("SlurmRunner was constructed before the safety gate")
+
+    monkeypatch.setattr(build_module, "SlurmRunner", fail_if_constructed)
+
+    with pytest.raises(ConfigError) as exc_info:
+        builder(config, wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+    assert runner_constructed is False
+
+
 def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     config = write_build_config(
         tmp_path,
@@ -297,9 +704,11 @@ def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     )
     work = tmp_path / "work"
     write_converged_relaxation(work, with_velocity_block=True)
+    write_relaxation_manifest(work, [(0, 0)])
     init_mlff = work / "init_mlff"
     init_mlff.mkdir(parents=True)
-    (init_mlff / "ML_ABN").write_text("abn", encoding="utf-8")
+    seed = Path(__file__).parent / "data" / "mlab" / "complete_vasp_651.mlab"
+    shutil.copy2(seed, init_mlff / "ML_ABN")
     (init_mlff / "ML_FFN").write_text("ffn", encoding="utf-8")
 
     run_build(config, wait=False)
@@ -309,11 +718,12 @@ def test_stage1_generates_md_from_strict_relaxation_inputs_and_mlff(tmp_path):
     assert (md_dir / "KPOINTS").exists()
     assert (md_dir / "POTCAR").exists()
     assert (md_dir / "DFT_script.sh").exists()
-    assert (md_dir / "ML_AB").read_text(encoding="utf-8") == "abn"
+    assert (md_dir / "ML_AB").read_bytes() == seed.read_bytes()
     assert (md_dir / "ML_FF").read_text(encoding="utf-8") == "ffn"
     poscar_text = (md_dir / "POSCAR").read_text(encoding="utf-8")
     assert "9.0 9.0 9.0" not in poscar_text
     manifest = yaml.safe_load((work / "md" / "manifest.yaml").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
     assert manifest["stage"] == "md"
     assert manifest["directories"] == ["md/0_0"]
     assert manifest["stackings"] == [[0, 0]]
@@ -325,12 +735,13 @@ def test_stage1_fails_for_unconverged_relaxation(tmp_path):
     target.mkdir(parents=True, exist_ok=True)
     write_vasp(target / "CONTCAR", atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
     (target / "OUTCAR").write_text("not there yet\n", encoding="utf-8")
+    write_relaxation_manifest(tmp_path / "work", [(0, 0)])
 
     with pytest.raises(RuntimeError, match="rlx/0_0: Relaxation did not converge"):
         run_build(config, wait=False)
 
 
-def test_stage1_preflight_reports_all_failures_without_mutating_existing_md(tmp_path):
+def test_stage1_preflight_reports_all_failures_without_creating_md(tmp_path):
     config = write_build_config(
         tmp_path,
         stage=1,
@@ -346,11 +757,7 @@ def test_stage1_preflight_reports_all_failures_without_mutating_existing_md(tmp_
     unconverged.mkdir(parents=True, exist_ok=True)
     write_vasp(unconverged / "CONTCAR", atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
     (unconverged / "OUTCAR").write_text("not there yet\n", encoding="utf-8")
-    existing_md = work / "md" / "0_0"
-    existing_md.mkdir(parents=True, exist_ok=True)
-    marker = existing_md / "marker.txt"
-    marker.write_text("keep me here", encoding="utf-8")
-
+    write_relaxation_manifest(work, [(0, 0), (1, 0)])
     with pytest.raises(RuntimeError) as exc_info:
         run_build(config, wait=False)
 
@@ -359,9 +766,7 @@ def test_stage1_preflight_reports_all_failures_without_mutating_existing_md(tmp_
     assert "rlx/1_0: Relaxation did not converge" in message
     assert "init_mlff/ML_ABN: missing required MLFF file" in message
     assert "init_mlff/ML_FFN: missing required MLFF file" in message
-    assert existing_md.is_dir()
-    assert marker.read_text(encoding="utf-8") == "keep me here"
-    assert not any(path.name.startswith("0_0.") for path in (work / "md").iterdir())
+    assert not (work / "md").exists()
 
 
 def test_stage1_expands_primitive_relaxation_when_sc_rlx_is_false(tmp_path):
@@ -376,6 +781,7 @@ def test_stage1_expands_primitive_relaxation_when_sc_rlx_is_false(tmp_path):
     )
     work = tmp_path / "work"
     write_converged_relaxation(work, atoms=Atoms("H", positions=[[0, 0, 0]], cell=[4, 5, 12], pbc=True))
+    write_relaxation_manifest(work, [(0, 0)])
 
     run_build(config, wait=False)
 
@@ -412,78 +818,7 @@ def test_ordered_elements_preserves_consecutive_symbol_groups():
     assert _ordered_elements(atoms) == ["Mo", "S", "Mo"]
 
 
-def test_stage_all_waits_init_step2_and_rlx_before_generating_md(monkeypatch, tmp_path):
-    fake_runner = FakeRunner()
-    fake_runner.root = tmp_path / "work"
-    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
-
-    def fake_twist_struct(self, _min_n, _max_n, _out_dir):
-        return ["1.00deg"], [Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True)]
-
-    monkeypatch.setattr(build_module.StructureHandler, "make_twist_struct", fake_twist_struct)
-    config = write_build_config(
-        tmp_path,
-        stage="all",
-        submit=True,
-        n_sectors=[1, 1],
-        twist_val=True,
-        include_monolayer_md=False,
-    )
-
-    run_build(config, wait=True)
-
-    work = tmp_path / "work"
-    assert (work / "init_mlff" / "ML_AB").read_text(encoding="utf-8") == "step1-abn"
-    assert (work / "init_mlff" / "ML_FF").read_text(encoding="utf-8") == "step1-ffn"
-    assert (work / "init_mlff" / "ML_ABN").read_text(encoding="utf-8") == "step2-abn"
-    assert (work / "init_mlff" / "ML_FFN").read_text(encoding="utf-8") == "step2-ffn"
-    assert (work / "md" / "0_0" / "ML_AB").read_text(encoding="utf-8") == "step2-abn"
-    assert (work / "md" / "0_0" / "ML_FF").read_text(encoding="utf-8") == "step2-ffn"
-    assert fake_runner.events == [
-        ("submit", "init_mlff"),
-        ("wait", ["init_mlff"]),
-        ("submit", "init_mlff"),
-        ("wait", ["init_mlff"]),
-        ("submit", "rlx/0_0"),
-        ("wait", ["rlx/0_0"]),
-        ("submit", "validation/1.00deg"),
-        ("wait", ["validation/1.00deg"]),
-        ("submit", "md/0_0"),
-        ("wait", ["md/0_0"]),
-    ]
-
-
-def test_stage_all_uses_submit_many_wait_for_validation_and_md(monkeypatch, tmp_path):
-    fake_runner = SubmitManyRunner()
-    fake_runner.root = tmp_path / "work"
-    monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)
-
-    def fake_twist_struct(self, _min_n, _max_n, _out_dir):
-        atoms = Atoms("H", positions=[[0, 0, 0]], cell=[4, 4, 12], pbc=True)
-        return ["1.00deg", "2.00deg"], [atoms, atoms.copy()]
-
-    monkeypatch.setattr(build_module.StructureHandler, "make_twist_struct", fake_twist_struct)
-    config = write_build_config(
-        tmp_path,
-        stage="all",
-        submit=True,
-        n_sectors=[2, 1],
-        twist_val=True,
-        include_monolayer_md=False,
-    )
-
-    run_build(config, wait=True)
-
-    assert fake_runner.submit_many_calls == [
-        (["init_mlff"], True),
-        (["init_mlff"], True),
-        (["rlx/0_0", "rlx/1_0"], True),
-        (["validation/1.00deg", "validation/2.00deg"], True),
-        (["md/0_0", "md/1_0"], True),
-    ]
-
-
-def test_stage0_submit_without_wait_submits_only_init_step1(monkeypatch, tmp_path):
+def test_fire_and_forget_stage0_remains_allowed(monkeypatch, tmp_path):
     fake_runner = FakeRunner()
     fake_runner.root = tmp_path / "work"
     monkeypatch.setattr(build_module, "SlurmRunner", lambda *_args: fake_runner)

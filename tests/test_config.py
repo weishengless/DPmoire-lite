@@ -1,9 +1,18 @@
 from pathlib import Path
+import re
 
 import pytest
 import yaml
 
 from dpmoire_lite.config import ConfigError, load_config, normalize_pair
+
+
+def assert_temporary_safety_error(error: ConfigError) -> None:
+    message = str(error)
+    assert "temporarily disabled" in message
+    assert "Slurm terminal-state validation and failure propagation" in message
+    assert "submit: false" in message
+    assert "manually" in message
 
 
 def write_config(path: Path, **overrides):
@@ -63,14 +72,57 @@ def test_load_config_resolves_paths(tmp_path):
     assert config.work_dir == tmp_path / "work"
 
 
-def test_stage_all_requires_submit_wait_at_build_time(tmp_path):
+def test_stage_all_is_temporarily_disabled_for_submit_false(tmp_path):
     (tmp_path / "potcars").mkdir()
     (tmp_path / "scripts").mkdir()
     (tmp_path / "input").mkdir()
     config_file = tmp_path / "config.yaml"
     write_config(config_file, stage="all", submit=False)
     config = load_config(config_file)
-    with pytest.raises(ConfigError, match="stage: all"):
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=False)
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_stage_all_is_temporarily_disabled_for_submit_true_wait(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, stage="all", submit=True)
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_submitted_wait_is_disabled_for_stage0(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, stage=0, submit=True)
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_submitted_wait_is_disabled_for_stage1(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, stage=1, submit=True)
+    config = load_config(config_file)
+
+    with pytest.raises(ConfigError) as exc_info:
+        config.validate_build_mode(wait=True)
+
+    assert_temporary_safety_error(exc_info.value)
+
+
+def test_manual_stage0_and_stage1_remain_allowed(tmp_path):
+    for stage in (0, 1):
+        config_file = tmp_path / f"config-stage{stage}.yaml"
+        write_config(config_file, stage=stage, submit=False)
+        config = load_config(config_file)
+
         config.validate_build_mode(wait=False)
 
 
@@ -134,6 +186,90 @@ def test_d_mode_defaults_to_surface_gap(tmp_path):
     assert config.d_mode == "surface_gap"
     assert config.d_reference is None
     assert config.potcar_policy == "recommend"
+    assert config.init_mlff_mode == "manual"
+    assert config.init_bottom_incar is None
+    assert config.init_top_incar is None
+
+
+def test_single_job_init_mode_requires_and_resolves_explicit_templates(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        init_mlff_mode="single-job",
+        init_bottom_incar="bottom/init_INCAR",
+        init_top_incar="top/init_INCAR",
+    )
+
+    config = load_config(config_file)
+
+    assert config.init_mlff_mode == "single-job"
+    assert config.init_bottom_incar == tmp_path / "input" / "bottom" / "init_INCAR"
+    assert config.init_top_incar == tmp_path / "input" / "top" / "init_INCAR"
+
+
+@pytest.mark.parametrize("missing", ["init_bottom_incar", "init_top_incar"])
+def test_single_job_init_mode_rejects_missing_scientific_template(tmp_path, missing):
+    config_file = tmp_path / "config.yaml"
+    templates = {
+        "init_bottom_incar": "init_bottom_INCAR",
+        "init_top_incar": "init_top_INCAR",
+    }
+    del templates[missing]
+    write_config(config_file, init_mlff_mode="single-job", **templates)
+
+    with pytest.raises(ConfigError, match=missing):
+        load_config(config_file)
+
+
+def test_single_job_init_mode_rejects_disabled_init_mlff(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        init_mlff=False,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+    )
+
+    with pytest.raises(ConfigError, match="requires init_mlff: true"):
+        load_config(config_file)
+
+
+def test_single_job_init_fire_and_forget_submission_is_allowed(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        submit=True,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+    )
+    config = load_config(config_file)
+
+    config.validate_build_mode(wait=False)
+
+
+@pytest.mark.parametrize("mode", ["automatic", "single_job", ""])
+def test_load_config_rejects_invalid_init_mlff_mode(tmp_path, mode):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, init_mlff_mode=mode)
+
+    with pytest.raises(ConfigError, match="init_mlff_mode"):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("template", ["../outside_INCAR", "C:/outside/INCAR"])
+def test_single_job_init_templates_must_remain_inside_input_dir(tmp_path, template):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        init_mlff_mode="single-job",
+        init_bottom_incar=template,
+        init_top_incar="init_top_INCAR",
+    )
+
+    with pytest.raises(ConfigError, match="init_bottom_incar"):
+        load_config(config_file)
 
 
 @pytest.mark.parametrize("policy", ["recommend", "minimal"])
@@ -221,3 +357,136 @@ def test_load_config_rejects_invalid_d_mode(tmp_path):
 
     with pytest.raises(ConfigError, match="d_mode"):
         load_config(config_file)
+
+
+def test_preserve_grid_shift_md_defaults_false_when_omitted(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.preserve_grid_shift_md is False
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_preserve_grid_shift_md_accepts_explicit_boolean(tmp_path, value):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, preserve_grid_shift_md=value)
+
+    config = load_config(config_file)
+
+    assert config.preserve_grid_shift_md is value
+
+
+def test_preserve_grid_shift_md_rejects_invalid_boolean(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, preserve_grid_shift_md="sometimes")
+
+    with pytest.raises(ConfigError, match="preserve_grid_shift_md"):
+        load_config(config_file)
+
+
+def test_source_and_bundled_examples_show_false_default():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    for relative_path in ("example/config.yaml", "src/dpmoire_lite/example/config.yaml"):
+        data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
+        assert data["preserve_grid_shift_md"] is False
+        assert data["init_mlff_mode"] == "manual"
+        assert data["init_bottom_incar"] == "init_bottom_INCAR"
+        assert data["init_top_incar"] == "init_top_INCAR"
+
+
+def test_outcar_patterns_defaults_to_historical_families_then_active(tmp_path):
+    expected = (
+        r"^OUTCAR\d+$",
+        r"^OUT\d+$",
+        r"^out\d+$",
+        r"^OUTCAR$",
+    )
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.outcar_patterns == expected
+    repo_root = Path(__file__).resolve().parents[1]
+    for relative_path in ("example/config.yaml", "src/dpmoire_lite/example/config.yaml"):
+        data = yaml.safe_load((repo_root / relative_path).read_text(encoding="utf-8"))
+        assert data["outcar_patterns"] == list(expected)
+
+
+def test_outcar_patterns_rejects_scalar_string(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=r"^OUTCAR\d+$")
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    message = str(exc_info.value)
+    assert "outcar_patterns must be a non-empty YAML list of non-empty regex strings" in message
+    assert "outcar_patterns:" in message
+    assert "  - '^OUTCAR\\d+$'" in message
+    assert "  - '^OUT\\d+$'" in message
+    assert "  - '^out\\d+$'" in message
+    assert "  - '^OUTCAR$'" in message
+
+
+def test_outcar_patterns_rejects_empty_list(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[])
+
+    with pytest.raises(
+        ConfigError,
+        match="outcar_patterns must be a non-empty YAML list of non-empty regex strings",
+    ):
+        load_config(config_file)
+
+
+def test_outcar_patterns_rejects_empty_string_item(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[r"^OUTCAR$", ""])
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    assert "outcar_patterns[1] must be a non-empty string" in str(exc_info.value)
+
+
+def test_outcar_patterns_rejects_mixed_types(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[r"^OUTCAR$", 7, r"^OUTCAR\d+$"])
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    assert "outcar_patterns[1] must be a non-empty string" in str(exc_info.value)
+
+
+def test_outcar_patterns_rejects_invalid_regex_with_index(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=[r"^OUTCAR$", "[", r"^OUTCAR\d+$"])
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    message = str(exc_info.value)
+    assert "Invalid outcar_patterns[1] '[':" in message
+    assert isinstance(exc_info.value.__cause__, re.error)
+
+
+def test_outcar_patterns_deduplicates_exact_text_with_warning(tmp_path):
+    duplicate = r"^OUTCAR\d+$"
+    patterns = [duplicate, r"^OUT\d+$", duplicate, r"^OUTCAR$"]
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, outcar_patterns=patterns)
+
+    with pytest.warns(UserWarning) as recorded:
+        config = load_config(config_file)
+
+    assert len(recorded) == 1
+    assert str(recorded[0].message) == (
+        "Duplicate outcar_patterns[2] '^OUTCAR\\\\d+$' ignored; "
+        "first occurrence is outcar_patterns[0]."
+    )
+    assert config.outcar_patterns == (duplicate, r"^OUT\d+$", r"^OUTCAR$")

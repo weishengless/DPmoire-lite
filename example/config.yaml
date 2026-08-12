@@ -1,7 +1,8 @@
 
 ############################ ENVIRONMENT SETTINGS ############################
-dft_script: sub                             #Name of VASP submit script.
-potcar_dir: /gpfs/home/cwang/pps/pbe64      #Diretory to access POTCAR
+dft_script: sub                             #Submit template. single-job requires the final marked dpmoire_run_vasp call shown in scripts/sub.
+#Automatic single-job submission rejects #SBATCH/#SLURM waits and any #PBS/#BSUB prefix anywhere in the template.
+potcar_dir: ./potcars                       #Directory containing POTCAR element folders; edit for your environment.
 potcar_policy: recommend                    #recommend: VASP recommended mapping. minimal: lowest-ZVAL regular POTCAR candidate.
 script_dir: ./scripts                       #Prepared slurm scripts.
 input_dir: ./input                          #Prepared VASP files and nequIP presets.
@@ -10,27 +11,31 @@ n_nodes: 4                                  #Maximum active Slurm jobs in DPmoir
 username: example                           #Username, deprecated setting, not used anymore.
 
 ############################ Workflow Settings  ############################
-stage : 0    #Build stage: *0* generates init_mlff, rlx, and optional validation folders; *1* generates md folders; *all* runs the automated submit-and-wait dependency
-submit: false            #*false*: only generate folders. *true*: submit generated folders with Slurm.
-auto_resub: false       #In --wait mode, resubmit failed jobs once per calculation directory, including all waited stage: all submissions.
+stage : 0    #Build stage: *0* generates init_mlff, rlx, and optional validation folders; *1* generates md folders; *all* is temporarily unavailable.
+submit: false            #*false*: only generate folders. *true*: fire-and-forget sbatch; single-job submits exactly one init root wrapper.
+auto_resub: false       #Reserved for submitted --wait workflows; not production-ready while submitted --wait is disabled, and ignored in non-wait mode.
 vasp_ml: true           # *true*: use VASP MLFF for MD. Stage1 distributes init_mlff/ML_ABN and ML_FFN as ML_AB and ML_FF, and MD collection reads ML_ABN; *false*: collect MD from OUTCAR.
 outcar_collect_freq: 8   #Collect 1 data every 8 ionic steps in OUTCAR.
 do_relaxation: true      #In stage0, generate stacking relaxation folders under rlx/.
 init_mlff: true         #In stage0, generate the initial init_mlff/ folder.
+init_mlff_mode: manual  #manual: legacy single-folder init. single-job: bottom/top workflow; submit false generates, submit true requests one root sbatch.
+init_bottom_incar: init_bottom_INCAR #Explicit bottom-layer scientific template required by single-job mode; path is relative to input_dir.
+init_top_incar: init_top_INCAR       #Explicit top-layer scientific template required by single-job mode; path is relative to input_dir.
 include_monolayer_md: true  #In stage1, also generate md/top_layer and md/bot_layer monolayer MD folders.
 outcar_patterns:        #Optional regex list used to discover OUTCAR series during collection. Defaults are kept explicit here for readability.
-  - '^OUTCAR$'
   - '^OUTCAR\d+$'
   - '^OUT\d+$'
   - '^out\d+$'
+  - '^OUTCAR$'
 
 ############################ Calculation and Structure Parameters ##############################################
 k_mesh: 40              #KPOINTS mesh target, using k*a = K-mesh.
-encut_factor: 1.6              #ENCUT multiplier, using ENCUT = ENMAX * max(POTCAR ENMAX).
+encut_factor: 1.6              #ENCUT = encut_factor * max(ENMAX) across selected top+bottom POTCAR variants; shared by every stage.
 r_cut: -1               #Value written to ML_RCUT1 and ML_RCUT2. Use a negative value for the automatic estimate based on the largest input-layer in-plane lattice length and d.
 
 sc: 2                   #Supercell expansion for MD and, when sc_rlx is true, relaxation. An integer means [n, n]; a pair [m, n] allows rectangular supercells.
 sc_rlx: false            #true: relax supercell stacking structures. false: relax primitive glide structures, then expand the converged CONTCAR during stage1.
+preserve_grid_shift_md: false #true: preserve only DPmoire-lite grid-shift anchors; F F T means fixed x/y and movable z. false: clear MD constraints.
 d: 7.3                  #Distance value interpreted by d_mode.
 d_mode: surface_gap     #surface_gap: min_z(top)-max_z(bot); reference_plane_gap: selected mean-z distance.
 #d_reference:           #Optional, only used by reference_plane_gap.

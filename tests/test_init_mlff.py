@@ -1,0 +1,980 @@
+import hashlib
+import shutil
+from pathlib import Path
+
+import pytest
+import yaml
+from ase import Atoms
+from ase.io.vasp import write_vasp
+
+import dpmoire_lite.atomic_io as atomic_io_module
+import dpmoire_lite.build as build_module
+import dpmoire_lite.init_mlff as init_mlff_module
+from dpmoire_lite.build import run_build
+from dpmoire_lite.init_mlff import (
+    InitMlffWorkflow,
+    InitMlffWorkflowError,
+    validate_published_init_mlff_seed,
+)
+from dpmoire_lite.manifest import read_manifest, write_manifest
+
+from test_build import write_build_config
+
+
+MLAB_FIXTURES = Path(__file__).parent / "data" / "mlab"
+CONFIGURATION_2_MARKER = "     Configuration num.      2"
+CONFIGURATION_3_MARKER = "     Configuration num.      3"
+CONFIGURATION_4_MARKER = "     Configuration num.      4"
+CONFIGURATION_COUNT_2 = (
+    "     The number of configurations\n"
+    "--------------------------------------------------\n"
+    "         2"
+)
+CONFIGURATION_COUNT_4 = CONFIGURATION_COUNT_2[:-1] + "4"
+INITIAL_LATTICE_ROW = (
+    "   4.000000000000000E+000  0.000000000000000E+000"
+    "  0.000000000000000E+000"
+)
+STRAINED_LATTICE_ROW = (
+    "   4.040000000000000E+000  0.000000000000000E+000"
+    "  0.000000000000000E+000"
+)
+
+
+def _replace_once(text, old, new):
+    assert text.count(old) == 1
+    return text.replace(old, new, 1)
+
+
+def _split_second_configuration(text):
+    prefix, separator, second_configuration = text.partition(CONFIGURATION_2_MARKER)
+    assert separator
+    return prefix, second_configuration
+
+
+class SyntheticCalculationAdapter:
+    def __init__(self, work_dir, handlers):
+        self.work_dir = Path(work_dir)
+        self.handlers = handlers
+        self.calls = []
+
+    def run(self, request):
+        result = read_manifest(self.work_dir, "init_mlff")
+        assert result.manifest is not None
+        workflow = result.manifest.init_workflow
+        self.calls.append(
+            (
+                request.phase,
+                request.role,
+                request.directory,
+                workflow["state"],
+                workflow["phases"][request.name]["state"],
+            )
+        )
+        return self.handlers[request.phase](request.directory)
+
+
+def _write_phase_templates(input_dir):
+    for name in ("init_bottom_INCAR", "init_top_INCAR"):
+        (input_dir / name).write_text(
+            "ENCUT=400\nML_RCUT1=6\nML_RCUT2=6\n",
+            encoding="utf-8",
+        )
+
+
+def _write_op_layer(path, positions):
+    write_vasp(
+        path,
+        Atoms(
+            ["O", "Pt"],
+            positions=positions,
+            cell=[4.0, 4.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+
+
+def _prepare_workflow(tmp_path, *, do_relaxation=False):
+    config_path = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff_mode="single-job",
+        init_bottom_incar="init_bottom_INCAR",
+        init_top_incar="init_top_INCAR",
+        do_relaxation=do_relaxation,
+        twist_val=False,
+        n_sectors=[1, 1],
+        include_monolayer_md=False,
+    )
+    input_dir = tmp_path / "input"
+    _write_phase_templates(input_dir)
+    _write_op_layer(
+        input_dir / "bot_layer.poscar",
+        [[0.0, 0.0, 1.0], [2.0, 2.0, 2.0]],
+    )
+    _write_op_layer(
+        input_dir / "top_layer.poscar",
+        [[0.0, 0.0, 1.1], [2.1, 2.0, 2.0]],
+    )
+    for element in ("O", "Pt"):
+        potcar = tmp_path / "potcars" / element / "POTCAR"
+        potcar.parent.mkdir(parents=True)
+        potcar.write_text(f"synthetic {element}\n ENMAX = 100;\n", encoding="utf-8")
+
+    run_build(config_path, wait=False)
+    return config_path, tmp_path / "work"
+
+
+def _write_valid_step1(directory):
+    shutil.copy2(MLAB_FIXTURES / "complete_vasp_651.mlab", directory / "ML_ABN")
+    (directory / "ML_FFN").write_bytes(b"synthetic-step1-force-field\n")
+    return 0
+
+
+def _write_variable_cell_step1(directory):
+    text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+    prefix, second_configuration = _split_second_configuration(text)
+    second_configuration = _replace_once(
+        second_configuration,
+        INITIAL_LATTICE_ROW,
+        STRAINED_LATTICE_ROW,
+    )
+    (directory / "ML_ABN").write_text(
+        prefix + CONFIGURATION_2_MARKER + second_configuration,
+        encoding="utf-8",
+    )
+    (directory / "ML_FFN").write_bytes(b"synthetic-variable-cell-force-field\n")
+    return 0
+
+
+def _write_variable_cell_step2(directory):
+    step1_seed = (directory / "ML_AB").read_text(encoding="utf-8")
+    assert (directory / "ML_FF").read_bytes() == (
+        b"synthetic-variable-cell-force-field\n"
+    )
+    output = _replace_once(
+        step1_seed,
+        CONFIGURATION_COUNT_2,
+        CONFIGURATION_COUNT_4,
+    )
+
+    source = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+    _prefix, top_configuration = _split_second_configuration(source)
+    top_anchor = CONFIGURATION_3_MARKER + top_configuration
+
+    top_variable = _replace_once(
+        top_configuration,
+        INITIAL_LATTICE_ROW,
+        STRAINED_LATTICE_ROW,
+    )
+    top_variable = _replace_once(
+        top_variable,
+        "   0.000000000000000E+000  0.000000000000000E+000"
+        "  1.100000000000000E+000",
+        "   0.000000000000000E+000  0.000000000000000E+000"
+        "  1.200000000000000E+000",
+    )
+    top_variable = _replace_once(
+        top_variable,
+        "   2.100000000000000E+000  2.000000000000000E+000"
+        "  2.000000000000000E+000",
+        "   2.200000000000000E+000  2.000000000000000E+000"
+        "  2.000000000000000E+000",
+    )
+    output += top_anchor + CONFIGURATION_4_MARKER + top_variable
+    (directory / "ML_ABN").write_text(output, encoding="utf-8")
+    (directory / "ML_FFN").write_bytes(b"synthetic-variable-cell-final-ff\n")
+    return 0
+
+
+def _write_valid_step2(directory):
+    assert (directory / "ML_AB").read_bytes() == (
+        MLAB_FIXTURES / "complete_vasp_651.mlab"
+    ).read_bytes()
+    assert (directory / "ML_FF").read_bytes() == b"synthetic-step1-force-field\n"
+    shutil.copy2(MLAB_FIXTURES / "complete_multi.mlab", directory / "ML_ABN")
+    (directory / "ML_FFN").write_bytes(b"synthetic-step2-force-field\n")
+    return 0
+
+
+def _manifest(work_dir):
+    result = read_manifest(work_dir, "init_mlff")
+    assert result.kind == "current"
+    assert result.manifest is not None
+    return result.manifest
+
+
+def _assert_no_seed_candidates(root):
+    assert list(root.rglob("*.candidate")) == []
+
+
+def test_phase_position_evidence_accepts_periodic_image_coordinates():
+    configuration = init_mlff_module.parse_mlab(
+        MLAB_FIXTURES / "complete_vasp_651.mlab"
+    ).configurations[0]
+    periodic_image = Atoms(
+        ["O", "Pt"],
+        positions=[[0.0, 0.0, 13.0], [2.0, 2.0, 2.0]],
+        cell=[4.0, 4.0, 12.0],
+        pbc=True,
+    )
+
+    assert init_mlff_module._configuration_matches_periodic_positions(
+        configuration,
+        periodic_image,
+    )
+
+
+def test_workflow_runs_both_phases_through_one_adapter_and_publishes_final_seed(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+
+    result = InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    bottom = root / "bottom"
+    top = root / "top"
+    assert adapter.calls == [
+        ("step1", "step-1", bottom, "step-1-running", "step-1-running"),
+        ("step2", "step-2", top, "step-2-running", "step-2-running"),
+    ]
+    assert result.init_workflow["state"] == "complete"
+    assert result.init_workflow["phases"]["bottom"]["state"] == "complete"
+    assert result.init_workflow["phases"]["top"]["state"] == "complete"
+    assert (bottom / "ML_ABN").read_bytes() == (
+        MLAB_FIXTURES / "complete_vasp_651.mlab"
+    ).read_bytes()
+    assert (bottom / "ML_FFN").read_bytes() == b"synthetic-step1-force-field\n"
+    assert (top / "ML_AB").read_bytes() == (bottom / "ML_ABN").read_bytes()
+    assert (top / "ML_FF").read_bytes() == (bottom / "ML_FFN").read_bytes()
+    assert (root / "ML_ABN").read_bytes() == (top / "ML_ABN").read_bytes()
+    assert (root / "ML_FFN").read_bytes() == (top / "ML_FFN").read_bytes()
+    assert result.mlff_seed == {
+        "source": "init_mlff/ML_ABN",
+        "configurations": 2,
+        "digest_schema": "mlab-seed-v1",
+        "seed_prefix_sha256": init_mlff_module.seed_prefix_identity(
+            root / "ML_ABN"
+        ).sha256,
+        "ml_ab_sha256": hashlib.sha256((root / "ML_ABN").read_bytes()).hexdigest(),
+        "ml_ff_sha256": hashlib.sha256((root / "ML_FFN").read_bytes()).hexdigest(),
+    }
+    _assert_no_seed_candidates(root)
+
+
+def test_workflow_accepts_anchored_variable_cell_trajectories_and_publishes_seed(
+    tmp_path,
+):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_variable_cell_step1, "step2": _write_variable_cell_step2},
+    )
+
+    result = InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1", "step2"]
+    workflow = result.init_workflow
+    root = work_dir / "init_mlff"
+    assert workflow["state"] == "complete"
+    assert workflow["phases"]["bottom"]["state"] == "complete"
+    assert workflow["phases"]["top"]["state"] == "complete"
+    assert (root / "top" / "ML_AB").read_bytes() == (
+        root / "bottom" / "ML_ABN"
+    ).read_bytes()
+    assert (root / "ML_ABN").read_bytes() == (root / "top" / "ML_ABN").read_bytes()
+    assert (root / "ML_FFN").read_bytes() == (root / "top" / "ML_FFN").read_bytes()
+    assert init_mlff_module.parse_mlab(root / "ML_ABN").complete_count == 4
+
+
+def test_phase_anchor_requires_lattice_and_positions_in_same_configuration(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def write_split_anchor_step1(directory):
+        _write_variable_cell_step1(directory)
+        text = (directory / "ML_ABN").read_text(encoding="utf-8")
+        first_configuration, second_configuration = _split_second_configuration(text)
+        first_anchor_position = (
+            "   0.000000000000000E+000  0.000000000000000E+000"
+            "  1.000000000000000E+000"
+        )
+        displaced_first_position = (
+            "   0.000000000000000E+000  0.000000000000000E+000"
+            "  1.500000000000000E+000"
+        )
+        first_configuration = _replace_once(
+            first_configuration,
+            first_anchor_position,
+            displaced_first_position,
+        )
+        top_positions = (
+            (
+                "   0.000000000000000E+000  0.000000000000000E+000"
+                "  1.100000000000000E+000",
+                first_anchor_position,
+            ),
+            (
+                "   2.100000000000000E+000  2.000000000000000E+000"
+                "  2.000000000000000E+000",
+                "   2.000000000000000E+000  2.000000000000000E+000"
+                "  2.000000000000000E+000",
+            ),
+        )
+        for displaced, anchored in top_positions:
+            second_configuration = _replace_once(
+                second_configuration,
+                displaced,
+                anchored,
+            )
+        (directory / "ML_ABN").write_text(
+            first_configuration + CONFIGURATION_2_MARKER + second_configuration,
+            encoding="utf-8",
+        )
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": write_split_anchor_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="joint periodic POSCAR anchor"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    workflow = _manifest(work_dir).init_workflow
+    assert workflow["state"] == "step-1-failed"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    assert not (work_dir / "init_mlff" / "ML_ABN").exists()
+
+
+def test_phase_rejects_singular_non_anchor_lattice(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def write_singular_step1(directory):
+        _write_variable_cell_step1(directory)
+        text = (directory / "ML_ABN").read_text(encoding="utf-8")
+        prefix, second_configuration = _split_second_configuration(text)
+        regular_lattice_row = (
+            "   0.000000000000000E+000  4.000000000000000E+000"
+            "  0.000000000000000E+000"
+        )
+        singular_lattice_row = (
+            "   0.000000000000000E+000  0.000000000000000E+000"
+            "  0.000000000000000E+000"
+        )
+        second_configuration = _replace_once(
+            second_configuration,
+            regular_lattice_row,
+            singular_lattice_row,
+        )
+        (directory / "ML_ABN").write_text(
+            prefix + CONFIGURATION_2_MARKER + second_configuration,
+            encoding="utf-8",
+        )
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": write_singular_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="phase structure"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    workflow = _manifest(work_dir).init_workflow
+    assert workflow["state"] == "step-1-failed"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    assert not (work_dir / "init_mlff" / "ML_ABN").exists()
+
+
+def test_nonzero_step1_fails_closed_and_cannot_be_retried_implicitly(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def fail_step1(directory):
+        _write_valid_step1(directory)
+        (directory / "private-marker").write_text("do-not-leak", encoding="utf-8")
+        return 7
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": fail_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError) as exc_info:
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert "step1" in str(exc_info.value)
+    assert "exit code 7" in str(exc_info.value)
+    assert "do-not-leak" not in str(exc_info.value)
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    workflow = _manifest(work_dir).init_workflow
+    assert workflow["state"] == "step-1-failed"
+    assert workflow["phases"]["bottom"]["state"] == "step-1-failed"
+    assert workflow["phases"]["top"]["state"] == "planned"
+    root = work_dir / "init_mlff"
+    assert not (root / "top" / "ML_AB").exists()
+    assert not (root / "ML_ABN").exists()
+
+    retry = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": pytest.fail, "step2": pytest.fail},
+    )
+    with pytest.raises(InitMlffWorkflowError, match="step-1-failed|state invariant"):
+        InitMlffWorkflow(work_dir).run(retry)
+    assert retry.calls == []
+
+
+def test_adapter_exception_is_recorded_without_exposing_private_message(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def raise_step1(_directory):
+        raise RuntimeError("private VASP output must not leak")
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": raise_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError) as exc_info:
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    message = str(exc_info.value)
+    assert "step1 adapter invariant" in message
+    assert "RuntimeError" in message
+    assert "private VASP output" not in message
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("missing", "missing"),
+        ("empty", "empty"),
+        ("partial", "complete"),
+        ("malformed", "malformed"),
+        ("phase-mismatch", "phase structure"),
+        ("species-order-mismatch", "species order"),
+        ("position-mismatch", "positions"),
+        ("missing-ff", "ML_FFN"),
+        ("empty-ff", "ML_FFN"),
+    ],
+)
+def test_zero_step1_rejects_untrusted_outputs_before_step2(
+    tmp_path,
+    case,
+    expected,
+):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def invalid_step1(directory):
+        if case == "empty":
+            (directory / "ML_ABN").write_bytes(b"")
+        elif case == "partial":
+            shutil.copy2(MLAB_FIXTURES / "tail_force_crop.mlab", directory / "ML_ABN")
+        elif case == "malformed":
+            shutil.copy2(MLAB_FIXTURES / "internal_corruption.mlab", directory / "ML_ABN")
+        elif case == "phase-mismatch":
+            shutil.copy2(MLAB_FIXTURES / "complete_vasp_641.mlab", directory / "ML_ABN")
+        elif case == "species-order-mismatch":
+            text = (MLAB_FIXTURES / "complete_vasp_651.mlab").read_text(
+                encoding="utf-8"
+            )
+            text = text.replace(
+                "     O      1\n     Pt     1",
+                "     Pt     1\n     O      1",
+                1,
+            )
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
+        elif case == "position-mismatch":
+            text = (MLAB_FIXTURES / "complete_vasp_651.mlab").read_text(
+                encoding="utf-8"
+            )
+            text = text.replace(
+                "   0.000000000000000E+000  0.000000000000000E+000  1.000000000000000E+000",
+                "   0.000000000000000E+000  0.000000000000000E+000  1.500000000000000E+000",
+                1,
+            )
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
+        elif case in {"missing-ff", "empty-ff"}:
+            shutil.copy2(
+                MLAB_FIXTURES / "complete_vasp_651.mlab",
+                directory / "ML_ABN",
+            )
+        if case not in {"missing-ff", "empty-ff"}:
+            (directory / "ML_FFN").write_bytes(b"synthetic-force-field\n")
+        elif case == "empty-ff":
+            (directory / "ML_FFN").write_bytes(b"")
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": invalid_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError) as exc_info:
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    message = str(exc_info.value)
+    assert "step1 output invariant" in message
+    assert expected in message
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
+    root = work_dir / "init_mlff"
+    assert not (root / "top" / "ML_AB").exists()
+    assert not (root / "ML_ABN").exists()
+
+
+def test_handoff_interruption_leaves_no_formal_or_partial_top_seed(
+    tmp_path,
+    monkeypatch,
+):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    real_publish = atomic_io_module.atomic_file_publish_no_replace
+    calls = 0
+
+    def fail_second_file(candidate, destination):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic handoff interruption")
+        return real_publish(candidate, destination)
+
+    monkeypatch.setattr(
+        atomic_io_module,
+        "atomic_file_publish_no_replace",
+        fail_second_file,
+    )
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step1 handoff invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    assert not (root / "top" / "ML_AB").exists()
+    assert not (root / "top" / "ML_FF").exists()
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    _assert_no_seed_candidates(root)
+
+
+def test_handoff_post_rename_failure_rolls_back_the_unregistered_copy(
+    tmp_path,
+    monkeypatch,
+):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    real_publish = atomic_io_module.atomic_file_publish_no_replace
+    failed = False
+
+    def fail_after_first_rename(candidate, destination):
+        nonlocal failed
+        result = real_publish(candidate, destination)
+        if not failed:
+            failed = True
+            raise OSError("synthetic post-rename interruption")
+        return result
+
+    monkeypatch.setattr(
+        atomic_io_module,
+        "atomic_file_publish_no_replace",
+        fail_after_first_rename,
+    )
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step1 handoff invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    assert not (root / "top" / "ML_AB").exists()
+    assert not (root / "top" / "ML_FF").exists()
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
+    _assert_no_seed_candidates(root)
+
+
+def test_step2_ready_manifest_failure_rolls_back_handoff_files(tmp_path, monkeypatch):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    real_write_manifest = init_mlff_module.write_manifest
+    failed = False
+
+    def fail_ready_once(target_work_dir, manifest):
+        nonlocal failed
+        if manifest.init_workflow["state"] == "step-2-ready" and not failed:
+            failed = True
+            raise OSError("synthetic ready-state interruption")
+        return real_write_manifest(target_work_dir, manifest)
+
+    monkeypatch.setattr(init_mlff_module, "write_manifest", fail_ready_once)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step1 handoff invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    assert not (root / "top" / "ML_AB").exists()
+    assert not (root / "top" / "ML_FF").exists()
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
+    assert [call[0] for call in adapter.calls] == ["step1"]
+
+
+def test_nonzero_step2_preserves_bottom_evidence_and_failed_top_directory(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def fail_step2(directory):
+        (directory / "synthetic-output").write_text("kept", encoding="utf-8")
+        return 9
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": fail_step2},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step2.*exit code 9"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    workflow = _manifest(work_dir).init_workflow
+    assert workflow["state"] == "step-2-failed"
+    assert workflow["phases"]["bottom"]["state"] == "step-1-complete"
+    assert workflow["phases"]["top"]["state"] == "step-2-failed"
+    assert (root / "bottom" / "ML_ABN").is_file()
+    assert (root / "top" / "ML_AB").is_file()
+    assert (root / "top" / "synthetic-output").read_text(encoding="utf-8") == "kept"
+    assert not (root / "ML_ABN").exists()
+    assert not (root / "ML_FFN").exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("missing", "missing"),
+        ("malformed", "malformed"),
+        ("no-new", "new top"),
+        ("prefix-mismatch", "seed prefix"),
+        ("species-order-mismatch", "species order"),
+        ("position-mismatch", "positions"),
+    ],
+)
+def test_zero_step2_rejects_invalid_final_outputs(tmp_path, case, expected):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def invalid_step2(directory):
+        if case == "malformed":
+            shutil.copy2(MLAB_FIXTURES / "internal_corruption.mlab", directory / "ML_ABN")
+        elif case == "no-new":
+            shutil.copy2(
+                MLAB_FIXTURES / "complete_vasp_651.mlab",
+                directory / "ML_ABN",
+            )
+        elif case == "prefix-mismatch":
+            text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+            text = text.replace("-1.250000000000000E+000", "-9.250000000000000E+000", 1)
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
+        elif case == "species-order-mismatch":
+            text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+            prefix, separator, suffix = text.rpartition(
+                "     O      1\n     Pt     1"
+            )
+            assert separator
+            (directory / "ML_ABN").write_text(
+                prefix + "     Pt     1\n     O      1" + suffix,
+                encoding="utf-8",
+            )
+        elif case == "position-mismatch":
+            text = (MLAB_FIXTURES / "complete_multi.mlab").read_text(encoding="utf-8")
+            text = text.replace(
+                "   0.000000000000000E+000  0.000000000000000E+000  1.100000000000000E+000",
+                "   0.000000000000000E+000  0.000000000000000E+000  1.600000000000000E+000",
+                1,
+            )
+            (directory / "ML_ABN").write_text(text, encoding="utf-8")
+        if case != "missing":
+            (directory / "ML_FFN").write_bytes(b"synthetic-step2-force-field\n")
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": invalid_step2},
+    )
+
+    with pytest.raises(InitMlffWorkflowError) as exc_info:
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    message = str(exc_info.value)
+    assert "step2 output invariant" in message
+    assert expected in message
+    assert [call[0] for call in adapter.calls] == ["step1", "step2"]
+    root = work_dir / "init_mlff"
+    assert _manifest(work_dir).init_workflow["state"] == "step-2-failed"
+    assert not (root / "ML_ABN").exists()
+    assert not (root / "ML_FFN").exists()
+
+
+def test_final_publication_interruption_rolls_back_root_seed(tmp_path, monkeypatch):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    real_publish = atomic_io_module.atomic_file_publish_no_replace
+    calls = 0
+
+    def fail_final_second_file(candidate, destination):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise OSError("synthetic final publication interruption")
+        return real_publish(candidate, destination)
+
+    monkeypatch.setattr(
+        atomic_io_module,
+        "atomic_file_publish_no_replace",
+        fail_final_second_file,
+    )
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step2 publication invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    assert not (root / "ML_ABN").exists()
+    assert not (root / "ML_FFN").exists()
+    assert _manifest(work_dir).init_workflow["state"] == "step-2-failed"
+    assert (root / "top" / "ML_ABN").is_file()
+    assert (root / "top" / "ML_FFN").is_file()
+    _assert_no_seed_candidates(root)
+
+
+def test_complete_manifest_failure_rolls_back_root_seed(tmp_path, monkeypatch):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    real_write_manifest = init_mlff_module.write_manifest
+    failed = False
+
+    def fail_complete_once(target_work_dir, manifest):
+        nonlocal failed
+        if manifest.init_workflow["state"] == "complete" and not failed:
+            failed = True
+            raise OSError("synthetic complete-state interruption")
+        return real_write_manifest(target_work_dir, manifest)
+
+    monkeypatch.setattr(init_mlff_module, "write_manifest", fail_complete_once)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step2 publication invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    root = work_dir / "init_mlff"
+    assert not (root / "ML_ABN").exists()
+    assert not (root / "ML_FFN").exists()
+    assert _manifest(work_dir).init_workflow["state"] == "step-2-failed"
+    assert (root / "top" / "ML_ABN").is_file()
+    assert (root / "top" / "ML_FFN").is_file()
+
+
+def test_workflow_refuses_preexisting_publication_without_adapter(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    root = work_dir / "init_mlff"
+    (root / "ML_ABN").write_text("preexisting", encoding="utf-8")
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": pytest.fail, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="preflight invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert adapter.calls == []
+    assert (root / "ML_ABN").read_text(encoding="utf-8") == "preexisting"
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-ready"
+
+
+def test_workflow_refuses_static_input_drift_without_adapter(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    root = work_dir / "init_mlff"
+    (root / "bottom" / "INCAR").write_text("changed", encoding="utf-8")
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": pytest.fail, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="static input.*changed"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert adapter.calls == []
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-ready"
+
+
+def test_step1_rechecks_recorded_static_evidence_after_adapter_returns(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def mutate_step1_static(directory):
+        _write_valid_step1(directory)
+        with (directory / "INCAR").open("a", encoding="utf-8") as handle:
+            handle.write("# changed during calculation\n")
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": mutate_step1_static, "step2": pytest.fail},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step1 static-input invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1"]
+    assert _manifest(work_dir).init_workflow["state"] == "step-1-failed"
+
+
+def test_step2_rechecks_recorded_static_evidence_after_adapter_returns(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+
+    def mutate_step2_static(directory):
+        _write_valid_step2(directory)
+        with (directory / "KPOINTS").open("a", encoding="utf-8") as handle:
+            handle.write("# changed during calculation\n")
+        return 0
+
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": mutate_step2_static},
+    )
+
+    with pytest.raises(InitMlffWorkflowError, match="step2 static-input invariant"):
+        InitMlffWorkflow(work_dir).run(adapter)
+
+    assert [call[0] for call in adapter.calls] == ["step1", "step2"]
+    assert _manifest(work_dir).init_workflow["state"] == "step-2-failed"
+    assert not (work_dir / "init_mlff" / "ML_ABN").exists()
+
+
+@pytest.mark.parametrize(
+    ("workflow_state", "bottom_state", "top_state"),
+    [
+        ("planned", "planned", "planned"),
+        ("step-1-running", "step-1-running", "planned"),
+        ("step-1-failed", "step-1-failed", "planned"),
+    ],
+)
+def test_stage1_seed_gate_rejects_unpublished_automated_states_even_when_files_exist(
+    tmp_path,
+    workflow_state,
+    bottom_state,
+    top_state,
+):
+    config_path, work_dir = _prepare_workflow(tmp_path)
+    manifest = _manifest(work_dir)
+    workflow = manifest.init_workflow
+    workflow["state"] = workflow_state
+    workflow["phases"]["bottom"]["state"] = bottom_state
+    workflow["phases"]["top"]["state"] = top_state
+    write_manifest(work_dir, manifest)
+    root = work_dir / "init_mlff"
+    shutil.copy2(MLAB_FIXTURES / "complete_multi.mlab", root / "ML_ABN")
+    (root / "ML_FFN").write_bytes(b"unpublished-force-field\n")
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["stage"] = 1
+    config_path.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        run_build(config_path, wait=False)
+
+    message = str(exc_info.value)
+    assert f"state {workflow_state!r} is not complete" in message
+    assert not (work_dir / "md").exists()
+
+
+def test_stage1_consumes_the_hash_verified_published_seed_unchanged(tmp_path):
+    config_path, work_dir = _prepare_workflow(tmp_path, do_relaxation=True)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+    InitMlffWorkflow(work_dir).run(adapter)
+    root = work_dir / "init_mlff"
+    published = validate_published_init_mlff_seed(work_dir)
+    assert published is not None
+
+    relaxation = work_dir / "rlx" / "0_0"
+    shutil.copy2(relaxation / "POSCAR", relaxation / "CONTCAR")
+    (relaxation / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["stage"] = 1
+    config_path.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    run_build(config_path, wait=False)
+
+    md_dir = work_dir / "md" / "0_0"
+    assert (md_dir / "ML_AB").read_bytes() == (root / "ML_ABN").read_bytes()
+    assert (md_dir / "ML_FF").read_bytes() == (root / "ML_FFN").read_bytes()
+    assert _manifest(work_dir).mlff_seed == read_manifest(work_dir, "md").manifest.mlff_seed
+
+
+def test_stage1_rejects_published_seed_mutation_after_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    config_path, work_dir = _prepare_workflow(tmp_path, do_relaxation=True)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+    InitMlffWorkflow(work_dir).run(adapter)
+
+    relaxation = work_dir / "rlx" / "0_0"
+    shutil.copy2(relaxation / "POSCAR", relaxation / "CONTCAR")
+    (relaxation / "OUTCAR").write_text(
+        "reached required accuracy - stopping structural energy minimisation\n",
+        encoding="utf-8",
+    )
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["stage"] = 1
+    config_path.write_text(yaml.safe_dump(config_data), encoding="utf-8")
+
+    real_preflight = build_module.preflight_stage1
+
+    def mutate_after_preflight(config):
+        result = real_preflight(config)
+        force_field = work_dir / "init_mlff" / "ML_FFN"
+        payload = bytearray(force_field.read_bytes())
+        payload[0] ^= 1
+        force_field.write_bytes(payload)
+        return result
+
+    monkeypatch.setattr(build_module, "preflight_stage1", mutate_after_preflight)
+
+    with pytest.raises(RuntimeError, match="Prepared source identity changed since preflight"):
+        run_build(config_path, wait=False)
+
+    assert not (work_dir / "md" / "manifest.yaml").exists()
+
+
+def test_published_seed_hash_evidence_rejects_post_publication_tampering(tmp_path):
+    _config_path, work_dir = _prepare_workflow(tmp_path)
+    adapter = SyntheticCalculationAdapter(
+        work_dir,
+        {"step1": _write_valid_step1, "step2": _write_valid_step2},
+    )
+    InitMlffWorkflow(work_dir).run(adapter)
+    root = work_dir / "init_mlff"
+    (root / "ML_FFN").write_bytes(b"tampered-force-field\n")
+
+    with pytest.raises(InitMlffWorkflowError, match="ML_FFN hash changed"):
+        validate_published_init_mlff_seed(work_dir)
