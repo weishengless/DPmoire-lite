@@ -2,6 +2,9 @@
 
 英文说明见 [README.md](README.md)。详细工作流说明见 [workflow_CH.md](workflow_CH.md)，英文版见 [workflow.md](workflow.md)。
 
+使用代码 Agent 的新手可以从仓库级 `$dpmoire-guide` skill 和
+[Agent 新手指南](docs/dpmoire-agent-guide.zh-CN.md)开始。
+
 DPmoire-lite 是从原始 DPmoire 工作流中整理出来的干净 VASP 数据集生成框架。它用于生成双层或莫尔体系力场数据集所需的 VASP 计算目录，可选择提交 Slurm 作业，并从完成的计算中收集独立的 `extxyz` 数据集。
 
 这个项目只负责数据准备：不训练模型，也不会自动合并弛豫、MD 和验证集数据。

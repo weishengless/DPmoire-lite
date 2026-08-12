@@ -4,6 +4,10 @@ Chinese documentation is available in [README_CH.md](README_CH.md). A detailed
 workflow guide is available in [workflow.md](workflow.md), with the Chinese
 version in [workflow_CH.md](workflow_CH.md).
 
+Newcomers using a coding agent can start with the repository-scoped
+`$dpmoire-guide` skill and the Chinese
+[agent guide](docs/dpmoire-agent-guide.zh-CN.md).
+
 DPmoire-lite is a clean VASP dataset-generation framework extracted from the
 original DPmoire workflow. It generates calculation folders for bilayer or moire
 force-field dataset construction, submits optional Slurm jobs, and collects

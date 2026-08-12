@@ -1,0 +1,6 @@
+interface:
+  display_name: "DPmoire Agent Guide"
+  short_description: "Guide safe DPmoire-lite learning, runs, debugging, and edits"
+  default_prompt: "Use $dpmoire-guide to handle this DPmoire-lite task safely. Choose [LEARN], [RUN], [DEBUG], or [CHANGE], read the matching reference, and report evidence and stop conditions."
+policy:
+  allow_implicit_invocation: true
