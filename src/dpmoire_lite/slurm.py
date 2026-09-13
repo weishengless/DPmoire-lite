@@ -80,6 +80,7 @@ def render_array_submission_script(
         "",
         "ARRAY_FOLDERS=(" + " ".join(f'"{folder}"' for folder in folders) + ")",
         'TASK_ID="${SLURM_ARRAY_TASK_ID:?submit this script with sbatch}"',
+        'echo "DPmoire-lite array task $TASK_ID -> ${ARRAY_FOLDERS[$TASK_ID]} (job ${SLURM_JOB_ID:-unknown})"',
         'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"',
         'cd "$SCRIPT_DIR/${ARRAY_FOLDERS[$TASK_ID]}" || exit 1',
         "",

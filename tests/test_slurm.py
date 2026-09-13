@@ -179,6 +179,7 @@ def test_render_array_script_injects_array_line_overrides_and_mapping():
     assert "#SBATCH -e %x.%A.%a.err" in text
     assert 'ARRAY_FOLDERS=("0_0" "0_1" "0_2")' in text
     assert "SLURM_ARRAY_TASK_ID:?" in text
+    assert 'echo "DPmoire-lite array task $TASK_ID ->' in text
     assert text.index("#SBATCH --array=0-2") > text.index("#SBATCH -e err.%j")
     assert text.index("ARRAY_FOLDERS") > text.index("#SBATCH -e err.%j")
     assert text.index('cd "$SCRIPT_DIR') < text.index("mpirun")

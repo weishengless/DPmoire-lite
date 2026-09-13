@@ -13,7 +13,8 @@
   2. `#SBATCH -o %x.%A.%a.out` / `-e %x.%A.%a.err` 覆盖行，防止 array 任务
      互相覆盖用户模板中的 `-o out.%j` 类输出；
   3. 内嵌 `ARRAY_FOLDERS` 列表与按 `SLURM_ARRAY_TASK_ID` 的 `cd`，
-     `SCRIPT_DIR` 先定位脚本所在目录，因此从任意 CWD 提交均成立。
+     `SCRIPT_DIR` 先定位脚本所在目录，因此从任意 CWD 提交均成立；
+     任务开始时向输出文件 echo 一行 task → 目录映射便于排查。
 - 用户模板正文（module / 环境变量 / mpirun）逐字保留；各目录内的原脚本
   拷贝不受影响。
 - 每层一个 array 任务即一个完整节点作业；`>sout` 等 body 内重定向发生在
