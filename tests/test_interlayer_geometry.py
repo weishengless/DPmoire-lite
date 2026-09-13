@@ -417,3 +417,127 @@ def test_grid_shift_anchor_selects_atoms_different_from_sorted_default(tmp_path)
     assert [symbols[index] for index in anchors] == ["Te", "V"]
     assert anchors[0] in top_idx
     assert anchors[1] in bot_idx
+
+
+def _write_pair_candidate_inputs(root: Path) -> Path:
+    input_dir = root / "input"
+    input_dir.mkdir(parents=True)
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.3, 0.0, 3.0], [1.5, 1.0, 3.0]],
+            cell=[6.0, 6.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te", "Te"],
+            positions=[[0.6, 0.6, 3.0], [1.9, 0.6, 3.0], [0.6, 1.9, 3.0]],
+            cell=[6.0, 6.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    return input_dir
+
+
+def test_grid_shift_anchor_nearest_pair_pins_closest_element_pair(tmp_path):
+    input_dir = _write_pair_candidate_inputs(tmp_path)
+    handler = _handler(
+        input_dir,
+        tmp_path,
+        d=3.0,
+        grid_shift_anchor={"top": "Te", "bot": "Te", "selection": "nearest_pair"},
+    )
+
+    atoms = handler.shift_primitive_atoms(0, 0)
+
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    top_te = [i for i in handler.find_layer_idx(handler.new_struct)[0] if symbols[i] == "Te"]
+    bot_te = [i for i in handler.find_layer_idx(handler.new_struct)[1] if symbols[i] == "Te"]
+    assert [symbols[index] for index in anchors] == ["Te", "Te"]
+    assert anchors[0] != top_te[0]
+    assert anchors[1] == bot_te[0]
+    assert len(published.constraints) == 2
+    for constraint in published.constraints:
+        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+
+
+def test_grid_shift_anchor_bare_nearest_pair_pins_global_closest_pair(tmp_path):
+    input_dir = _write_pair_candidate_inputs(tmp_path)
+    handler = _handler(
+        input_dir, tmp_path, d=3.0, grid_shift_anchor={"selection": "nearest_pair"}
+    )
+
+    atoms = handler.shift_primitive_atoms(0, 0)
+
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    assert [symbols[index] for index in anchors] == ["Te", "Te"]
+    assert len(published.constraints) == 2
+
+
+def test_grid_shift_anchor_nearest_pair_tie_breaks_by_lowest_index(tmp_path):
+    input_dir = root = Path(tmp_path)
+    input_dir = root / "input"
+    input_dir.mkdir(parents=True)
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.3, 0.0, 3.0], [1.3, 2.6, 3.0]],
+            cell=[6.0, 6.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te", "Te"],
+            positions=[[0.6, 0.6, 3.0], [1.9, 0.6, 3.0], [1.9, 2.0, 3.0]],
+            cell=[6.0, 6.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    handler = _handler(
+        input_dir,
+        tmp_path,
+        d=3.0,
+        grid_shift_anchor={"top": "Te", "bot": "Te", "selection": "nearest_pair"},
+    )
+
+    atoms = handler.shift_primitive_atoms(0, 0)
+
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    top_te = [i for i in handler.find_layer_idx(handler.new_struct)[0] if symbols[i] == "Te"]
+    bot_te = [i for i in handler.find_layer_idx(handler.new_struct)[1] if symbols[i] == "Te"]
+    assert [symbols[index] for index in anchors] == ["Te", "Te"]
+    assert anchors[0] == top_te[0]
+    assert anchors[1] == bot_te[0]
+
+
+def test_grid_shift_anchor_nearest_pair_on_supercell_path(tmp_path):
+    input_dir = _write_pair_candidate_inputs(tmp_path)
+    handler = _handler(
+        input_dir,
+        tmp_path,
+        d=3.0,
+        grid_shift_anchor={"top": "Te", "bot": "Te", "selection": "nearest_pair"},
+    )
+
+    atoms = handler.shift_atoms(0, 0, c_constrain=True, sc=(2, 2))
+
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    assert len(published.constraints) == 2
+    for constraint in published.constraints:
+        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    assert [symbols[index] for index in anchors] == ["Te", "Te"]

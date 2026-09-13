@@ -10,6 +10,7 @@ import numpy as np
 from ase import Atoms
 from ase.build import make_supercell, sort, stack
 from ase.constraints import FixedLine
+from ase.geometry import get_distances
 from ase.io.vasp import read_vasp, write_vasp
 
 from .atomic_io import atomic_text_publish
@@ -119,20 +120,43 @@ def translate_indexes_z(atoms: Atoms, indexes: list[int], delta_z: float) -> Non
     atoms.set_positions(positions)
 
 
-def _anchor_index_for_layer(
+_ANCHOR_PAIR_DISTANCE_TOLERANCE = 1e-6
+
+
+def _element_candidates(
     symbols: list[str],
     indexes: list[int],
     symbol: str,
     layer_name: str,
-) -> int:
-    for index in indexes:
-        if symbols[index] == symbol:
-            return index
-    available = sorted({symbols[index] for index in indexes})
-    raise ValueError(
-        f"grid_shift_anchor element {symbol} was not found in the {layer_name} layer; "
-        f"available symbols: {available}"
+) -> list[int]:
+    candidates = [index for index in indexes if symbols[index] == symbol]
+    if not candidates:
+        available = sorted({symbols[index] for index in indexes})
+        raise ValueError(
+            f"grid_shift_anchor element {symbol} was not found in the {layer_name} layer; "
+            f"available symbols: {available}"
+        )
+    return candidates
+
+
+def _nearest_pair_indexes(
+    atoms: Atoms,
+    top_candidates: list[int],
+    bot_candidates: list[int],
+) -> list[int]:
+    _, length_matrix = get_distances(
+        atoms.positions[top_candidates],
+        atoms.positions[bot_candidates],
+        cell=atoms.cell,
+        pbc=atoms.pbc,
     )
+    minimum = float(length_matrix.min())
+    for top_offset, top_index in enumerate(top_candidates):
+        row = length_matrix[top_offset]
+        for bot_offset, bot_index in enumerate(bot_candidates):
+            if row[bot_offset] - minimum <= _ANCHOR_PAIR_DISTANCE_TOLERANCE:
+                return [int(top_index), int(bot_index)]
+    raise ValueError("grid_shift_anchor nearest-pair search found no candidate pair")
 
 
 def grid_shift_anchor_indexes(
@@ -144,10 +168,19 @@ def grid_shift_anchor_indexes(
     if selector is None:
         return [top_indexes[0], bot_indexes[0]]
     symbols = atoms.get_chemical_symbols()
-    return [
-        _anchor_index_for_layer(symbols, top_indexes, selector["top"], "top"),
-        _anchor_index_for_layer(symbols, bot_indexes, selector["bot"], "bot"),
-    ]
+    top_candidates = (
+        _element_candidates(symbols, top_indexes, selector["top"], "top")
+        if "top" in selector
+        else list(top_indexes)
+    )
+    bot_candidates = (
+        _element_candidates(symbols, bot_indexes, selector["bot"], "bot")
+        if "bot" in selector
+        else list(bot_indexes)
+    )
+    if selector.get("selection", "first") == "first":
+        return [top_candidates[0], bot_candidates[0]]
+    return _nearest_pair_indexes(atoms, top_candidates, bot_candidates)
 
 
 def _cell_z_length(atoms: Atoms) -> float:

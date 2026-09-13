@@ -219,3 +219,7 @@ grid_shift_anchors:
 - 设计决定（用户批准）：每层 1 个锚点、逐层元素选择器、缺省 auto、层内取
   首个匹配原子。动机：异质结两层元素不等价时（如 NbSe2/TaSe2），排序巧合
   会在下层固定金属、上层固定硫属。
+- 同日追记：新增 `selection: nearest_pair`（映射内）与裸关键字
+  `grid_shift_anchor: nearest_pair` —— 在两层候选集内按 PBC 最近配对选取
+  锚点，并列取索引序最小的一对。`first` 语义与缺省行为不变；物理契约
+  （每层 1 锚点、`[true, true, false]`、扩胞总数 2）不变。

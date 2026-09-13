@@ -393,6 +393,59 @@ def test_load_config_rejects_non_mapping_grid_shift_anchor(tmp_path):
         load_config(config_file)
 
 
+def test_load_config_accepts_nearest_pair_keyword(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor="nearest_pair")
+
+    config = load_config(config_file)
+
+    assert config.grid_shift_anchor == {"selection": "nearest_pair"}
+
+
+def test_load_config_accepts_selection_with_element_mapping(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        grid_shift_anchor={"top": "Ta", "bot": "Nb", "selection": "nearest_pair"},
+    )
+
+    config = load_config(config_file)
+
+    assert config.grid_shift_anchor == {
+        "top": "Ta",
+        "bot": "Nb",
+        "selection": "nearest_pair",
+    }
+
+
+def test_load_config_drops_explicit_first_selection(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"top": "Se", "bot": "Se", "selection": "first"})
+
+    config = load_config(config_file)
+
+    assert config.grid_shift_anchor == {"top": "Se", "bot": "Se"}
+
+
+def test_load_config_rejects_unknown_selection_value(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(
+        config_file,
+        grid_shift_anchor={"top": "Se", "bot": "Se", "selection": "closest"},
+    )
+
+    with pytest.raises(ConfigError, match="selection"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_selection_without_elements(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"selection": "nearest_pair"})
+
+    with pytest.raises(ConfigError, match="grid_shift_anchor"):
+        load_config(config_file)
+
+
 def test_load_config_ignores_reference_when_surface_gap(tmp_path):
     config_file = tmp_path / "config.yaml"
     write_config(

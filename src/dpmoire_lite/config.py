@@ -163,6 +163,8 @@ def normalize_grid_shift_anchor(value: Any) -> dict[str, str] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        if value == "nearest_pair":
+            return {"selection": "nearest_pair"}
         symbol = _normalize_element_symbol(value, "grid_shift_anchor")
         return {"top": symbol, "bot": symbol}
     if not isinstance(value, dict):
@@ -172,17 +174,23 @@ def normalize_grid_shift_anchor(value: Any) -> dict[str, str] | None:
     for key in value:
         if not isinstance(key, str):
             raise ConfigError(f"grid_shift_anchor keys must be strings: {key!r}")
-    allowed = {"top", "bot"}
+    allowed = {"top", "bot", "selection"}
     extra = sorted(set(value) - allowed)
     if extra:
         raise ConfigError(f"grid_shift_anchor has unknown keys: {', '.join(extra)}")
-    missing = sorted(allowed - set(value))
+    missing = sorted({"top", "bot"} - set(value))
     if missing:
         raise ConfigError(f"grid_shift_anchor is missing keys: {', '.join(missing)}")
-    return {
+    selection = value.get("selection", "first")
+    if selection not in ("first", "nearest_pair"):
+        raise ConfigError('grid_shift_anchor selection must be "first" or "nearest_pair"')
+    anchor = {
         "top": _normalize_element_symbol(value["top"], "grid_shift_anchor.top"),
         "bot": _normalize_element_symbol(value["bot"], "grid_shift_anchor.bot"),
     }
+    if selection == "nearest_pair":
+        anchor["selection"] = "nearest_pair"
+    return anchor
 
 
 def _normalize_outcar_patterns(value: Any) -> tuple[str, ...]:

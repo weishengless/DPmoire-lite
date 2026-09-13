@@ -54,7 +54,9 @@ Group keys before explaining them:
   by element (`top`/`bot` mapping, or one bare symbol for both layers). The
   element must exist in that layer and is validated before any directory is
   created. Without the key, the default stays the sorted first atom of each
-  layer.
+  layer. `selection: nearest_pair` switches the within-layer pick to the
+  closest-approaching cross-layer pair of the selected elements (ties to the
+  lowest atom index); the bare keyword `nearest_pair` skips element filtering.
 - `potcar_policy` selects POTCAR variants, but POTCAR bytes remain private and
   must never enter prompts, fixtures, logs, packages, or git.
 
