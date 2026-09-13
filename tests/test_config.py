@@ -326,6 +326,73 @@ def test_load_config_accepts_all_reference_keyword(tmp_path):
     assert config.d_reference == {"top": "all", "bot": "all"}
 
 
+def test_load_config_accepts_grid_shift_anchor_shorthand(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor="Se")
+
+    config = load_config(config_file)
+
+    assert config.grid_shift_anchor == {"top": "Se", "bot": "Se"}
+
+
+def test_load_config_accepts_grid_shift_anchor_per_layer(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"top": "Ta", "bot": "Nb"})
+
+    config = load_config(config_file)
+
+    assert config.grid_shift_anchor == {"top": "Ta", "bot": "Nb"}
+
+
+def test_load_config_grid_shift_anchor_defaults_to_auto(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.grid_shift_anchor is None
+
+
+def test_load_config_rejects_invalid_grid_shift_anchor_element(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"top": "Zz", "bot": "Nb"})
+
+    with pytest.raises(ConfigError, match="grid_shift_anchor"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_partial_grid_shift_anchor(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"top": "Se"})
+
+    with pytest.raises(ConfigError, match="grid_shift_anchor"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_unknown_grid_shift_anchor_keys(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"top": "Se", "bot": "Se", "mid": "Se"})
+
+    with pytest.raises(ConfigError, match="grid_shift_anchor"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_non_string_grid_shift_anchor_keys(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor={"top": "Se", "bot": "Se", 1: "Se"})
+
+    with pytest.raises(ConfigError, match="grid_shift_anchor"):
+        load_config(config_file)
+
+
+def test_load_config_rejects_non_mapping_grid_shift_anchor(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, grid_shift_anchor=["Se", "Se"])
+
+    with pytest.raises(ConfigError, match="grid_shift_anchor"):
+        load_config(config_file)
+
+
 def test_load_config_ignores_reference_when_surface_gap(tmp_path):
     config_file = tmp_path / "config.yaml"
     write_config(

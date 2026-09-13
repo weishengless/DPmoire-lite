@@ -119,6 +119,37 @@ def translate_indexes_z(atoms: Atoms, indexes: list[int], delta_z: float) -> Non
     atoms.set_positions(positions)
 
 
+def _anchor_index_for_layer(
+    symbols: list[str],
+    indexes: list[int],
+    symbol: str,
+    layer_name: str,
+) -> int:
+    for index in indexes:
+        if symbols[index] == symbol:
+            return index
+    available = sorted({symbols[index] for index in indexes})
+    raise ValueError(
+        f"grid_shift_anchor element {symbol} was not found in the {layer_name} layer; "
+        f"available symbols: {available}"
+    )
+
+
+def grid_shift_anchor_indexes(
+    atoms: Atoms,
+    top_indexes: list[int],
+    bot_indexes: list[int],
+    selector: dict[str, str] | None,
+) -> list[int]:
+    if selector is None:
+        return [top_indexes[0], bot_indexes[0]]
+    symbols = atoms.get_chemical_symbols()
+    return [
+        _anchor_index_for_layer(symbols, top_indexes, selector["top"], "top"),
+        _anchor_index_for_layer(symbols, bot_indexes, selector["bot"], "bot"),
+    ]
+
+
 def _cell_z_length(atoms: Atoms) -> float:
     c_z = float(atoms.cell.array[2, 2])
     if abs(c_z) > 1e-12:
@@ -197,8 +228,9 @@ class StructureHandler:
         d: float,
         d_mode: str = "surface_gap",
         d_reference: dict[str, str | tuple[str, ...]] | None = None,
+        grid_shift_anchor: dict[str, str] | None = None,
     ):
-        self._configure(input_dir, work_dir, n_sectors, d, d_mode, d_reference)
+        self._configure(input_dir, work_dir, n_sectors, d, d_mode, d_reference, grid_shift_anchor)
         self.read_all_layers()
         self._build_combined_structure()
 
@@ -213,9 +245,12 @@ class StructureHandler:
         bot_atoms: Atoms,
         d_mode: str = "surface_gap",
         d_reference: dict[str, str | tuple[str, ...]] | None = None,
+        grid_shift_anchor: dict[str, str] | None = None,
     ) -> StructureHandler:
         handler = cls.__new__(cls)
-        handler._configure(input_dir, work_dir, n_sectors, d, d_mode, d_reference)
+        handler._configure(
+            input_dir, work_dir, n_sectors, d, d_mode, d_reference, grid_shift_anchor
+        )
         handler.top_atoms = top_atoms.copy()
         handler.bot_atoms = bot_atoms.copy()
         handler._build_combined_structure()
@@ -229,6 +264,7 @@ class StructureHandler:
         d: float,
         d_mode: str,
         d_reference: dict[str, str | tuple[str, ...]] | None,
+        grid_shift_anchor: dict[str, str] | None,
     ) -> None:
         self.input_dir = Path(input_dir)
         self.work_dir = Path(work_dir)
@@ -236,6 +272,7 @@ class StructureHandler:
         self.d = d
         self.d_mode = d_mode
         self.d_reference = d_reference
+        self.grid_shift_anchor = grid_shift_anchor
         self.top_atoms: Atoms | None = None
         self.bot_atoms: Atoms | None = None
         self.top_indexes: list[int] = []
@@ -244,6 +281,12 @@ class StructureHandler:
 
     def _build_combined_structure(self) -> None:
         self.new_struct, self.top_indexes, self.bot_indexes = self.build_new_struct(d=self.d)
+        grid_shift_anchor_indexes(
+            self.new_struct,
+            self.top_indexes,
+            self.bot_indexes,
+            self.grid_shift_anchor,
+        )
 
     def read_atoms(self, in_file: Path | str) -> Atoms:
         path = Path(in_file)
@@ -372,7 +415,8 @@ class StructureHandler:
         atoms_sc = sort(make_supercell(prim=atoms, P=supercell_matrix(sc)))
         top_idx, bot_idx = self.find_layer_idx(atoms_sc)
         if c_constrain:
-            cons = FixedLine([top_idx[0], bot_idx[0]], direction=atoms_sc.cell.array[2] / atoms_sc.cell.lengths()[2])
+            anchor_indexes = grid_shift_anchor_indexes(atoms_sc, top_idx, bot_idx, self.grid_shift_anchor)
+            cons = FixedLine(anchor_indexes, direction=atoms_sc.cell.array[2] / atoms_sc.cell.lengths()[2])
             atoms_sc.set_constraint(cons)
         return atoms_sc
 
@@ -380,7 +424,8 @@ class StructureHandler:
         atoms = self._shift_primitive(i, j)
         if c_constrain:
             top_idx, bot_idx = self.find_layer_idx(atoms)
-            cons = FixedLine([top_idx[0], bot_idx[0]], direction=atoms.cell.array[2] / atoms.cell.lengths()[2])
+            anchor_indexes = grid_shift_anchor_indexes(atoms, top_idx, bot_idx, self.grid_shift_anchor)
+            cons = FixedLine(anchor_indexes, direction=atoms.cell.array[2] / atoms.cell.lengths()[2])
             atoms.set_constraint(cons)
         return atoms
 

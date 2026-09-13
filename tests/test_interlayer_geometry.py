@@ -1,9 +1,10 @@
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
 import pytest
 from ase import Atoms
-from ase.io.vasp import write_vasp
+from ase.io.vasp import read_vasp, write_vasp
 
 from dpmoire_lite._find_homo_twist import adjust_atoms_d
 from dpmoire_lite.structures import StructureHandler
@@ -118,8 +119,17 @@ def _handler(
     d: float,
     d_mode: str = "surface_gap",
     d_reference: dict[str, str | tuple[str, ...]] | None = None,
+    grid_shift_anchor: dict[str, str] | None = None,
 ) -> StructureHandler:
-    return StructureHandler(input_dir, tmp_path / f"work-{d}-{d_mode}", (1, 1), d, d_mode, d_reference)
+    return StructureHandler(
+        input_dir,
+        tmp_path / f"work-{d}-{d_mode}",
+        (1, 1),
+        d,
+        d_mode,
+        d_reference,
+        grid_shift_anchor,
+    )
 
 
 def test_surface_gap_mode_uses_boundary_gap_for_thick_layers(tmp_path):
@@ -296,3 +306,114 @@ def test_adjust_atoms_d_preserves_cells_while_setting_surface_gap():
     np.testing.assert_allclose(adjusted_top.cell.array, top_cell)
     np.testing.assert_allclose(adjusted_bot.cell.array, bot_cell)
     assert adjusted_top.positions[:, 2].min() - adjusted_bot.positions[:, 2].max() == pytest.approx(5.5)
+
+
+def _published_anchors(atoms: Atoms):
+    buffer = StringIO()
+    write_vasp(buffer, atoms, direct=True)
+    buffer.seek(0)
+    published = read_vasp(buffer)
+    anchors = [
+        int(index)
+        for constraint in published.constraints
+        for index in np.asarray(constraint.index).reshape(-1)
+    ]
+    return published, anchors
+
+
+def test_shift_primitive_atoms_defaults_to_first_atom_of_each_layer(tmp_path):
+    input_dir = _write_pto3_on_pt_inputs(tmp_path)
+    handler = _handler(input_dir, tmp_path, d=3.0)
+
+    atoms = handler.shift_primitive_atoms(0, 0)
+
+    top_idx, bot_idx = handler.find_layer_idx(handler.new_struct)
+    _, anchors = _published_anchors(atoms)
+    assert anchors == [top_idx[0], bot_idx[0]]
+
+
+def test_shift_primitive_atoms_uses_grid_shift_anchor_elements(tmp_path):
+    input_dir = _write_pto3_on_pt_inputs(tmp_path)
+    handler = _handler(input_dir, tmp_path, d=3.0, grid_shift_anchor={"top": "O", "bot": "Pt"})
+
+    atoms = handler.shift_primitive_atoms(0, 0)
+
+    top_idx, bot_idx = handler.find_layer_idx(handler.new_struct)
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    assert [symbols[index] for index in anchors] == ["O", "Pt"]
+    assert anchors[0] in top_idx
+    assert anchors[1] in bot_idx
+    assert len(published.constraints) == 2
+    for constraint in published.constraints:
+        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+
+
+def test_shift_atoms_supercell_path_uses_grid_shift_anchor_elements(tmp_path):
+    input_dir = _write_mixed_inputs(tmp_path)
+    handler = _handler(input_dir, tmp_path, d=3.0, grid_shift_anchor={"top": "Te", "bot": "V"})
+
+    atoms = handler.shift_atoms(0, 0, c_constrain=True, sc=(2, 2))
+
+    top_idx, bot_idx = handler.find_layer_idx(atoms)
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    assert len(published.constraints) == 2
+    for constraint in published.constraints:
+        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    assert [symbols[index] for index in anchors] == ["Te", "V"]
+    assert sorted(anchors) != sorted([top_idx[0], bot_idx[0]])
+    assert anchors[0] in top_idx
+    assert anchors[1] in bot_idx
+    assert len(published.constraints) == 2
+    for constraint in published.constraints:
+        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+
+
+def test_grid_shift_anchor_fails_when_element_missing_from_layer(tmp_path):
+    input_dir = _write_pto3_on_pt_inputs(tmp_path)
+
+    with pytest.raises(ValueError, match="Mo"):
+        _handler(input_dir, tmp_path, d=3.0, grid_shift_anchor={"top": "O", "bot": "Mo"})
+
+
+def _write_mixed_inputs(root: Path) -> Path:
+    input_dir = root / "input"
+    input_dir.mkdir(parents=True)
+    write_vasp(
+        input_dir / "top_layer.poscar",
+        Atoms(
+            ["Nb", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=[4.0, 4.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    write_vasp(
+        input_dir / "bot_layer.poscar",
+        Atoms(
+            ["V", "Te"],
+            positions=[[0.0, 0.0, 3.0], [1.0, 1.0, 3.0]],
+            cell=[4.0, 4.0, 12.0],
+            pbc=True,
+        ),
+        direct=True,
+    )
+    return input_dir
+
+
+def test_grid_shift_anchor_selects_atoms_different_from_sorted_default(tmp_path):
+    input_dir = _write_mixed_inputs(tmp_path)
+    handler = _handler(input_dir, tmp_path, d=3.0, grid_shift_anchor={"top": "Te", "bot": "V"})
+
+    atoms = handler.shift_primitive_atoms(0, 0)
+
+    top_idx, bot_idx = handler.find_layer_idx(handler.new_struct)
+    published, anchors = _published_anchors(atoms)
+    symbols = published.get_chemical_symbols()
+    assert anchors[0] != top_idx[0]
+    assert anchors[1] != bot_idx[0]
+    assert [symbols[index] for index in anchors] == ["Te", "V"]
+    assert anchors[0] in top_idx
+    assert anchors[1] in bot_idx

@@ -970,6 +970,7 @@ def _read_structures(
             input_atoms["bot_layer"],
             config.d_mode,
             config.d_reference,
+            config.grid_shift_anchor,
         )
     except Exception as exc:
         diagnostics.append(

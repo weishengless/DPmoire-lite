@@ -41,6 +41,9 @@ d_mode: surface_gap     #surface_gap: min_z(top)-max_z(bot); reference_plane_gap
 #d_reference:           #Optional, only used by reference_plane_gap.
 #  top: [Mo]
 #  bot: [Mo]
+#grid_shift_anchor:     #Optional, choose the two anti-slide anchor atoms by element. Default: first atom of each layer in sorted order.
+#  top: Mo              #Element pinned in the top layer (written as F F T); must exist in that layer.
+#  bot: Mo              #Element pinned in the bottom layer. A bare value like grid_shift_anchor: Mo pins both layers.
 n_sectors: 9            #Stacking-shift grid. An integer means [n, n]; a pair [m, n] allows rectangular grids.
 symm_reduce: true        #Reduce shift structures according to symmetry.
 

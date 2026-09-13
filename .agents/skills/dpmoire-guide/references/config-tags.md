@@ -34,7 +34,7 @@ Group keys before explaining them:
 | Execution controls | `stage`, `submit`, `auto_resub` |
 | Engine and collection | `vasp_ml`, `outcar_collect_freq`, `outcar_patterns` |
 | Init and stage generation | `do_relaxation`, `init_mlff`, `init_mlff_mode`, `init_bottom_incar`, `init_top_incar`, `sc_rlx`, `include_monolayer_md` |
-| Geometry and sampling | `n_sectors`, `sc`, `d`, `d_mode`, `d_reference`, `k_mesh`, `encut_factor`, `r_cut`, `symm_reduce`, `twist_val`, `min_val_n`, `max_val_n`, `preserve_grid_shift_md` |
+| Geometry and sampling | `n_sectors`, `sc`, `d`, `d_mode`, `d_reference`, `k_mesh`, `encut_factor`, `r_cut`, `symm_reduce`, `twist_val`, `min_val_n`, `max_val_n`, `preserve_grid_shift_md`, `grid_shift_anchor` |
 
 ## Configuration Traps
 
@@ -50,6 +50,11 @@ Group keys before explaining them:
   strings. It does not control MLFF MD collection.
 - `preserve_grid_shift_md: true` preserves only DPmoire-lite grid-shift anchors;
   it is not a request to preserve every selective-dynamics constraint.
+- `grid_shift_anchor` pins exactly one anti-slide anchor atom per layer, chosen
+  by element (`top`/`bot` mapping, or one bare symbol for both layers). The
+  element must exist in that layer and is validated before any directory is
+  created. Without the key, the default stays the sorted first atom of each
+  layer.
 - `potcar_policy` selects POTCAR variants, but POTCAR bytes remain private and
   must never enter prompts, fixtures, logs, packages, or git.
 

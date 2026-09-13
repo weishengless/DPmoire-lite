@@ -159,6 +159,32 @@ def normalize_d_reference(value: Any) -> dict[str, str | tuple[str, ...]] | None
     }
 
 
+def normalize_grid_shift_anchor(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        symbol = _normalize_element_symbol(value, "grid_shift_anchor")
+        return {"top": symbol, "bot": symbol}
+    if not isinstance(value, dict):
+        raise ConfigError(
+            "grid_shift_anchor must be an element symbol or a mapping with top and bot keys"
+        )
+    for key in value:
+        if not isinstance(key, str):
+            raise ConfigError(f"grid_shift_anchor keys must be strings: {key!r}")
+    allowed = {"top", "bot"}
+    extra = sorted(set(value) - allowed)
+    if extra:
+        raise ConfigError(f"grid_shift_anchor has unknown keys: {', '.join(extra)}")
+    missing = sorted(allowed - set(value))
+    if missing:
+        raise ConfigError(f"grid_shift_anchor is missing keys: {', '.join(missing)}")
+    return {
+        "top": _normalize_element_symbol(value["top"], "grid_shift_anchor.top"),
+        "bot": _normalize_element_symbol(value["bot"], "grid_shift_anchor.bot"),
+    }
+
+
 def _normalize_outcar_patterns(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         message = OUTCAR_PATTERNS_SHAPE_ERROR
@@ -222,6 +248,7 @@ class DPmoireLiteConfig:
     max_val_n: int
     include_monolayer_md: bool
     preserve_grid_shift_md: bool = False
+    grid_shift_anchor: dict[str, str] | None = None
     init_mlff_mode: str = "manual"
     init_bottom_incar: Path | None = None
     init_top_incar: Path | None = None
@@ -362,6 +389,7 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         outcar_patterns = _normalize_outcar_patterns(list(DEFAULT_OUTCAR_PATTERNS))
     d_mode = normalize_d_mode(raw.get("d_mode", "surface_gap"))
     d_reference = normalize_d_reference(raw.get("d_reference")) if d_mode == "reference_plane_gap" else None
+    grid_shift_anchor = normalize_grid_shift_anchor(raw.get("grid_shift_anchor"))
     potcar_policy = normalize_potcar_policy(raw.get("potcar_policy", "recommend"))
     input_dir = _resolve_path(base, _require(raw, "input_dir"))
     init_mlff = _bool(_require(raw, "init_mlff"), "init_mlff")
@@ -414,6 +442,7 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         d=_float(_require(raw, "d"), "d"),
         d_mode=d_mode,
         d_reference=d_reference,
+        grid_shift_anchor=grid_shift_anchor,
         potcar_policy=potcar_policy,
         k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
         encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),

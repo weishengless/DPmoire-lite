@@ -92,7 +92,7 @@ $dpmoire-guide [CHANGE]
   `init_bottom_incar`、`init_top_incar`、`sc_rlx`、`include_monolayer_md`。
 - 结构与采样：`n_sectors`、`sc`、`d`、`d_mode`、`d_reference`、`k_mesh`、
   `encut_factor`、`r_cut`、`symm_reduce`、`twist_val`、`min_val_n`、
-  `max_val_n`、`preserve_grid_shift_md`。
+  `max_val_n`、`preserve_grid_shift_md`、`grid_shift_anchor`。
 
 所有配置键使用 snake_case。`VASP_ML`、`K-mesh`、`POTCAR_dir`、
 `DFT_script`、`ENMAX`、`OUTCAR_collect_freq` 等旧写法会被拒绝。

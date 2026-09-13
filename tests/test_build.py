@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 import dpmoire_lite.build as build_module
+import dpmoire_lite.build_preflight as build_preflight_module
 from dpmoire_lite.build import _ordered_elements, build_stage0, build_stage1, build_stage_all, run_build
 from dpmoire_lite.config import ConfigError, load_config
 from dpmoire_lite.incar import parse_incar
@@ -256,6 +257,7 @@ def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_
         vasp_ml=False,
         twist_val=False,
         encut_factor=1.5,
+        grid_shift_anchor={"top": "Te", "bot": "V"},
     )
     potcar_payloads = write_mixed_layer_inputs(tmp_path)
 
@@ -856,3 +858,28 @@ def test_parse_sacct_states_maps_states():
 def test_slurm_job_records_path():
     job = SlurmJob(job_id="12345", path="rlx/0_0", status="SUBMITTED")
     assert job.path == "rlx/0_0"
+
+
+def test_config_summary_records_grid_shift_anchor(tmp_path):
+    config_path = write_build_config(tmp_path, grid_shift_anchor={"top": "H", "bot": "H"})
+    config = load_config(config_path)
+
+    class _FakeCutoff:
+        def audit_record(self):
+            return {}
+
+    summary = build_module._config_summary(config, _FakeCutoff())
+
+    assert summary["grid_shift_anchor"] == {"top": "H", "bot": "H"}
+
+
+def test_preflight_stage0_rejects_bad_anchor_before_creating_directories(tmp_path):
+    config_path = write_build_config(tmp_path, grid_shift_anchor={"top": "H", "bot": "Mo"})
+    config = load_config(config_path)
+
+    with pytest.raises(RuntimeError, match="not found in the bot layer"):
+        build_preflight_module.preflight_stage0(config)
+
+    assert not config.work_dir.exists()
+    assert not (config.work_dir / "rlx").exists()
+    assert not (config.work_dir / "init_mlff").exists()

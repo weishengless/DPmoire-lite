@@ -1338,6 +1338,9 @@ def _config_summary(
         "d": config.d,
         "d_mode": config.d_mode,
         "d_reference": d_reference,
+        "grid_shift_anchor": dict(config.grid_shift_anchor)
+        if config.grid_shift_anchor
+        else None,
         "potcar_policy": config.potcar_policy,
         "init_mlff_mode": config.init_mlff_mode,
         "k_mesh": config.k_mesh,
