@@ -257,6 +257,8 @@ class DPmoireLiteConfig:
     include_monolayer_md: bool
     preserve_grid_shift_md: bool = False
     grid_shift_anchor: dict[str, str] | None = None
+    array_submission: bool = False
+    array_max_concurrent: int = 0
     init_mlff_mode: str = "manual"
     init_bottom_incar: Path | None = None
     init_top_incar: Path | None = None
@@ -398,6 +400,10 @@ def load_config(path: Path) -> DPmoireLiteConfig:
     d_mode = normalize_d_mode(raw.get("d_mode", "surface_gap"))
     d_reference = normalize_d_reference(raw.get("d_reference")) if d_mode == "reference_plane_gap" else None
     grid_shift_anchor = normalize_grid_shift_anchor(raw.get("grid_shift_anchor"))
+    array_submission = _bool(raw.get("array_submission", False), "array_submission")
+    array_max_concurrent = _int(raw.get("array_max_concurrent", 0), "array_max_concurrent")
+    if array_max_concurrent < 0:
+        raise ConfigError("array_max_concurrent must be a non-negative integer")
     potcar_policy = normalize_potcar_policy(raw.get("potcar_policy", "recommend"))
     input_dir = _resolve_path(base, _require(raw, "input_dir"))
     init_mlff = _bool(_require(raw, "init_mlff"), "init_mlff")
@@ -451,6 +457,8 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         d_mode=d_mode,
         d_reference=d_reference,
         grid_shift_anchor=grid_shift_anchor,
+        array_submission=array_submission,
+        array_max_concurrent=array_max_concurrent,
         potcar_policy=potcar_policy,
         k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
         encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),

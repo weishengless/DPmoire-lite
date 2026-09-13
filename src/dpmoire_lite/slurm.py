@@ -56,6 +56,37 @@ def parse_sacct_states(output: str) -> dict[str, str]:
     return states
 
 
+def render_array_submission_script(
+    template_text: str,
+    folders: list[str],
+    max_concurrent: int = 0,
+) -> str:
+    if not folders:
+        raise ValueError("Array submission script requires a non-empty folder list")
+    lines = template_text.splitlines()
+    sbatch_indexes = [i for i, line in enumerate(lines) if line.startswith("#SBATCH")]
+    if not sbatch_indexes:
+        raise ValueError(
+            "Array submission script requires a template with #SBATCH headers"
+        )
+    insertion = sbatch_indexes[-1] + 1
+    array_target = f"0-{len(folders) - 1}"
+    if max_concurrent > 0:
+        array_target = f"{array_target}%{max_concurrent}"
+    injected = [
+        "#SBATCH --array=" + array_target,
+        "#SBATCH -o %x.%A.%a.out",
+        "#SBATCH -e %x.%A.%a.err",
+        "",
+        "ARRAY_FOLDERS=(" + " ".join(f'"{folder}"' for folder in folders) + ")",
+        'TASK_ID="${SLURM_ARRAY_TASK_ID:?submit this script with sbatch}"',
+        'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"',
+        'cd "$SCRIPT_DIR/${ARRAY_FOLDERS[$TASK_ID]}" || exit 1',
+        "",
+    ]
+    return "\n".join(lines[:insertion] + injected + lines[insertion:]) + "\n"
+
+
 class SlurmRunner:
     def __init__(self, script_name: str, n_nodes: int, auto_resub: bool):
         self.script_name = script_name

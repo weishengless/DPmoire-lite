@@ -8,6 +8,7 @@
 - Added `surface_gap` mode, where `d` sets `min_z(top) - max_z(bot)`.
 - Added `reference_plane_gap` mode with optional `d_reference` selectors, where `d` sets the selected reference-plane mean-z distance.
 - Added `grid_shift_anchor` to choose the two grid-shift anti-slide anchor atoms by element (one per layer; per-layer mapping or one symbol for both). Defaults keep the previous sorted first-atom anchors, and invalid elements fail preflight before any directory is created. `selection: nearest_pair` (or the bare `nearest_pair` keyword) pins the closest-approaching cross-layer atom pair instead of the first match.
+- Added opt-in `array_submission` (with optional `array_max_concurrent` throttling) that generates one Slurm array submission script per stage root (`rlx/`, `md/`) from the user's `dft_script` template, so a whole stage can be submitted with a single `sbatch` instead of one job per folder. The generated script wraps the template verbatim, maps `SLURM_ARRAY_TASK_ID` to each calculation folder, appends collision-free `%A_%a` output overrides, and is recorded in the stage manifest; submission itself stays manual.
 - Added `potcar_policy` with `recommend` and `minimal` modes for choosing VASP-recommended or lowest-`ZVAL` regular POTCAR variants.
 - Added typed `--mlff-collect-mode seed-aware|full-dedup` collection. The
   seed-aware default validates immutable seed provenance, while explicit

@@ -278,6 +278,8 @@ rejected.
 | `init_top_incar` | relative path | Top-phase INCAR template under `input_dir`; required by `single-job`. |
 | `sc_rlx` | bool | If `true`, relax supercell stacking structures. If `false`, relax primitive glide structures and expand the converged CONTCAR during stage1. |
 | `preserve_grid_shift_md` | bool | Stage1 defaults to clearing all constraints. If `true`, preserve only DPmoire-lite grid-shift anchors; `F F T` means fixed x/y and movable z. |
+| `array_submission` | bool | If `true`, generate one Slurm array script per stage root (`rlx/array_<dft_script>`, `md/array_<dft_script>`; `init_mlff` and `validation` excluded). The generated script wraps your `dft_script` template verbatim, injects `#SBATCH --array=0-N`, appends `-o %x.%A.%a.out` / `-e %x.%A.%a.err` overrides so array tasks cannot overwrite each other's output, and maps `SLURM_ARRAY_TASK_ID` to each calculation folder. Submit it once with `sbatch`; per-folder original scripts stay untouched. Generation only — nothing is submitted automatically. Defaults to `false`. |
+| `array_max_concurrent` | non-negative int | With `array_submission` enabled, a value greater than zero injects `--array=0-N%K` to cap concurrently running tasks. Defaults to `0` (no cap). |
 | `n_sectors` | int or `[nx, ny]` | Stacking-shift grid. `9` means `[9, 9]`; `[9, 8]` creates a rectangular grid. |
 | `sc` | int or `[sx, sy]` | Supercell expansion used for MD and, when `sc_rlx: true`, relaxation. `2` means `[2, 2]`. |
 | `d` | number | Distance value interpreted according to `d_mode`. |

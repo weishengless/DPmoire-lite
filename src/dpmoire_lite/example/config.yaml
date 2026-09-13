@@ -45,6 +45,8 @@ d_mode: surface_gap     #surface_gap: min_z(top)-max_z(bot); reference_plane_gap
 #  top: Mo              #Element pinned in the top layer (written as F F T); must exist in that layer.
 #  bot: Mo              #Element pinned in the bottom layer. A bare value like grid_shift_anchor: Mo pins both layers.
 #  selection: nearest_pair  #Optional: pin the closest-approaching pair of the selected elements instead of the first match (ties -> lowest atom index).
+array_submission: false  #true: generate one Slurm array script per stage root (rlx/array_<script>, md/array_<script>) wrapping your dft_script; submit the generated script once with sbatch. init_mlff and validation excluded.
+array_max_concurrent: 0  #>0 caps concurrently running array tasks (--array=0-N%K); 0 = no cap. Requires array_submission: true.
 n_sectors: 9            #Stacking-shift grid. An integer means [n, n]; a pair [m, n] allows rectangular grids.
 symm_reduce: true        #Reduce shift structures according to symmetry.
 

@@ -203,6 +203,8 @@ build CLI 在没有执行任何 `sbatch` 时输出 `build status=generated`，�
 | `init_top_incar` | 相对路径 | `input_dir` 下的 top phase INCAR 模板；`single-job` 必填。 |
 | `sc_rlx` | 布尔值 | `true` 表示弛豫超胞堆垛结构；`false` 表示只弛豫 primitive glide structure，并在 stage1 根据 CONTCAR 扩胞。 |
 | `preserve_grid_shift_md` | 布尔值 | Stage1 默认清除全部约束。设为 `true` 时只保留 DPmoire-lite 的网格平移锚点；`F F T` 表示固定 x/y、允许 z 移动。 |
+| `array_submission` | 布尔值 | 设为 `true` 时在每个 stage 根目录生成一个 Slurm array 提交脚本（`rlx/array_<dft_script>`、`md/array_<dft_script>`；`init_mlff` 与 `validation` 排除）。生成的脚本逐字保留你的 `dft_script` 模板，注入 `#SBATCH --array=0-N`，追加 `-o %x.%A.%a.out` / `-e %x.%A.%a.err` 覆盖行以避免 array 任务互相覆盖输出，并把 `SLURM_ARRAY_TASK_ID` 映射到各计算目录。用 `sbatch` 提交一次即可；各目录内的原脚本不动。只生成、不自动提交。默认 `false`。 |
+| `array_max_concurrent` | 非负整数 | `array_submission` 开启时，大于 0 会注入 `--array=0-N%K` 限制同时运行的任务数。默认 `0`（不限）。 |
 | `n_sectors` | 整数或 `[nx, ny]` | 堆垛平移采样网格。`9` 等价于 `[9, 9]`，`[9, 8]` 表示矩形网格。 |
 | `sc` | 整数或 `[sx, sy]` | MD 使用的超胞扩展；当 `sc_rlx: true` 时也用于弛豫。`2` 等价于 `[2, 2]`。 |
 | `d` | 数值 | 距离数值，具体物理含义由 `d_mode` 决定。 |

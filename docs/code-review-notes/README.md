@@ -26,6 +26,7 @@ MD restart 自动化、CI matrix 和 lint/type-check 基础设施已单独暂缓
 | --- | --- | --- | --- |
 | P0 | 仓库卫生 | `example-test/` 整体忽略，只裁剪可再分发 fixture，POTCAR 不入库 | [P0](P0-repository-hygiene.md) |
 | P1-1 | MD Selective Dynamics | 默认清除全部约束；保留模式只接受 manifest 记录的两个项目锚点 | [P1-1](P1-1-md-selective-dynamics.md) |
+| Array submission scripts | 2026-09-13 新增 | array_submission 只生成不提交；用户模板逐字保留，注入 array 行、输出覆盖与目录映射 | [array-submission-scripts](array-submission-scripts.md) |
 | P1-2 gate | 自动化安全门 | 完整 Slurm 修复前 fail-closed `stage: all` 和 submitted `--wait` | [P1-2 gate](P1-2-automation-safety-gate.md) |
 | P1-4 | INCAR 安全改写 | 只控制 ENCUT/ML_RCUT；安全解析合法语法；重复冲突预检 | [P1-4](P1-4-incar-safe-rendering.md) |
 | P1-5 | Stage provenance | 新 manifest 严格校验；旧 manifest 以原子数和晶胞双判据兼容 | [P1-5](P1-5-stage-provenance.md) |

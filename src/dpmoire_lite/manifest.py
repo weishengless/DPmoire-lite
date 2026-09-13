@@ -55,6 +55,7 @@ _MANIFEST_FIELDS = {
     "mlff_seed",
     "init_workflow",
     "partial",
+    "array_scripts",
 }
 
 
@@ -77,6 +78,7 @@ class Manifest:
     mlff_seed: dict[str, Any] = field(default_factory=dict)
     init_workflow: dict[str, Any] = field(default_factory=dict)
     partial: list[dict[str, Any]] = field(default_factory=list)
+    array_scripts: dict[str, Any] = field(default_factory=dict)
 
 
 def set_init_workflow_state(manifest: Manifest, state: str) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import warnings
@@ -19,6 +20,7 @@ from .atomic_io import (
     PinnedDirectory,
     atomic_bytes_publish,
     atomic_directory_publish_no_replace,
+    atomic_text_publish,
     claim_pinned_directory_no_replace,
     sha256_file,
 )
@@ -55,7 +57,7 @@ from .manifest import (
 from .mlab import seed_prefix_identity
 from .paths import relative_to_workdir
 from . import provenance as provenance_module
-from .slurm import SlurmJob, SlurmRunner
+from .slurm import SlurmJob, SlurmRunner, render_array_submission_script
 from .structures import StructureHandler, supercell_matrix
 
 
@@ -591,6 +593,12 @@ def _build_stage1_after_preflight(
                         output_directory.verify()
                 directories.append(target)
 
+        array_scripts = _maybe_array_scripts(
+            config,
+            md_root,
+            _md_array_folders(stackings, config.include_monolayer_md),
+            preflight.submit_script,
+        )
         if not config.submit:
             runner = None
         elif runner is None:
@@ -623,6 +631,7 @@ def _build_stage1_after_preflight(
                 ),
                 grid_shift_anchors=md_anchor_records,
                 mlff_seed=mlff_seed,
+                array_scripts=array_scripts,
             ),
         )
         return bool(jobs)
@@ -990,6 +999,46 @@ def _file_evidence(path: Path) -> dict[str, object]:
     }
 
 
+def _write_array_submission_script(
+    config: DPmoireLiteConfig,
+    stage_root: PinnedDirectory,
+    folders: list[str],
+    submit_script: PreparedSource,
+) -> dict[str, str]:
+    template_text = submit_script.path.read_text(encoding="utf-8")
+    script_name = Path(config.dft_script).name
+    array_name = f"array_{script_name}"
+    text = render_array_submission_script(
+        template_text,
+        folders,
+        max_concurrent=config.array_max_concurrent,
+    )
+    atomic_text_publish(stage_root.write_path / array_name, text, encoding="utf-8")
+    stage_root.verify()
+    return {array_name: hashlib.sha256(text.encode("utf-8")).hexdigest()}
+
+
+def _maybe_array_scripts(
+    config: DPmoireLiteConfig,
+    stage_root: PinnedDirectory,
+    folders: list[str],
+    submit_script: PreparedSource,
+) -> dict[str, str]:
+    if not config.array_submission:
+        return {}
+    return _write_array_submission_script(config, stage_root, folders, submit_script)
+
+
+def _md_array_folders(
+    stackings: tuple[tuple[int, int], ...],
+    include_monolayer_md: bool,
+) -> list[str]:
+    folders = [f"{i}_{j}" for i, j in stackings]
+    if include_monolayer_md:
+        folders.extend(("top_layer", "bot_layer"))
+    return folders
+
+
 def _build_relaxations(
     config: DPmoireLiteConfig,
     structures: StructureHandler,
@@ -1051,6 +1100,12 @@ def _build_relaxations(
             )
             output_directory.verify()
         directories.append(target)
+    array_scripts = _maybe_array_scripts(
+        config,
+        stage_root,
+        [directory.path.name for directory in target_directories],
+        submit_script,
+    )
     for target_directory in target_directories:
         _verify_claimed_directory(target_directory.path, target_directory)
     jobs = _submit_dirs(config, runner, list(target_directories), wait)
@@ -1075,6 +1130,7 @@ def _build_relaxations(
             stackings=[[i, j] for i, j in stackings],
             structure_provenance=provenance,
             grid_shift_anchors=grid_shift_anchors,
+            array_scripts=array_scripts,
         ),
     )
     return bool(jobs)
@@ -1341,6 +1397,8 @@ def _config_summary(
         "grid_shift_anchor": dict(config.grid_shift_anchor)
         if config.grid_shift_anchor
         else None,
+        "array_submission": config.array_submission,
+        "array_max_concurrent": config.array_max_concurrent,
         "potcar_policy": config.potcar_policy,
         "init_mlff_mode": config.init_mlff_mode,
         "k_mesh": config.k_mesh,

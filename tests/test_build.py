@@ -884,3 +884,55 @@ def test_preflight_stage0_rejects_bad_anchor_before_creating_directories(tmp_pat
     assert not config.work_dir.exists()
     assert not (config.work_dir / "rlx").exists()
     assert not (config.work_dir / "init_mlff").exists()
+
+
+def test_stage0_generates_rlx_array_script_when_enabled(tmp_path):
+    config_path = write_build_config(tmp_path, array_submission=True)
+    (tmp_path / "scripts" / "DFT_script.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "#SBATCH -J test\n"
+        "#SBATCH -p batch\n"
+        "dpmoire_run_vasp() {\n"
+        "    true\n"
+        "}\n"
+        "dpmoire_run_vasp # DPMOIRE-LITE:RUN\n",
+        encoding="utf-8",
+    )
+
+    run_build(config_path, wait=False)
+
+    array_script = tmp_path / "work" / "rlx" / "array_DFT_script.sh"
+    text = array_script.read_text(encoding="utf-8")
+    assert "#SBATCH --array=0-1" in text
+    assert "ARRAY_FOLDERS=(\"0_0\" \"1_0\")" in text
+    assert "#SBATCH -o %x.%A.%a.out" in text
+    assert "#SBATCH -e %x.%A.%a.err" in text
+    assert not (tmp_path / "work" / "init_mlff" / "array_DFT_script.sh").exists()
+    expected_hash = hashlib.sha256(array_script.read_bytes()).hexdigest()
+    manifest = yaml.safe_load(
+        (tmp_path / "work" / "rlx" / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    assert manifest["array_scripts"] == {"array_DFT_script.sh": expected_hash}
+    assert (tmp_path / "work" / "rlx" / "0_0" / "DFT_script.sh").exists()
+
+
+def test_stage0_omits_array_script_by_default(tmp_path):
+    config_path = write_build_config(tmp_path)
+
+    run_build(config_path, wait=False)
+
+    assert not (tmp_path / "work" / "rlx" / "array_DFT_script.sh").exists()
+    manifest = yaml.safe_load(
+        (tmp_path / "work" / "rlx" / "manifest.yaml").read_text(encoding="utf-8")
+    )
+    assert manifest["array_scripts"] == {}
+
+
+def test_md_array_folders_include_monolayer_directories():
+    assert build_module._md_array_folders(((0, 0), (1, 0)), True) == [
+        "0_0",
+        "1_0",
+        "top_layer",
+        "bot_layer",
+    ]
+    assert build_module._md_array_folders(((0, 0),), False) == ["0_0"]

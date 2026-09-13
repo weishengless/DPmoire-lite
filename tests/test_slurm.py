@@ -2,6 +2,8 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 import dpmoire_lite.slurm as slurm_module
 from dpmoire_lite.build import _submit_dirs
 from dpmoire_lite.slurm import SlurmJob, SlurmRunner
@@ -150,3 +152,60 @@ def test_submit_many_wait_resubmits_failed_job_once_and_preserves_path():
         ("rlx/0_0", "CANCELLED"),
         ("rlx/0_0", "COMPLETED"),
     ]
+
+
+ARRAY_TEMPLATE = """#!/usr/bin/env bash
+#SBATCH -J NbSe2
+#SBATCH -p batch
+#SBATCH -N 1 --ntasks-per-node=64
+#SBATCH --time=2-0:0:0
+#SBATCH -o out.%j
+#SBATCH -e err.%j
+
+export OMP_NUM_THREADS=1
+
+mpirun /usr/local/bin/vasp_std >sout
+"""
+
+
+def test_render_array_script_injects_array_line_overrides_and_mapping():
+    text = slurm_module.render_array_submission_script(
+        ARRAY_TEMPLATE,
+        ["0_0", "0_1", "0_2"],
+    )
+
+    assert "#SBATCH --array=0-2" in text
+    assert "#SBATCH -o %x.%A.%a.out" in text
+    assert "#SBATCH -e %x.%A.%a.err" in text
+    assert 'ARRAY_FOLDERS=("0_0" "0_1" "0_2")' in text
+    assert "SLURM_ARRAY_TASK_ID:?" in text
+    assert text.index("#SBATCH --array=0-2") > text.index("#SBATCH -e err.%j")
+    assert text.index("ARRAY_FOLDERS") > text.index("#SBATCH -e err.%j")
+    assert text.index('cd "$SCRIPT_DIR') < text.index("mpirun")
+    assert text.rstrip().endswith("mpirun /usr/local/bin/vasp_std >sout")
+    # user SBATCH lines are preserved verbatim ahead of the injected ones
+    assert "#SBATCH -o out.%j" in text
+
+
+def test_render_array_script_injects_throttle_when_configured():
+    text = slurm_module.render_array_submission_script(
+        ARRAY_TEMPLATE,
+        ["0_0"],
+        max_concurrent=4,
+    )
+
+    assert "#SBATCH --array=0-0%4" in text
+
+
+def test_render_array_script_requires_sbatch_header():
+    with pytest.raises(ValueError, match="SBATCH"):
+        slurm_module.render_array_submission_script(
+            "#!/usr/bin/env bash\nmpirun vasp\n", ["0_0"]
+        )
+
+
+def test_render_array_script_rejects_empty_folder_list():
+    with pytest.raises(ValueError, match="folder"):
+        slurm_module.render_array_submission_script(ARRAY_TEMPLATE,
+        [],
+    )

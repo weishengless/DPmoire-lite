@@ -610,3 +610,31 @@ def test_outcar_patterns_deduplicates_exact_text_with_warning(tmp_path):
         "first occurrence is outcar_patterns[0]."
     )
     assert config.outcar_patterns == (duplicate, r"^OUT\d+$", r"^OUTCAR$")
+
+
+def test_load_config_array_submission_defaults_to_off(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+
+    config = load_config(config_file)
+
+    assert config.array_submission is False
+    assert config.array_max_concurrent == 0
+
+
+def test_load_config_accepts_array_submission_settings(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, array_submission=True, array_max_concurrent=8)
+
+    config = load_config(config_file)
+
+    assert config.array_submission is True
+    assert config.array_max_concurrent == 8
+
+
+def test_load_config_rejects_negative_array_max_concurrent(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, array_max_concurrent=-1)
+
+    with pytest.raises(ConfigError, match="array_max_concurrent"):
+        load_config(config_file)
