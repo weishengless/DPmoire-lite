@@ -120,6 +120,8 @@ def translate_indexes_z(atoms: Atoms, indexes: list[int], delta_z: float) -> Non
     atoms.set_positions(positions)
 
 
+# Pairs within this distance (Å) of the minimum count as ties; symmetric
+# periodic images tie exactly, the tolerance absorbs float noise.
 _ANCHOR_PAIR_DISTANCE_TOLERANCE = 1e-6
 
 
@@ -156,7 +158,6 @@ def _nearest_pair_indexes(
         for bot_offset, bot_index in enumerate(bot_candidates):
             if row[bot_offset] - minimum <= _ANCHOR_PAIR_DISTANCE_TOLERANCE:
                 return [int(top_index), int(bot_index)]
-    raise ValueError("grid_shift_anchor nearest-pair search found no candidate pair")
 
 
 def grid_shift_anchor_indexes(
@@ -314,6 +315,9 @@ class StructureHandler:
 
     def _build_combined_structure(self) -> None:
         self.new_struct, self.top_indexes, self.bot_indexes = self.build_new_struct(d=self.d)
+        self._validate_grid_shift_anchor()
+
+    def _validate_grid_shift_anchor(self) -> None:
         grid_shift_anchor_indexes(
             self.new_struct,
             self.top_indexes,

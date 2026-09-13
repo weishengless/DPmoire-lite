@@ -208,7 +208,7 @@ build CLI 在没有执行任何 `sbatch` 时输出 `build status=generated`，�
 | `d` | 数值 | 距离数值，具体物理含义由 `d_mode` 决定。 |
 | `d_mode` | `surface_gap` 或 `reference_plane_gap` | `surface_gap` 表示 `min_z(top) - max_z(bot) = d`；`reference_plane_gap` 表示所选参考原子的平均 z 坐标差为 `d`。默认值为 `surface_gap`。 |
 | `d_reference` | 映射，可选 | `reference_plane_gap` 使用的参考原子选择器，例如内置 MoTe2 示例可用 `{top: [Mo], bot: [Mo]}`。省略或使用 `all` 表示该层所有原子。 |
-| `grid_shift_anchor` | 元素或 `{top, bot}` 映射，可选 | 按元素指定两个抗滑移锚点原子（每层一个，写出为 `F F T`）。单个元素同时用于两层；映射可逐层指定，例如内置 MoTe2 示例可用 `{top: Mo, bot: Mo}`。元素必须存在于该层，并在创建任何目录之前校验。省略时保持默认：排序后每层的第一个原子。加 `selection: nearest_pair` 可在所选元素候选内固定跨层距离最近的原子对（并列取索引序最小）；裸关键字 `grid_shift_anchor: nearest_pair` 表示不做元素过滤、固定全局最近的上下层原子对。 |
+| `grid_shift_anchor` | 元素或 `{top, bot}` 映射，可选 | 按元素指定两个抗滑移锚点原子（每层一个，写出为 `F F T`）。单个元素同时用于两层；映射可逐层指定，例如内置 MoTe2 示例可用 `{top: Mo, bot: Mo}`。元素必须存在于该层，并在创建任何目录之前校验。省略时保持默认：排序后每层的第一个原子。加 `selection: nearest_pair` 可在所选元素候选内固定跨层距离最近的原子对（并列按先顶层、后底层的原子索引字典序取最小）；裸关键字 `grid_shift_anchor: nearest_pair` 表示不做元素过滤、固定全局最近的上下层原子对。 |
 | `k_mesh` | 整数 | KPOINTS 目标值。程序会根据生成后 POSCAR 的面内晶格长度写 Gamma-centered mesh。 |
 | `encut_factor` | 数值 | 生成前，DPmoire-lite 会解析 top layer 与 bottom layer 元素并集所选中的 POTCAR 变体。init、relaxation、双层/单层 MD 和 validation 的所有 INCAR 都统一使用该工作流集合中的 `encut_factor * max(ENMAX)`；每个目录的 POTCAR 仍只包含其本地 POSCAR 中的元素，并保持本地 POSCAR 元素顺序。 |
 | `r_cut` | 数值 | 写入 `ML_RCUT1` 和 `ML_RCUT2` 的值。若为负数，则根据最大输入单层面内晶格长度和 `d` 自动估算。 |

@@ -300,6 +300,7 @@ def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_
             (work / stage / "manifest.yaml").read_text(encoding="utf-8")
         )
         assert manifest["config_summary"]["workflow_cutoff"] == expected_evidence
+        assert manifest["config_summary"]["grid_shift_anchor"] == {"top": "Te", "bot": "V"}
 
 
 def test_single_job_init_mode_generates_auditable_two_phase_workspace(tmp_path):

@@ -321,6 +321,12 @@ def _published_anchors(atoms: Atoms):
     return published, anchors
 
 
+def _assert_two_fixed_line_anchors(published) -> None:
+    assert len(published.constraints) == 2
+    for constraint in published.constraints:
+        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+
+
 def test_shift_primitive_atoms_defaults_to_first_atom_of_each_layer(tmp_path):
     input_dir = _write_pto3_on_pt_inputs(tmp_path)
     handler = _handler(input_dir, tmp_path, d=3.0)
@@ -344,9 +350,7 @@ def test_shift_primitive_atoms_uses_grid_shift_anchor_elements(tmp_path):
     assert [symbols[index] for index in anchors] == ["O", "Pt"]
     assert anchors[0] in top_idx
     assert anchors[1] in bot_idx
-    assert len(published.constraints) == 2
-    for constraint in published.constraints:
-        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    _assert_two_fixed_line_anchors(published)
 
 
 def test_shift_atoms_supercell_path_uses_grid_shift_anchor_elements(tmp_path):
@@ -358,16 +362,12 @@ def test_shift_atoms_supercell_path_uses_grid_shift_anchor_elements(tmp_path):
     top_idx, bot_idx = handler.find_layer_idx(atoms)
     published, anchors = _published_anchors(atoms)
     symbols = published.get_chemical_symbols()
-    assert len(published.constraints) == 2
-    for constraint in published.constraints:
-        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    _assert_two_fixed_line_anchors(published)
     assert [symbols[index] for index in anchors] == ["Te", "V"]
     assert sorted(anchors) != sorted([top_idx[0], bot_idx[0]])
     assert anchors[0] in top_idx
     assert anchors[1] in bot_idx
-    assert len(published.constraints) == 2
-    for constraint in published.constraints:
-        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    _assert_two_fixed_line_anchors(published)
 
 
 def test_grid_shift_anchor_fails_when_element_missing_from_layer(tmp_path):
@@ -463,9 +463,7 @@ def test_grid_shift_anchor_nearest_pair_pins_closest_element_pair(tmp_path):
     assert [symbols[index] for index in anchors] == ["Te", "Te"]
     assert anchors[0] != top_te[0]
     assert anchors[1] == bot_te[0]
-    assert len(published.constraints) == 2
-    for constraint in published.constraints:
-        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    _assert_two_fixed_line_anchors(published)
 
 
 def test_grid_shift_anchor_bare_nearest_pair_pins_global_closest_pair(tmp_path):
@@ -483,8 +481,7 @@ def test_grid_shift_anchor_bare_nearest_pair_pins_global_closest_pair(tmp_path):
 
 
 def test_grid_shift_anchor_nearest_pair_tie_breaks_by_lowest_index(tmp_path):
-    input_dir = root = Path(tmp_path)
-    input_dir = root / "input"
+    input_dir = tmp_path / "input"
     input_dir.mkdir(parents=True)
     write_vasp(
         input_dir / "top_layer.poscar",
@@ -537,7 +534,5 @@ def test_grid_shift_anchor_nearest_pair_on_supercell_path(tmp_path):
 
     published, anchors = _published_anchors(atoms)
     symbols = published.get_chemical_symbols()
-    assert len(published.constraints) == 2
-    for constraint in published.constraints:
-        assert np.asarray(constraint.mask).tolist() == [True, True, False]
+    _assert_two_fixed_line_anchors(published)
     assert [symbols[index] for index in anchors] == ["Te", "Te"]
