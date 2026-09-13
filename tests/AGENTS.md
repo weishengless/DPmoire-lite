@@ -11,13 +11,15 @@
 
 ## Pytest Temporary Paths
 
+- On the Linux cluster, run pytest directly with the verified interpreter and
+  a unique, absolute basetemp under `/tmp` (XFS), named
+  `/tmp/dpmoire-pytest-<unit>-<gate>-<nonce>`.
 - On Windows/Codex, every pytest gate uses scoped `require_escalated`
-  non-sandbox execution.
-- Use a unique, absolute basetemp named
+  non-sandbox execution with basetemp
   `$env:TEMP\dpmoire-pytest-<unit>-<gate>-<nonce>`.
 - Before pytest, confirm the basetemp path does not exist; never reuse it.
-- If scoped escalation is unavailable, report a blocker. Do not skip tests or
-  classify an environment failure as behavioral RED.
+- If scoped escalation is unavailable on Windows/Codex, report a blocker. Do
+  not skip tests or classify an environment failure as behavioral RED.
 - Do not change permissions to make a pytest gate pass.
 - Do not use the default `pytest-of-*` temporary root in this environment.
 - The repository ignore contract includes `/pytest-of-*/` for standard residue.

@@ -8,7 +8,12 @@
 
 ## Verified Python
 
-- Use `C:\Users\Nice_Try\anaconda3\envs\vdwID\python.exe`.
+- Primary development environment is the `dpmoire` conda env on the Linux
+  cluster: `~/anaconda3/envs/dpmoire/bin/python` (Python 3.10, pytest
+  included). The canonical source tree is the git clone at
+  `~/work/soft/DPmoire-lite`.
+- The Windows interpreter `C:\Users\Nice_Try\anaconda3\envs\vdwID\python.exe`
+  belonged to the retired Windows workspace and is no longer authoritative.
 - Verify `sys.executable` before relying on Python.
 - Do not use bare `python`, `python3`, or a WindowsApps alias.
 - Do not install or change packages without explicit user approval.
@@ -43,6 +48,9 @@
 - Keep `stage: all` and submitted `--wait` fail-closed.
 - Do not implement deferred Slurm automation, MD restart, or fuzzy deduplication
   outside an approved unit.
+- Keep the Linux `renameat2` no-replace publish fallback and its mock-`EINVAL`
+  tests; GPFS does not implement `RENAME_NOREPLACE`, so the fallback is the
+  supported no-replace publication path there.
 
 ## Scoped Instructions
 
