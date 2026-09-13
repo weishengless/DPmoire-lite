@@ -522,7 +522,26 @@ def _rollback_published_copies(published: tuple[_PublishedCopy, ...]) -> None:
         fsync_directory(parent)
 
 
+_RENAMEAT2_UNSUPPORTED_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.ENOTSUP,
+}
+_EOPNOTSUPP = getattr(errno, "EOPNOTSUPP", None)
+if _EOPNOTSUPP is not None:
+    _RENAMEAT2_UNSUPPORTED_ERRNOS.add(_EOPNOTSUPP)
+
+
 def _linux_rename_no_replace(candidate: Path, destination: Path) -> None:
+    try:
+        _linux_renameat2_no_replace(candidate, destination)
+    except OSError as exc:
+        if exc.errno not in _RENAMEAT2_UNSUPPORTED_ERRNOS:
+            raise
+        _linux_publish_no_replace_without_renameat2(candidate, destination)
+
+
+def _linux_renameat2_no_replace(candidate: Path, destination: Path) -> None:
     at_fdcwd = -100
     rename_noreplace = 1
     source_bytes = os.fsencode(candidate)
@@ -574,6 +593,49 @@ def _linux_rename_no_replace(candidate: Path, destination: Path) -> None:
             os.strerror(error_number),
             str(destination),
         )
+
+
+def _linux_publish_no_replace_without_renameat2(
+    candidate: Path,
+    destination: Path,
+) -> None:
+    candidate = Path(candidate)
+    destination = Path(destination)
+    observed = candidate.lstat()
+    if stat.S_ISDIR(observed.st_mode):
+        _linux_directory_publish_no_replace_without_renameat2(candidate, destination)
+        return
+    if stat.S_ISREG(observed.st_mode):
+        _linux_file_publish_no_replace_without_renameat2(candidate, destination)
+        return
+    raise OSError(
+        errno.ENOTSUP,
+        "Atomic no-replace publication fallback requires a directory or regular file",
+        str(destination),
+    )
+
+
+def _linux_file_publish_no_replace_without_renameat2(
+    candidate: Path,
+    destination: Path,
+) -> None:
+    os.link(os.fspath(candidate), os.fspath(destination))
+    os.unlink(candidate)
+
+
+def _linux_directory_publish_no_replace_without_renameat2(
+    candidate: Path,
+    destination: Path,
+) -> None:
+    os.mkdir(destination)
+    try:
+        os.rename(candidate, destination)
+    except BaseException:
+        try:
+            os.rmdir(destination)
+        except OSError:
+            pass
+        raise
 
 
 def _new_candidate(destination: Path) -> Path:

@@ -1,9 +1,27 @@
+import errno
 import hashlib
 import os
+import platform
 
 import pytest
 
 import dpmoire_lite.atomic_io as atomic_io
+
+
+def _force_renameat2_errno(monkeypatch, error_number):
+    real_cdll = atomic_io.ctypes.CDLL
+
+    def fake_cdll(name=None, *args, **kwargs):
+        libc = real_cdll(name, *args, **kwargs)
+
+        def renameat2(*_args, **_kwargs):
+            atomic_io.ctypes.set_errno(error_number)
+            return -1
+
+        libc.renameat2 = renameat2
+        return libc
+
+    monkeypatch.setattr(atomic_io.ctypes, "CDLL", fake_cdll)
 
 
 def test_atomic_text_publish_replaces_only_after_candidate_fsync(tmp_path, monkeypatch):
@@ -214,3 +232,111 @@ def test_atomic_copy_pair_rolls_back_when_fsync_fails_after_first_rename(
     assert not first_destination.exists()
     assert not second_destination.exists()
     assert list(tmp_path.glob("*.candidate")) == []
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux",
+    reason="renameat2 no-replace fallback is a Linux publication path",
+)
+def test_atomic_directory_publish_when_renameat2_is_unsupported(tmp_path, monkeypatch):
+    _force_renameat2_errno(monkeypatch, errno.EINVAL)
+    candidate = tmp_path / ".workspace-candidate"
+    destination = tmp_path / "init_mlff"
+    (candidate / "bottom").mkdir(parents=True)
+    (candidate / "bottom" / "POSCAR").write_text("prepared\n", encoding="utf-8")
+    candidate_identity = atomic_io.verify_plain_directory(candidate)
+
+    atomic_io.atomic_directory_publish_no_replace(candidate, destination)
+
+    assert not candidate.exists()
+    assert (destination / "bottom" / "POSCAR").read_text(encoding="utf-8") == (
+        "prepared\n"
+    )
+    published = atomic_io.verify_plain_directory(destination)
+    assert published.device == candidate_identity.device
+    assert published.inode == candidate_identity.inode
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux",
+    reason="renameat2 no-replace fallback is a Linux publication path",
+)
+def test_atomic_directory_publish_refuses_existing_when_renameat2_is_unsupported(
+    tmp_path,
+    monkeypatch,
+):
+    _force_renameat2_errno(monkeypatch, errno.EINVAL)
+    candidate = tmp_path / ".workspace-candidate"
+    destination = tmp_path / "init_mlff"
+    candidate.mkdir()
+    (candidate / "manifest.yaml").write_text("candidate\n", encoding="utf-8")
+    destination.mkdir()
+
+    with pytest.raises(FileExistsError):
+        atomic_io.atomic_directory_publish_no_replace(candidate, destination)
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+    assert (candidate / "manifest.yaml").read_text(encoding="utf-8") == "candidate\n"
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux",
+    reason="renameat2 no-replace fallback is a Linux publication path",
+)
+def test_atomic_file_publish_when_renameat2_is_unsupported(tmp_path, monkeypatch):
+    _force_renameat2_errno(monkeypatch, errno.EINVAL)
+    candidate = tmp_path / ".ML_AB.candidate"
+    destination = tmp_path / "ML_AB"
+    payload = b"verified-seed\n"
+    candidate.write_bytes(payload)
+    candidate_stat = candidate.stat()
+
+    atomic_io.atomic_file_publish_no_replace(candidate, destination)
+
+    assert not candidate.exists()
+    assert destination.read_bytes() == payload
+    published_stat = destination.stat()
+    assert published_stat.st_dev == candidate_stat.st_dev
+    assert published_stat.st_ino == candidate_stat.st_ino
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux",
+    reason="renameat2 no-replace fallback is a Linux publication path",
+)
+def test_atomic_file_publish_refuses_existing_when_renameat2_is_unsupported(
+    tmp_path,
+    monkeypatch,
+):
+    _force_renameat2_errno(monkeypatch, errno.EINVAL)
+    candidate = tmp_path / ".ML_AB.candidate"
+    destination = tmp_path / "ML_AB"
+    candidate.write_bytes(b"candidate\n")
+    destination.write_bytes(b"existing\n")
+
+    with pytest.raises(FileExistsError):
+        atomic_io.atomic_file_publish_no_replace(candidate, destination)
+
+    assert candidate.read_bytes() == b"candidate\n"
+    assert destination.read_bytes() == b"existing\n"
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux",
+    reason="renameat2 no-replace fallback is a Linux publication path",
+)
+def test_claim_pinned_directory_when_renameat2_is_unsupported(tmp_path, monkeypatch):
+    _force_renameat2_errno(monkeypatch, errno.EINVAL)
+    parent_path = tmp_path / "work"
+    parent_path.mkdir()
+    target = parent_path / "init_mlff"
+    parent_identity = atomic_io.verify_plain_directory(parent_path)
+
+    with atomic_io.pinned_directory(parent_path, parent_identity) as parent:
+        with atomic_io.claim_pinned_directory_no_replace(target, parent=parent) as claimed:
+            (claimed.write_path / "marker").write_text("ok\n", encoding="utf-8")
+            claimed.verify()
+
+    assert (target / "marker").read_text(encoding="utf-8") == "ok\n"
+    assert atomic_io.verify_plain_directory(target)
