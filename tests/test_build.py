@@ -92,7 +92,7 @@ def write_build_config(root, **overrides):
         "sc": [1, 1],
         "d": 4.0,
         "k_mesh": 20,
-        "encut_factor": 1.5,
+        "encut": 450.0,
         "r_cut": -1,
         "symm_reduce": False,
         "twist_val": False,
@@ -256,7 +256,6 @@ def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_
         sc=[1, 1],
         vasp_ml=False,
         twist_val=False,
-        encut_factor=1.5,
         grid_shift_anchor={"top": "Te", "bot": "V"},
     )
     potcar_payloads = write_mixed_layer_inputs(tmp_path)
@@ -283,16 +282,12 @@ def test_stage0_uses_workflow_wide_encut_for_bottom_init_and_bilayer_inputs(tmp_
         payload_by_element[element] for element in init_elements
     )
     expected_evidence = {
-        "schema": "dpmoire-lite.workflow-cutoff.v1",
+        "schema": "dpmoire-lite.workflow-cutoff.v2",
         "selected_potcars": [
             {"element": "Nb", "directory": "Nb_sv", "enmax": 300.0},
             {"element": "Te", "directory": "Te", "enmax": 260.0},
             {"element": "V", "directory": "V_sv", "enmax": 240.0},
         ],
-        "governing_element": "Nb",
-        "governing_potcar_directory": "Nb_sv",
-        "max_enmax": 300.0,
-        "encut_factor": 1.5,
         "encut": expected_encut,
     }
     for stage in ("init_mlff", "rlx"):
@@ -313,7 +308,6 @@ def test_single_job_init_mode_generates_auditable_two_phase_workspace(tmp_path):
         twist_val=False,
         n_sectors=[1, 1],
         sc=[1, 1],
-        encut_factor=1.5,
     )
     potcar_payloads = write_mixed_layer_inputs(tmp_path)
     input_dir = tmp_path / "input"
@@ -434,7 +428,6 @@ def test_stage0_validation_uses_workflow_wide_encut_and_local_potcar_order(tmp_p
         twist_val=True,
         min_val_n=1,
         max_val_n=1,
-        encut_factor=1.5,
     )
     potcar_payloads = write_mixed_layer_inputs(tmp_path)
 
@@ -474,7 +467,6 @@ def test_stage1_uses_workflow_wide_encut_for_bilayer_and_monolayer_md(tmp_path):
         vasp_ml=False,
         twist_val=False,
         include_monolayer_md=True,
-        encut_factor=1.5,
     )
     potcar_payloads = write_mixed_layer_inputs(tmp_path)
     run_build(config, wait=False)
@@ -504,7 +496,6 @@ def test_stage1_uses_workflow_wide_encut_for_bilayer_and_monolayer_md(tmp_path):
         )
     manifest = yaml.safe_load((md_dir / "manifest.yaml").read_text(encoding="utf-8"))
     assert manifest["config_summary"]["workflow_cutoff"]["encut"] == expected_encut
-    assert manifest["config_summary"]["workflow_cutoff"]["governing_element"] == "Nb"
 
 
 def test_stage1_rejects_workflow_cutoff_drift_from_stage0_manifest(tmp_path):
@@ -518,14 +509,13 @@ def test_stage1_rejects_workflow_cutoff_drift_from_stage0_manifest(tmp_path):
         vasp_ml=False,
         twist_val=False,
         include_monolayer_md=False,
-        encut_factor=1.5,
     )
     write_mixed_layer_inputs(tmp_path)
     run_build(config, wait=False)
     complete_generated_relaxation_and_update_config(
         tmp_path,
         config,
-        encut_factor=1.6,
+        encut=500,
     )
 
     with pytest.raises(RuntimeError, match="workflow cutoff.*drift"):
@@ -550,7 +540,7 @@ def test_stage1_warns_when_manifest_predates_workflow_cutoff_evidence(tmp_path):
         run_build(config, wait=False)
 
     manifest = yaml.safe_load((work / "md" / "manifest.yaml").read_text(encoding="utf-8"))
-    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == 150.0
+    assert manifest["config_summary"]["workflow_cutoff"]["encut"] == 450.0
 
 
 @pytest.mark.parametrize(("sc_rlx", "expected_rlx_mesh"), [(False, "5 5 1"), (True, "3 3 1")])

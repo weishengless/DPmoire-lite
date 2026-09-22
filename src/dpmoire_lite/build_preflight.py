@@ -78,18 +78,11 @@ class PreparedValidationStructure:
 @dataclass(frozen=True)
 class PreparedWorkflowCutoff:
     selected_potcars: tuple[PreparedPotcar, ...]
-    governing_potcar: PreparedPotcar
-    encut_factor: float
     encut: float
 
-    @property
-    def max_enmax(self) -> float:
-        return self.governing_potcar.enmax
-
     def audit_record(self) -> dict[str, object]:
-        governing = self.governing_potcar
         return {
-            "schema": "dpmoire-lite.workflow-cutoff.v1",
+            "schema": "dpmoire-lite.workflow-cutoff.v2",
             "selected_potcars": [
                 {
                     "element": potcar.element,
@@ -101,10 +94,6 @@ class PreparedWorkflowCutoff:
                     key=lambda item: (item.element, item.source.path.parent.name),
                 )
             ],
-            "governing_element": governing.element,
-            "governing_potcar_directory": governing.source.path.parent.name,
-            "max_enmax": self.max_enmax,
-            "encut_factor": self.encut_factor,
             "encut": self.encut,
         }
 
@@ -1033,24 +1022,12 @@ def _prepare_workflow_cutoff(
     config: DPmoireLiteConfig,
     potcars: tuple[PreparedPotcar, ...],
 ) -> PreparedWorkflowCutoff | None:
-    factor = config.encut_factor
     if not potcars:
         return None
 
-    governing_potcar = min(
-        potcars,
-        key=lambda potcar: (
-            -potcar.enmax,
-            potcar.element,
-            potcar.source.path.parent.name,
-        ),
-    )
-    encut = governing_potcar.enmax * factor
     return PreparedWorkflowCutoff(
         selected_potcars=potcars,
-        governing_potcar=governing_potcar,
-        encut_factor=factor,
-        encut=float(encut),
+        encut=float(config.encut),
     )
 
 

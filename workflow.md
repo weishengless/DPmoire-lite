@@ -63,13 +63,13 @@ Each generated folder receives:
 - optional `vdw_kernel.bindat` if required by the INCAR template
 
 Before writing any calculation folder, preflight resolves the selected POTCAR
-variant and ENMAX for the union of all elements in the top and bottom input
-layers. One workflow cutoff is then fixed as
-`ENCUT = encut_factor * max(selected ENMAX)` and reused by init, relaxation,
-bilayer and monolayer MD, and validation inputs. A folder's POTCAR remains local:
+variant for the union of all elements in the top and bottom input layers. The
+configured `encut` (in eV, default `500`) is then fixed as the single workflow
+cutoff and reused by init, relaxation, bilayer and monolayer MD, and validation
+inputs. A folder's POTCAR remains local:
 it contains only that folder's POSCAR elements in POSCAR order. Stage manifests
-record the selected POTCAR directory names, ENMAX values, governing element,
-factor, and final ENCUT; they never contain POTCAR payloads.
+record the selected POTCAR directory names, ENMAX values, and the final ENCUT;
+they never contain POTCAR payloads.
 Stage1 compares its newly resolved plan with cutoff evidence in a newly generated
 relaxation manifest and fails before MD writes if it has drifted. Historical
 manifests without that evidence remain usable with an explicit warning and a

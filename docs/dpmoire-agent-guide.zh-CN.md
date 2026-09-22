@@ -91,7 +91,7 @@ $dpmoire-guide [CHANGE]
 - 工作流：`do_relaxation`、`init_mlff`、`init_mlff_mode`、
   `init_bottom_incar`、`init_top_incar`、`sc_rlx`、`include_monolayer_md`。
 - 结构与采样：`n_sectors`、`sc`、`d`、`d_mode`、`d_reference`、`k_mesh`、
-  `encut_factor`、`r_cut`、`symm_reduce`、`twist_val`、`min_val_n`、
+  `encut`、`r_cut`、`symm_reduce`、`twist_val`、`min_val_n`、
   `max_val_n`、`preserve_grid_shift_md`、`grid_shift_anchor`、`array_submission`、
   `array_max_concurrent`。
 

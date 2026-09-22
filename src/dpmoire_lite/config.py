@@ -14,6 +14,9 @@ class ConfigError(ValueError):
     """Raised when a DPmoire-lite config is invalid."""
 
 
+DEFAULT_ENCUT = 500.0
+
+
 DEFAULT_OUTCAR_PATTERNS = (
     r"^OUTCAR\d+$",
     r"^OUT\d+$",
@@ -60,7 +63,6 @@ REQUIRED_FIELDS = (
     "sc",
     "d",
     "k_mesh",
-    "encut_factor",
     "r_cut",
     "symm_reduce",
     "twist_val",
@@ -248,13 +250,13 @@ class DPmoireLiteConfig:
     d_reference: dict[str, str | tuple[str, ...]] | None
     potcar_policy: str
     k_mesh: int
-    encut_factor: float
     r_cut: float
     symm_reduce: bool
     twist_val: bool
     min_val_n: int
     max_val_n: int
     include_monolayer_md: bool
+    encut: float = DEFAULT_ENCUT
     preserve_grid_shift_md: bool = False
     grid_shift_anchor: dict[str, str] | None = None
     array_submission: bool = False
@@ -367,6 +369,13 @@ def _float(value: Any, field_name: str) -> float:
     raise ConfigError(f"{field_name} must be a number")
 
 
+def _positive_float(value: Any, field_name: str) -> float:
+    result = _float(value, field_name)
+    if result <= 0:
+        raise ConfigError(f"{field_name} must be positive")
+    return result
+
+
 def _normalize_stage(value: Any) -> int | str:
     if isinstance(value, bool):
         raise ConfigError("stage must be 0, 1, or all")
@@ -387,6 +396,13 @@ def load_config(path: Path) -> DPmoireLiteConfig:
     old_keys = sorted(set(raw).intersection(OLD_FIELD_NAMES))
     if old_keys:
         raise ConfigError(f"Use snake_case config fields instead of old names: {', '.join(old_keys)}")
+
+    if "encut_factor" in raw:
+        raise ConfigError(
+            "encut_factor is no longer supported; set encut to the plane-wave "
+            "cutoff in eV (for example encut: 500). Omitting encut uses the "
+            "default of 500 eV."
+        )
 
     missing = [field_name for field_name in REQUIRED_FIELDS if field_name not in raw]
     if missing:
@@ -461,7 +477,7 @@ def load_config(path: Path) -> DPmoireLiteConfig:
         array_max_concurrent=array_max_concurrent,
         potcar_policy=potcar_policy,
         k_mesh=_int(_require(raw, "k_mesh"), "k_mesh"),
-        encut_factor=_float(_require(raw, "encut_factor"), "encut_factor"),
+        encut=_positive_float(raw.get("encut", DEFAULT_ENCUT), "encut"),
         r_cut=_float(_require(raw, "r_cut"), "r_cut"),
         symm_reduce=_bool(_require(raw, "symm_reduce"), "symm_reduce"),
         twist_val=_bool(_require(raw, "twist_val"), "twist_val"),
