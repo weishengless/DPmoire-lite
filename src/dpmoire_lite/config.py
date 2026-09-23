@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 import re
 from typing import Any
 import warnings
@@ -314,8 +314,7 @@ def _resolve_optional_input_path(
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{field_name} must be a non-empty path relative to input_dir")
     raw_path = Path(value.strip())
-    windows_path = PureWindowsPath(raw_path)
-    if raw_path.is_absolute() or windows_path.is_absolute() or windows_path.drive:
+    if raw_path.is_absolute():
         raise ConfigError(f"{field_name} must be relative to input_dir")
     resolved = (input_dir / raw_path).resolve()
     try:
