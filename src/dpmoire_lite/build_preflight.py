@@ -75,6 +75,10 @@ class PreparedValidationStructure:
     atoms: Atoms
 
 
+_WORKFLOW_CUTOFF_SCHEMA_V1 = "dpmoire-lite.workflow-cutoff.v1"
+_WORKFLOW_CUTOFF_SCHEMA_V2 = "dpmoire-lite.workflow-cutoff.v2"
+
+
 @dataclass(frozen=True)
 class PreparedWorkflowCutoff:
     selected_potcars: tuple[PreparedPotcar, ...]
@@ -82,20 +86,34 @@ class PreparedWorkflowCutoff:
 
     def audit_record(self) -> dict[str, object]:
         return {
-            "schema": "dpmoire-lite.workflow-cutoff.v2",
-            "selected_potcars": [
-                {
-                    "element": potcar.element,
-                    "directory": potcar.source.path.parent.name,
-                    "enmax": potcar.enmax,
-                }
-                for potcar in sorted(
-                    self.selected_potcars,
-                    key=lambda item: (item.element, item.source.path.parent.name),
-                )
-            ],
+            "schema": _WORKFLOW_CUTOFF_SCHEMA_V2,
+            "selected_potcars": self._selected_potcar_records(),
             "encut": self.encut,
         }
+
+    def matches_recorded(self, recorded: object) -> bool:
+        current = self.audit_record()
+        if recorded == current:
+            return True
+        if not isinstance(recorded, dict) or recorded.get("schema") != _WORKFLOW_CUTOFF_SCHEMA_V1:
+            return False
+        return (
+            recorded.get("selected_potcars") == current["selected_potcars"]
+            and recorded.get("encut") == self.encut
+        )
+
+    def _selected_potcar_records(self) -> list[dict[str, object]]:
+        return [
+            {
+                "element": potcar.element,
+                "directory": potcar.source.path.parent.name,
+                "enmax": potcar.enmax,
+            }
+            for potcar in sorted(
+                self.selected_potcars,
+                key=lambda item: (item.element, item.source.path.parent.name),
+            )
+        ]
 
 
 @dataclass(frozen=True)
@@ -730,7 +748,7 @@ def _validate_workflow_cutoff_provenance(
             )
         )
         return
-    if recorded != workflow_cutoff.audit_record():
+    if not workflow_cutoff.matches_recorded(recorded):
         diagnostics.append(
             PreflightDiagnostic(
                 domain="provenance",

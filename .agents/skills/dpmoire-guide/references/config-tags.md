@@ -42,7 +42,9 @@ Group keys before explaining them:
   `DFT_script`, `ENMAX`, and `OUTCAR_collect_freq` are rejected.
 - `encut_factor` was removed: set `encut` to the plane-wave cutoff in eV
   (default `500`); a config containing `encut_factor` fails closed with an
-  explanatory error.
+  explanatory error. Stage1 accepts a v1 `workflow_cutoff` record when its
+  selected POTCAR entries and `encut` match the current plan. A different
+  ENCUT or POTCAR selection still blocks MD generation.
 - `stage: all` parses as a known value but build deliberately rejects it.
 - `submit: true` causes real Slurm requests; it is not a dry-run flag.
 - `auto_resub` and `n_nodes` do not enable the currently disabled submitted

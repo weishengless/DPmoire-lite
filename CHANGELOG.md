@@ -37,7 +37,9 @@
   bilayer/monolayer MD, and validation INCAR. A config still containing
   `encut_factor` fails closed with an explanatory error, and stage manifests
   record the workflow cutoff as `dpmoire-lite.workflow-cutoff.v2` (selected
-  POTCAR ENMAX values plus the final ENCUT).
+  POTCAR ENMAX values plus the final ENCUT). Stage1 accepts a v1 cutoff
+  record when those selected POTCAR entries and the final ENCUT match, and
+  still blocks MD generation when either differs.
 
 ### Fixed
 

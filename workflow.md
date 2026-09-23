@@ -71,9 +71,10 @@ it contains only that folder's POSCAR elements in POSCAR order. Stage manifests
 record the selected POTCAR directory names, ENMAX values, and the final ENCUT;
 they never contain POTCAR payloads.
 Stage1 compares its newly resolved plan with cutoff evidence in a newly generated
-relaxation manifest and fails before MD writes if it has drifted. Historical
-manifests without that evidence remain usable with an explicit warning and a
-newly resolved plan.
+relaxation manifest and fails before MD writes if it has drifted. A v1 cutoff
+record is accepted when its selected POTCAR entries and final ENCUT match the
+current plan. Historical manifests without cutoff evidence remain usable with
+an explicit warning and a newly resolved plan.
 
 If any target stage exists, including an empty directory, DPmoire-lite stops before modifying any file. It never moves, backs up, overwrites, or rebuilds a stage in place. Explicitly delete the complete conflicting stage, then rerun the build.
 

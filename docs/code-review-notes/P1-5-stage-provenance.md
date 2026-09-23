@@ -127,7 +127,6 @@ manifest 没有记录上下层输入结构哈希，也没有记录各个 Stage0 
 - `submit` 和 `wait`；
 - `vasp_ml`；
 - `k_mesh`；
-- `encut_factor`；
 - `r_cut`；
 - `potcar_policy`；
 - `include_monolayer_md`；
@@ -136,6 +135,16 @@ manifest 没有记录上下层输入结构哈希，也没有记录各个 Stage0 
 
 `sc_rlx: false` 表示 Stage0 弛豫 primitive structure，`sc` 本来就是 Stage1
 的 MD 扩胞参数，因此可以在 Stage1 有意调整。
+
+### Workflow cutoff
+
+`encut` 属于 Stage0 与 Stage1 的截断身份，不在上面的可调整列表里。Stage1
+把当前计划与 relaxation manifest 的 `workflow_cutoff` 比较：
+
+- `dpmoire-lite.workflow-cutoff.v2` 必须整份记录一致；
+- `dpmoire-lite.workflow-cutoff.v1` 在 `selected_potcars` 与 `encut` 一致时接受，已退役的 `governing_element`、`governing_potcar_directory`、`max_enmax` 和 `encut_factor` 不参与比较；
+- 没有 `workflow_cutoff` 的历史 manifest 只发出警告，并使用当前新解析的计划；
+- `encut` 或所选 POTCAR 不同，以及其他 schema，都在写出 MD 目录之前失败。
 
 ### 新格式的 Stage1 判定
 

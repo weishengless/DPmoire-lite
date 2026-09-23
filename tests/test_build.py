@@ -524,6 +524,76 @@ def test_stage1_rejects_workflow_cutoff_drift_from_stage0_manifest(tmp_path):
     assert not (tmp_path / "work" / "md").exists()
 
 
+def rewrite_relaxation_cutoff_as_v1(root, **overrides):
+    manifest_path = root / "work" / "rlx" / "manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    recorded = manifest["config_summary"]["workflow_cutoff"]
+    selected = recorded["selected_potcars"]
+    v1 = {
+        "schema": "dpmoire-lite.workflow-cutoff.v1",
+        "selected_potcars": selected,
+        "governing_element": selected[0]["element"],
+        "governing_potcar_directory": selected[0]["directory"],
+        "max_enmax": selected[0]["enmax"],
+        "encut_factor": 1.5,
+        "encut": recorded["encut"],
+    }
+    v1.update(overrides)
+    manifest["config_summary"]["workflow_cutoff"] = v1
+    manifest_path.write_text(
+        yaml.safe_dump(manifest, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def _stage0_relaxation_ready_for_stage1(tmp_path):
+    config = write_build_config(
+        tmp_path,
+        stage=0,
+        init_mlff=False,
+        do_relaxation=True,
+        n_sectors=[1, 1],
+        sc=[1, 1],
+        vasp_ml=False,
+        twist_val=False,
+        include_monolayer_md=False,
+    )
+    write_mixed_layer_inputs(tmp_path)
+    run_build(config, wait=False)
+    complete_generated_relaxation_and_update_config(tmp_path, config)
+    return config
+
+
+def test_stage1_accepts_v1_workflow_cutoff_with_same_encut_and_potcars(tmp_path):
+    config = _stage0_relaxation_ready_for_stage1(tmp_path)
+    rewrite_relaxation_cutoff_as_v1(tmp_path)
+
+    run_build(config, wait=False)
+
+    analysis = parse_incar(
+        (tmp_path / "work" / "md" / "0_0" / "INCAR").read_text(encoding="utf-8"),
+        source_name="md/0_0/INCAR",
+    ).analyze()
+    assert float(analysis.effective_value("ENCUT")) == 450.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"encut": 480.0},
+        {"selected_potcars": [{"element": "Nb", "directory": "Nb", "enmax": 300.0}]},
+    ],
+)
+def test_stage1_rejects_v1_workflow_cutoff_drift(tmp_path, overrides):
+    config = _stage0_relaxation_ready_for_stage1(tmp_path)
+    rewrite_relaxation_cutoff_as_v1(tmp_path, **overrides)
+
+    with pytest.raises(RuntimeError, match="workflow cutoff.*drift"):
+        run_build(config, wait=False)
+
+    assert not (tmp_path / "work" / "md").exists()
+
+
 def test_stage1_warns_when_manifest_predates_workflow_cutoff_evidence(tmp_path):
     config = write_build_config(
         tmp_path,
