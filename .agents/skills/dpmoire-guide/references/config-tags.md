@@ -34,12 +34,17 @@ Group keys before explaining them:
 | Execution controls | `stage`, `submit`, `auto_resub` |
 | Engine and collection | `vasp_ml`, `outcar_collect_freq`, `outcar_patterns` |
 | Init and stage generation | `do_relaxation`, `init_mlff`, `init_mlff_mode`, `init_bottom_incar`, `init_top_incar`, `sc_rlx`, `include_monolayer_md`, `array_submission`, `array_max_concurrent` |
-| Geometry and sampling | `n_sectors`, `sc`, `d`, `d_mode`, `d_reference`, `k_mesh`, `encut_factor`, `r_cut`, `symm_reduce`, `twist_val`, `min_val_n`, `max_val_n`, `preserve_grid_shift_md`, `grid_shift_anchor` |
+| Geometry and sampling | `n_sectors`, `sc`, `d`, `d_mode`, `d_reference`, `k_mesh`, `encut`, `r_cut`, `symm_reduce`, `twist_val`, `min_val_n`, `max_val_n`, `preserve_grid_shift_md`, `grid_shift_anchor` |
 
 ## Configuration Traps
 
 - Keys are snake_case. Old names such as `VASP_ML`, `K-mesh`, `POTCAR_dir`,
   `DFT_script`, `ENMAX`, and `OUTCAR_collect_freq` are rejected.
+- `encut_factor` was removed: set `encut` to the plane-wave cutoff in eV
+  (default `500`); a config containing `encut_factor` fails closed with an
+  explanatory error. Stage1 accepts a v1 `workflow_cutoff` record when its
+  selected POTCAR entries and `encut` match the current plan. A different
+  ENCUT or POTCAR selection still blocks MD generation.
 - `stage: all` parses as a known value but build deliberately rejects it.
 - `submit: true` causes real Slurm requests; it is not a dry-run flag.
 - `auto_resub` and `n_nodes` do not enable the currently disabled submitted

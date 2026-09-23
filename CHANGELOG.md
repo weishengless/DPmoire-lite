@@ -30,6 +30,17 @@
   cross-job dependencies remain deferred. Completed v1 workflow evidence remains
   readable for Stage1.
 
+### Changed
+
+- Replaced the `encut_factor` config tag with a direct `encut` tag: the
+  plane-wave cutoff in eV (default `500`) written to every init, relaxation,
+  bilayer/monolayer MD, and validation INCAR. A config still containing
+  `encut_factor` fails closed with an explanatory error, and stage manifests
+  record the workflow cutoff as `dpmoire-lite.workflow-cutoff.v2` (selected
+  POTCAR ENMAX values plus the final ENCUT). Stage1 accepts a v1 cutoff
+  record when those selected POTCAR entries and the final ENCUT match, and
+  still blocks MD generation when either differs.
+
 ### Fixed
 
 - Prevented automatic single-job submission from entering Slurm wait mode via

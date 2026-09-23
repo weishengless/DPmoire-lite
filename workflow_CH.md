@@ -55,14 +55,15 @@ stage0 可以根据配置生成三组相互独立的目录：
 - 如果 INCAR 模板需要，则复制 `vdw_kernel.bindat`
 
 写入任何计算目录前，preflight 会先解析 top layer 与 bottom layer 元素并集
-所选中的 POTCAR 变体及其 ENMAX，并固定唯一的工作流 cutoff：
-`ENCUT = encut_factor * max(selected ENMAX)`。init、relaxation、双层与单层
-MD、validation 输入都会复用这个 ENCUT。每个目录的 POTCAR 仍是局部的：只包含
+所选中的 POTCAR 变体。配置中的 `encut`（单位 eV，默认 `500`）作为唯一的
+工作流 cutoff，供 init、relaxation、双层与单层 MD、validation 输入复用。
+每个目录的 POTCAR 仍是局部的：只包含
 该目录 POSCAR 中的元素，并保持 POSCAR 元素顺序。各 stage manifest 会记录所选
-POTCAR 目录名、ENMAX、控制元素、factor 和最终 ENCUT，但不会记录 POTCAR 内容。
-Stage1 会把新解析的计划与新版 relaxation manifest 中的 cutoff 证据进行比较；
-若发生漂移，会在写入 MD 前失败。缺少该证据的历史 manifest 仍可兼容使用，但会
-明确警告并采用当前重新解析的计划。
+POTCAR 目录名、ENMAX 和最终 ENCUT，但不会记录 POTCAR 内容。
+Stage1 会把新解析的计划与 relaxation manifest 中的 cutoff 证据进行比较；
+若发生漂移，会在写入 MD 前失败。v1 cutoff 记录在所选 POTCAR 与最终 ENCUT
+一致时可以接受。缺少该证据的历史 manifest 仍可兼容使用，但会明确警告并采用
+当前重新解析的计划。
 
 如果任一目标 stage 已存在（包括空目录），DPmoire-lite 会在修改任何文件前停止。它不会移动、备份、覆盖或原地重建 stage。请显式删除完整的冲突 stage，然后重新运行 build。
 

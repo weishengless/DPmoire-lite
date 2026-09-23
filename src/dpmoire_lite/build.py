@@ -1402,7 +1402,7 @@ def _config_summary(
         "potcar_policy": config.potcar_policy,
         "init_mlff_mode": config.init_mlff_mode,
         "k_mesh": config.k_mesh,
-        "encut_factor": config.encut_factor,
+        "encut": config.encut,
         "workflow_cutoff": workflow_cutoff.audit_record(),
         "r_cut": config.r_cut,
     }

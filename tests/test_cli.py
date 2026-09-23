@@ -100,7 +100,7 @@ def _write_collect_cli_config(
                 "sc": [1, 1],
                 "d": 4.0,
                 "k_mesh": 20,
-                "encut_factor": 1.5,
+                "encut": 450.0,
                 "r_cut": -1,
                 "symm_reduce": False,
                 "twist_val": False,

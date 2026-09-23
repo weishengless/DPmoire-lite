@@ -75,38 +75,45 @@ class PreparedValidationStructure:
     atoms: Atoms
 
 
+_WORKFLOW_CUTOFF_SCHEMA_V1 = "dpmoire-lite.workflow-cutoff.v1"
+_WORKFLOW_CUTOFF_SCHEMA_V2 = "dpmoire-lite.workflow-cutoff.v2"
+
+
 @dataclass(frozen=True)
 class PreparedWorkflowCutoff:
     selected_potcars: tuple[PreparedPotcar, ...]
-    governing_potcar: PreparedPotcar
-    encut_factor: float
     encut: float
 
-    @property
-    def max_enmax(self) -> float:
-        return self.governing_potcar.enmax
-
     def audit_record(self) -> dict[str, object]:
-        governing = self.governing_potcar
         return {
-            "schema": "dpmoire-lite.workflow-cutoff.v1",
-            "selected_potcars": [
-                {
-                    "element": potcar.element,
-                    "directory": potcar.source.path.parent.name,
-                    "enmax": potcar.enmax,
-                }
-                for potcar in sorted(
-                    self.selected_potcars,
-                    key=lambda item: (item.element, item.source.path.parent.name),
-                )
-            ],
-            "governing_element": governing.element,
-            "governing_potcar_directory": governing.source.path.parent.name,
-            "max_enmax": self.max_enmax,
-            "encut_factor": self.encut_factor,
+            "schema": _WORKFLOW_CUTOFF_SCHEMA_V2,
+            "selected_potcars": self._selected_potcar_records(),
             "encut": self.encut,
         }
+
+    def matches_recorded(self, recorded: object) -> bool:
+        current = self.audit_record()
+        if recorded == current:
+            return True
+        if not isinstance(recorded, dict) or recorded.get("schema") != _WORKFLOW_CUTOFF_SCHEMA_V1:
+            return False
+        return (
+            recorded.get("selected_potcars") == current["selected_potcars"]
+            and recorded.get("encut") == self.encut
+        )
+
+    def _selected_potcar_records(self) -> list[dict[str, object]]:
+        return [
+            {
+                "element": potcar.element,
+                "directory": potcar.source.path.parent.name,
+                "enmax": potcar.enmax,
+            }
+            for potcar in sorted(
+                self.selected_potcars,
+                key=lambda item: (item.element, item.source.path.parent.name),
+            )
+        ]
 
 
 @dataclass(frozen=True)
@@ -741,7 +748,7 @@ def _validate_workflow_cutoff_provenance(
             )
         )
         return
-    if recorded != workflow_cutoff.audit_record():
+    if not workflow_cutoff.matches_recorded(recorded):
         diagnostics.append(
             PreflightDiagnostic(
                 domain="provenance",
@@ -1033,24 +1040,12 @@ def _prepare_workflow_cutoff(
     config: DPmoireLiteConfig,
     potcars: tuple[PreparedPotcar, ...],
 ) -> PreparedWorkflowCutoff | None:
-    factor = config.encut_factor
     if not potcars:
         return None
 
-    governing_potcar = min(
-        potcars,
-        key=lambda potcar: (
-            -potcar.enmax,
-            potcar.element,
-            potcar.source.path.parent.name,
-        ),
-    )
-    encut = governing_potcar.enmax * factor
     return PreparedWorkflowCutoff(
         selected_potcars=potcars,
-        governing_potcar=governing_potcar,
-        encut_factor=factor,
-        encut=float(encut),
+        encut=float(config.encut),
     )
 
 

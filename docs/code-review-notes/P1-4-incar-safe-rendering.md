@@ -1,8 +1,9 @@
 # P1-4：INCAR 合法语法未被安全解析和改写
 
-- 状态：讨论已完成
+- 状态：讨论已完成；2026-09-23 修订 ENCUT 来源
 - 评审日期：2026-07-11
 - 结论日期：2026-07-11
+- ENCUT 修订：2026-09-23。平面波截断改为配置中的 `encut`（单位 eV，省略时为 500），并写入每个生成的 INCAR。`encut_factor` 不再接受。本修订取代 `docs/superpowers/specs/2026-05-26-dpmoire-lite-design.md` 中的 `ENCUT = encut_factor * max(POTCAR ENMAX)`。
 - 优先级：P1
 - 关联位置：
   - `src/dpmoire_lite/inputs.py:72-82`
@@ -85,7 +86,7 @@ DPmoire-lite 不是完整的 INCAR 物理参数检查器。用户对具体 VASP 
 
 只有以下三个标签由 DPmoire-lite 决定数值：
 
-- `ENCUT`：由所选 POTCAR 的最大 ENMAX 和 `encut_factor` 计算；
+- `ENCUT`：由配置 `encut` 直接给出，单位 eV，省略时为 500；
 - `ML_RCUT1`：由 `r_cut` 或项目的自动 cutoff 规则计算；
 - `ML_RCUT2`：与上项相同。
 
@@ -203,7 +204,7 @@ ENCUT=400; ISMEAR=-1; ENCUT=520
 ENCUT = 600  # DPmoire-lite generated; missing from source template
 ```
 
-这保证显式配置的 `encut_factor` 不会静默失效。
+这保证显式配置的 `encut` 不会静默失效；省略 `encut` 时使用 500 eV。
 
 ### ML_RCUT1 和 ML_RCUT2
 

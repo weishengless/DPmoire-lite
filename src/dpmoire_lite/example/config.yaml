@@ -30,7 +30,7 @@ outcar_patterns:        #Optional regex list used to discover OUTCAR series duri
 
 ############################ Calculation and Structure Parameters ##############################################
 k_mesh: 40              #KPOINTS mesh target, using k*a = K-mesh.
-encut_factor: 1.6              #ENCUT = encut_factor * max(ENMAX) across selected top+bottom POTCAR variants; shared by every stage.
+encut: 500                   #Plane-wave cutoff in eV, shared by every generated INCAR (init, relaxation, MD, validation). Omit to use the 500 eV default.
 r_cut: -1               #Value written to ML_RCUT1 and ML_RCUT2. Use a negative value for the automatic estimate based on the largest input-layer in-plane lattice length and d.
 
 sc: 2                   #Supercell expansion for MD and, when sc_rlx is true, relaxation. An integer means [n, n]; a pair [m, n] allows rectangular supercells.

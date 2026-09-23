@@ -35,7 +35,7 @@ def write_config(path: Path, **overrides):
         "sc": [2, 3],
         "d": 6.3,
         "k_mesh": 40,
-        "encut_factor": 1.6,
+        "encut": 450.0,
         "r_cut": -1,
         "symm_reduce": True,
         "twist_val": True,
@@ -57,6 +57,51 @@ def test_normalize_pair_rejects_bad_values():
         normalize_pair([9, 8, 7], field="n_sectors")
     with pytest.raises(ConfigError, match="positive"):
         normalize_pair([9, 0], field="n_sectors")
+
+
+def test_encut_defaults_to_500_when_omitted(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file)
+    data = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    del data["encut"]
+    config_file.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert config.encut == 500.0
+
+
+def test_encut_is_read_directly_in_ev(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, encut=520)
+
+    config = load_config(config_file)
+
+    assert config.encut == 520.0
+
+
+def test_encut_factor_is_rejected(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, encut_factor=1.6)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(config_file)
+
+    message = str(exc_info.value)
+    assert "encut_factor is no longer supported" in message
+    assert "config_summary.workflow_cutoff.encut" in message
+
+
+def test_encut_must_be_positive(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    write_config(config_file, encut=0)
+
+    with pytest.raises(ConfigError, match="encut must be positive"):
+        load_config(config_file)
+
+    write_config(config_file, encut=-50)
+    with pytest.raises(ConfigError, match="encut must be positive"):
+        load_config(config_file)
 
 
 def test_load_config_resolves_paths(tmp_path):
