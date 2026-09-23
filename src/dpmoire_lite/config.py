@@ -400,8 +400,11 @@ def load_config(path: Path) -> DPmoireLiteConfig:
     if "encut_factor" in raw:
         raise ConfigError(
             "encut_factor is no longer supported; set encut to the plane-wave "
-            "cutoff in eV (for example encut: 500). Omitting encut uses the "
-            "default of 500 eV."
+            "cutoff in eV (for example encut: 500). Previous releases computed "
+            "ENCUT = encut_factor * max(ENMAX); the exact value is recorded in "
+            "your stage manifests under config_summary.workflow_cutoff.encut. "
+            "Copy that number, e.g. encut: 480, to reproduce your previous "
+            "cutoffs. Omitting encut uses the default of 500 eV."
         )
 
     missing = [field_name for field_name in REQUIRED_FIELDS if field_name not in raw]

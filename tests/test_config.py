@@ -84,8 +84,12 @@ def test_encut_factor_is_rejected(tmp_path):
     config_file = tmp_path / "config.yaml"
     write_config(config_file, encut_factor=1.6)
 
-    with pytest.raises(ConfigError, match="encut_factor is no longer supported"):
+    with pytest.raises(ConfigError) as exc_info:
         load_config(config_file)
+
+    message = str(exc_info.value)
+    assert "encut_factor is no longer supported" in message
+    assert "config_summary.workflow_cutoff.encut" in message
 
 
 def test_encut_must_be_positive(tmp_path):
